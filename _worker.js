@@ -682,66 +682,57 @@ async function handleCallbackQuery(callbackQuery, config, userSetting) {
         UPDATE user_settings 
         SET storage_type = ? 
         WHERE chat_id = ?
-  // 根据回调数据执行不同操作
-  if (data === 'close') {
-    // 关闭面板
-    await config.telegramClient.editMessageText(chatId, messageId, null, '面板已关闭');
-    return true;
-  } else if (data.startsWith('setStorage:')) {
-    // 设置存储类型
-    const newStorageType = data.split(':')[1];
-    
-    // 更新用户设置
-    await config.database.prepare(`
-      UPDATE user_settings 
-      SET storage_type = ? 
-      WHERE chat_id = ?
-    `).bind(newStorageType, chatId.toString()).run();
-    
-    // 重新发送面板
-    await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
-    return true;
-  } else if (data.startsWith('setCategory:')) {
-    // 设置分类
-    const categoryId = parseInt(data.split(':')[1]);
-    
-    // 更新用户设置
-    await config.database.prepare(`
-      UPDATE user_settings 
-      SET category_id = ? 
-      WHERE chat_id = ?
-    `).bind(categoryId, chatId.toString()).run();
-    
-    // 重新发送面板
-    await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
-    return true;
-  } else if (data === 'setSuffix') {
-    // 提示用户输入新的后缀
-    await config.telegramClient.editMessageText(
-      chatId, 
-      messageId, 
-      null, 
-      '请回复此消息，输入您想要设置的文件后缀\n(例如：.jpg 或 _thumb)\n\n输入"无"或"none"可清除后缀',
-      {
-        reply_markup: JSON.stringify({
-          force_reply: true,
-          selective: true
+      `).bind(newStorageType, chatId.toString()).run();
+      
+      // 重新发送面板
+      await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
+      return true;
+    } else if (data.startsWith('setCategory:')) {
+      // 设置分类
+      const categoryId = parseInt(data.split(':')[1]);
+      
+      // 更新用户设置
+      await config.database.prepare(`
+        UPDATE user_settings 
+        SET category_id = ? 
+        WHERE chat_id = ?
+      `).bind(categoryId, chatId.toString()).run();
+      
+      // 重新发送面板
+      await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
+      return true;
+    } else if (data === 'setSuffix') {
+      // 提示用户输入新的后缀
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text: '请回复此消息，输入您想要设置的文件后缀\n(例如：.jpg 或 _thumb)\n\n输入"无"或"none"可清除后缀',
+          reply_markup: JSON.stringify({
+            force_reply: true,
+            selective: true
+          })
         })
-      }
-    );
-    
-    // 设置用户状态为等待输入后缀
-    await config.database.prepare(`
-      UPDATE user_settings 
-      SET status = 'waiting_suffix' 
-      WHERE chat_id = ?
-    `).bind(chatId.toString()).run();
-    
-    return true;
-  } else {
-    // 重新发送面板
-    await sendPanel(chatId, userSetting, config);
-    return true;
+      });
+      
+      // 设置用户状态为等待输入后缀
+      await config.database.prepare(`
+        UPDATE user_settings 
+        SET waiting_for = 'waiting_suffix' 
+        WHERE chat_id = ?
+      `).bind(chatId.toString()).run();
+      
+      return true;
+    } else {
+      // 重新发送面板
+      await sendPanel(chatId, userSetting, config);
+      return true;
+    }
+  } catch (error) {
+    console.error(`处理回调查询时出错: ${error.message}`);
+    return false;
   }
 }
 
@@ -753,32 +744,23 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
 
     const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+
+    // 获取文件内容
     const fileResponse = await fetch(telegramUrl);
+    const fileBuffer = await fileResponse.arrayBuffer();
 
-    if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
-    const contentLength = fileResponse.headers.get('content-length');
-  
-    // 检查文件大小
-    if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
-      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
-      return;
-    }
-
-    // 第二步：准备文件数据，与网页上传保持一致的格式
-    // 获取文件扩展名和MIME类型
+    // 第二步：处理文件名和类型
     let fileName = '';
     let ext = '';
-    
-    if (isDocument && file.file_name) {
+
+    if (isDocument) {
       fileName = file.file_name;
-      ext = (fileName.split('.').pop() || '').toLowerCase();
+      ext = fileName.split('.').pop();
     } else {
-      ext = getExtensionFromMime(file.mime_type);
-      fileName = `image.${ext}`;
+      // 照片没有文件名，使用时间戳
+      ext = 'jpg';
+      fileName = `${Date.now()}.${ext}`;
     }
-    
-    const mimeType = file.mime_type || getContentType(ext);
-    const [mainType] = mimeType.split('/');
     
     // 第三步：根据存储类型(r2 或 telegram)处理文件存储
     const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
@@ -803,9 +785,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     
     if (storageType === 'r2' && config.bucket) {
       // 上传到R2存储
-      const arrayBuffer = await fileResponse.arrayBuffer();
-      await config.bucket.put(key, arrayBuffer, { 
-        httpMetadata: { contentType: mimeType } 
+      await config.bucket.put(key, fileBuffer, { 
+        httpMetadata: { contentType: `image/${ext}` } 
       });
       finalUrl = `https://${config.domain}/${key}`;
       dbFileId = key;
@@ -818,19 +799,17 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
         video: { method: 'sendVideo', field: 'video' },
         audio: { method: 'sendAudio', field: 'audio' }
       };
-      let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
+      let { method = 'sendDocument', field = 'document' } = typeMap[ext] || {};
       
-      if (['application', 'text'].includes(mainType)) {
+      if (['application', 'text'].includes(ext)) {
         method = 'sendDocument';
         field = 'document';
       }
       
       // 重新发送到存储聊天
-      const arrayBuffer = await fileResponse.arrayBuffer();
       const tgFormData = new FormData();
       tgFormData.append('chat_id', config.tgStorageChatId);
-      const blob = new Blob([arrayBuffer], { type: mimeType });
-      tgFormData.append(field, blob, fileName);
+      tgFormData.append(field, new Blob([fileBuffer], { type: `image/${ext}` }), fileName);
       
       const tgResponse = await fetch(
         `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
@@ -877,8 +856,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       dbMessageId,
       time,
       key,  // 使用key作为file_name
-      contentLength,
-      mimeType,
+      fileBuffer.length,
+      `image/${ext}`,
       chatId,
       categoryId,
       storageType
@@ -904,27 +883,15 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
 }
 
 async function getTelegramFileUrl(fileId, botToken, config) {
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
-  const data = await response.json();
-  if (!data.ok) throw new Error('获取文件路径失败');
-  
-  // 获取文件路径
-  const filePath = data.result.file_path;
-  
-  // 从路径中提取文件名和扩展名
-  const fileName = filePath.split('/').pop();
-  
-  // 使用时间戳重命名文件，保持与其他上传一致
-  const timestamp = Date.now();
-  const fileExt = fileName.split('.').pop();
-  const newFileName = `${timestamp}.${fileExt}`;
-  
-  // 返回域名格式URL
-  if (config && config.domain) {
-    return `https://${config.domain}/${newFileName}`;
-  } else {
-    // 仅在没有配置域名时才返回Telegram API链接
-    return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+    const data = await response.json();
+    if (!data.ok) throw new Error('获取文件路径失败');
+    
+    return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
+  } catch (error) {
+    console.error('获取Telegram文件URL失败:', error);
+    throw error;
   }
 }
 
@@ -3510,14 +3477,27 @@ async function getFile(fileId, config) {
 }
 
 async function deleteFile(fileId, config) {
-  if (config.bucket) {
-    try {
-      await config.bucket.delete(fileId);
-      return true;
-    } catch (error) {
-      console.error('R2删除文件失败:', error);
-      return false;
+  try {
+    // 检查R2存储是否可用
+    if (config.bucket) {
+      try {
+        // 删除R2文件
+        await config.bucket.delete(fileId);
+        console.log(`已从R2删除文件: ${fileId}`);
+      } catch (error) {
+        console.error(`从R2删除文件时出错: ${error.message}`);
+      }
     }
+    
+    // 从数据库中删除文件记录
+    await config.database.prepare('DELETE FROM files WHERE file_id = ? OR url LIKE ?')
+      .bind(fileId, `%${fileId}%`)
+      .run();
+      
+    console.log(`已从数据库删除文件记录: ${fileId}`);
+    return true;
+  } catch (error) {
+    console.error(`删除文件时出错: ${error.message}`);
+    return false;
   }
-  return true; // 如果没有R2桶，假设文件已删除或不需要删除
 }
