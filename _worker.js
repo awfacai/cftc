@@ -1,12 +1,21 @@
 // 数据库初始化函数
 async function initDatabase(config) {
-  // 创建数据库连接
   console.log("初始化数据库...");
 
   try {
+    // 测试数据库连接
+    console.log("测试数据库连接...");
+    try {
+      await config.database.prepare("SELECT 1").first();
+      console.log("数据库连接成功");
+    } catch (error) {
+      console.error(`数据库连接测试失败: ${error.message}`);
+      throw error;
+    }
+
     // 创建必要的表结构
     try {
-      console.log("正在创建/检查分类表..."); // Added log
+      console.log("正在创建/检查分类表...");
       // 创建分类表
       await config.database.prepare(`
         CREATE TABLE IF NOT EXISTS categories (
@@ -17,7 +26,7 @@ async function initDatabase(config) {
       `).run();
       console.log("分类表检查完成");
 
-      console.log("正在创建/检查用户设置表..."); // Added log
+      console.log("正在创建/检查用户设置表...");
       // 创建用户设置表
       await config.database.prepare(`
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -32,7 +41,7 @@ async function initDatabase(config) {
       `).run();
       console.log("用户设置表检查完成");
 
-      console.log("正在创建/检查文件表..."); // Added log
+      console.log("正在创建/检查文件表...");
       // 创建文件表
       await config.database.prepare(`
         CREATE TABLE IF NOT EXISTS files (
@@ -40,7 +49,7 @@ async function initDatabase(config) {
           url TEXT NOT NULL,
           fileId TEXT NOT NULL,
           message_id INTEGER NOT NULL DEFAULT 0,
-          created_at INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
           file_name TEXT,
           file_size INTEGER,
           mime_type TEXT,
@@ -54,23 +63,33 @@ async function initDatabase(config) {
       console.log("文件表检查完成");
 
       // 创建默认分类，如果不存在的话
-      const defaultCategory = await config.database
-        .prepare('SELECT id FROM categories WHERE name = ?')
-        .bind('默认分类')
-        .first();
+      try {
+        const defaultCategory = await config.database
+          .prepare('SELECT id FROM categories WHERE name = ?')
+          .bind('默认分类')
+          .first();
 
-      if (!defaultCategory) {
-        console.log("创建默认分类...");
-        await config.database
-          .prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
-          .bind('默认分类', Date.now())
-          .run();
-        console.log("默认分类创建完成");
+        if (!defaultCategory) {
+          console.log("创建默认分类...");
+          await config.database
+            .prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+            .bind('默认分类', Date.now())
+            .run();
+          console.log("默认分类创建完成");
+        }
+      } catch (error) {
+        console.error('检查/创建默认分类出错:', error);
+        // 继续执行，不中断初始化
       }
 
       // 修复数据库字段不一致问题
-      console.log("检查并修复数据库字段不一致...");
-      await checkAndFixDatabaseInconsistencies(config);
+      try {
+        console.log("检查并修复数据库字段不一致...");
+        await checkAndFixDatabaseInconsistencies(config);
+      } catch (error) {
+        console.error('修复数据库字段不一致出错:', error);
+        // 继续执行，不中断初始化
+      }
       
       console.log("数据库初始化完成");
     } catch (error) {
@@ -530,8 +549,7 @@ async function handleTelegramWebhook(request, config) {
           }
           // 处理文件上传
           else if (update.message.photo || update.message.document) {
-            const file = update.message.document || update.message.photo?.slice(-1)[0];
-            await handleMediaUpload(chatId, file, !!update.message.document, config, userSetting);
+            await handleMediaUpload(update.message, chatId, userSetting, config);
           }
         }
         // 处理回调查询（按钮点击）
@@ -711,29 +729,41 @@ async function handleCallbackQuery(update, config, userSetting) {
   }
 }
 
-async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
+async function handleMediaUpload(message, chatId, userSetting, config) {
   try {
-    // 第一步：获取文件信息并验证大小
-    // 注意：我们暂不下载文件内容，提升响应速度
-    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
-    const data = await response.json();
-    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
+    // 发送处理中消息
+    await sendMessage(chatId, "🔄 正在处理媒体文件，请稍候...", config.tgBotToken, message.message_id);
+    
+    // 获取文件信息
+    const file = message.photo ? message.photo[message.photo.length - 1] : message.document;
+    if (!file || !file.file_id) {
+      await sendMessage(chatId, "❌ 无法识别文件", config.tgBotToken, message.message_id);
+      return;
+    }
+    
+    // 获取文件信息
+    const fileInfo = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
+    const fileData = await fileInfo.json();
+    if (!fileData.ok) {
+      throw new Error(`获取文件信息失败: ${JSON.stringify(fileData)}`);
+    }
     
     // 获取文件大小信息
-    const fileSize = data.result.file_size || 0;
+    const fileSize = fileData.result.file_size || 0;
     
     // 检查文件大小
     if (fileSize > config.maxSizeMB * 1024 * 1024) {
-      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
+      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken, message.message_id);
       return;
     }
-
-    // 第二步：准备文件数据，与网页上传保持一致的格式
+    
+    // 准备文件数据
+    const isDocument = !!message.document;
     let fileName = '';
     let ext = '';
     
-    if (isDocument && file.file_name) {
-      fileName = file.file_name;
+    if (isDocument && message.document.file_name) {
+      fileName = message.document.file_name;
       ext = (fileName.split('.').pop() || '').toLowerCase();
     } else {
       ext = getExtensionFromMime(file.mime_type);
@@ -741,111 +771,80 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     }
     
     const mimeType = file.mime_type || getContentType(ext);
-    const [mainType] = mimeType.split('/');
     
-    // 第三步：根据存储类型(r2 或 telegram)处理文件
+    // 从Telegram下载文件
+    const filePath = fileData.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${filePath}`;
+    const fileResponse = await fetch(fileUrl);
+    const fileBuffer = await fileResponse.arrayBuffer();
+    
+    // 生成唯一文件名：使用时间戳+随机字符串
+    const timestamp = Date.now();
+    const dateObj = new Date(timestamp);
+    const randomStr = Math.random().toString(36).substring(2, 8);
+    const uniqueFileName = `${dateObj.getFullYear()}${String(dateObj.getMonth() + 1).padStart(2, '0')}${String(dateObj.getDate()).padStart(2, '0')}_${randomStr}.${ext}`;
+    
+    // 根据存储类型处理文件
     const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
+    let uploadedUrl = '';
     
-    // 获取分类ID
+    if (storageType === 'r2' && config.bucket) {
+      // 上传到R2存储
+      await config.bucket.put(uniqueFileName, fileBuffer, {
+        httpMetadata: { contentType: mimeType }
+      });
+      uploadedUrl = `https://${config.domain}/${uniqueFileName}`;
+    } else {
+      // 使用Telegram存储
+      const tgResponse = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument`, {
+        method: 'POST',
+        body: new FormData({
+          chat_id: config.tgStorageChatId,
+          document: new File([fileBuffer], uniqueFileName, { type: mimeType })
+        })
+      });
+      const tgResult = await tgResponse.json();
+      if (!tgResult.ok) {
+        throw new Error(`Telegram存储失败: ${JSON.stringify(tgResult)}`);
+      }
+      uploadedUrl = `https://${config.domain}/${uniqueFileName}`;
+    }
+    
+    // 获取用户可能设置的分类
     let categoryId = null;
     if (userSetting && userSetting.category_id) {
       categoryId = userSetting.category_id;
-    } else {
-      // 找默认分类
-      const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-      if (defaultCategory) {
-        categoryId = defaultCategory.id;
-      }
     }
     
-    // 处理自定义后缀
-    let baseFileName = `${Date.now()}`;
-    if (userSetting && userSetting.custom_suffix) {
-      baseFileName = userSetting.custom_suffix;
-    }
-    
-    const key = `${baseFileName}.${ext}`;
-    
-    // 并行处理文件上传和数据库操作，提高响应速度
-    const uploadPromise = (async () => {
-      if (storageType === 'r2' && config.bucket) {
-        // 上传到R2存储
-        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-        const fileResponse = await fetch(telegramUrl);
-        if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
-        
-        const arrayBuffer = await fileResponse.arrayBuffer();
-        await config.bucket.put(key, arrayBuffer, { 
-          httpMetadata: { contentType: mimeType } 
-        });
-        
-        return {
-          url: `https://${config.domain}/${key}`,
-          fileId: key,
-          messageId: 0
-        };
-      } else {
-        // 使用Telegram存储 - 实际上我们可以直接使用原始文件ID
-        return {
-          url: `https://${config.domain}/${key}`,
-          fileId: file.file_id,
-          messageId: 0
-        };
-      }
-    })();
-    
-    // 第四步：写入数据库
-    // 修复：使用正确的时间格式
-    const currentDate = new Date(); // 获取当前日期
-    const formattedDate = currentDate.toISOString(); // 将日期转换为ISO格式
-    
-    // 等待上传完成
-    const uploadResult = await uploadPromise;
-    
+    // 保存到数据库
     await config.database.prepare(`
-      INSERT INTO files (
-        url, 
-        fileId, 
-        message_id, 
-        created_at, 
-        file_name, 
-        file_size, 
-        mime_type, 
-        chat_id, 
-        category_id, 
-        storage_type,
-        custom_suffix
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files (filename, file_id, url, size, mime_type, created_at, category_id, chat_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      uploadResult.url,
-      uploadResult.fileId,
-      uploadResult.messageId,
-      formattedDate,  // 使用标准ISO日期格式
-      key,      // 使用key作为file_name
+      uniqueFileName,
+      uniqueFileName,
+      uploadedUrl,
       fileSize,
       mimeType,
-      chatId,
+      timestamp,
       categoryId,
-      storageType,
-      userSetting && userSetting.custom_suffix ? userSetting.custom_suffix : null
+      chatId
     ).run();
     
-    // 第五步：快速返回上传成功消息给用户
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(uploadResult.url)}`;
+    // 格式化时间并发送成功消息
+    const formattedDate = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}-${String(dateObj.getDate()).padStart(2, '0')} ${String(dateObj.getHours()).padStart(2, '0')}:${String(dateObj.getMinutes()).padStart(2, '0')}:${String(dateObj.getSeconds()).padStart(2, '0')}`;
+    const formattedSize = formatBytes(fileSize);
     
-    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        photo: qrCodeUrl,
-        caption: `✅ 文件上传成功!\n\n📅 上传时间: ${currentDate.toLocaleString()}\n📝 图床直链:\n${uploadResult.url}\n\n🔍 扫描上方二维码快速访问`,
-        parse_mode: 'HTML'
-      })
-    });
+    await sendMessage(
+      chatId,
+      `✅ 文件上传成功！\n\n📁 文件名: ${uniqueFileName}\n⏰ 上传时间: ${formattedDate}\n📊 文件大小: ${formattedSize}\n🔗 访问链接: ${uploadedUrl}`,
+      config.tgBotToken,
+      message.message_id
+    );
+    
   } catch (error) {
-    console.error("Error handling media upload:", error);
-    await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
+    console.error('媒体上传处理错误:', error);
+    await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken, message.message_id);
   }
 }
 
@@ -3477,4 +3476,158 @@ function getExtensionFromMime(mimeType) {
   };
   
   return mimeMap[mimeType] || 'bin';
+}
+
+// 从URL中提取文件名
+function getFileName(url) {
+  try {
+    if (!url) return '';
+    const urlObj = new URL(url);
+    const pathParts = urlObj.pathname.split('/');
+    return pathParts[pathParts.length - 1];
+  } catch (error) {
+    console.error('提取文件名出错:', error);
+    // 如果不是有效URL，尝试直接从字符串中提取
+    const parts = url.split('/');
+    return parts[parts.length - 1];
+  }
+}
+
+// 生成新的URL，用于修改后缀
+function generateNewUrl(url, suffix) {
+  try {
+    if (!url) return '';
+    const fileName = getFileName(url);
+    if (!fileName) return url;
+    
+    const ext = fileName.split('.').pop();
+    if (!ext) return url;
+    
+    const domain = new URL(url).origin;
+    return `${domain}/${suffix}.${ext}`;
+  } catch (error) {
+    console.error('生成新URL出错:', error);
+    return url;
+  }
+}
+
+// 辅助函数：复制到剪贴板
+function copyToClipboard(text) {
+  try {
+    navigator.clipboard.writeText(text)
+      .then(() => {
+        showConfirmModal('已复制到剪贴板', null, true);
+      })
+      .catch(() => {
+        showConfirmModal('复制失败，请手动复制', null, true);
+      });
+  } catch (error) {
+    console.error('复制到剪贴板出错:', error);
+    showConfirmModal('复制失败，请手动复制', null, true);
+  }
+}
+
+// 上传文件到R2对象存储
+async function uploadToR2(arrayBuffer, fileName, mimeType, config) {
+  try {
+    if (!config.bucket) {
+      throw new Error('未配置R2存储');
+    }
+    
+    await config.bucket.put(fileName, arrayBuffer, {
+      httpMetadata: { contentType: mimeType || 'application/octet-stream' }
+    });
+    
+    return `https://${config.domain}/${fileName}`;
+  } catch (error) {
+    console.error('上传到R2失败:', error);
+    throw new Error(`上传到R2失败: ${error.message}`);
+  }
+}
+
+// 添加用于处理R2/Telegram存储操作的通用函数
+async function storeFile(arrayBuffer, fileName, mimeType, config) {
+  try {
+    if (config.bucket) {
+      await config.bucket.put(fileName, arrayBuffer, {
+        httpMetadata: { contentType: mimeType || 'application/octet-stream' }
+      });
+      return `https://${config.domain}/${fileName}`;
+    } else {
+      // 没有配置R2，使用Telegram
+      return await storeFileInTelegram(arrayBuffer, fileName, mimeType, config);
+    }
+  } catch (error) {
+    console.error('存储文件出错:', error);
+    throw new Error(`存储文件出错: ${error.message}`);
+  }
+}
+
+async function storeFileInTelegram(arrayBuffer, fileName, mimeType, config) {
+  if (!config.tgBotToken || !config.tgStorageChatId) {
+    throw new Error('未配置Telegram存储参数 (TG_BOT_TOKEN 和 TG_STORAGE_CHAT_ID)');
+  }
+
+  try {
+    // 创建FormData对象模拟文件上传
+    const formData = new FormData();
+    const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
+    formData.append('document', blob, fileName);
+
+    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument?chat_id=${config.tgStorageChatId}`, {
+      method: 'POST',
+      body: formData
+    });
+
+    const result = await response.json();
+    if (result.ok) {
+      const fileId = result.result.document.file_id;
+      return `https://${config.domain}/${fileName}`; // 返回域名URL
+    } else {
+      throw new Error('Telegram存储失败: ' + JSON.stringify(result));
+    }
+  } catch (error) {
+    console.error('Telegram存储文件出错:', error);
+    throw new Error(`Telegram存储文件出错: ${error.message}`);
+  }
+}
+
+// 从R2或Telegram获取文件
+async function getFile(fileId, config) {
+  try {
+    console.log(`[getFile] 尝试获取文件: ${fileId}`);
+    if (config.bucket) {
+      const file = await config.bucket.get(fileId);
+      if (file) {
+        console.log(`[getFile] 从R2获取文件成功: ${fileId}`);
+        return file;
+      } else {
+        console.log(`[getFile] R2中未找到文件: ${fileId}`);
+      }
+    } else {
+      console.log(`[getFile] 未配置R2存储，无法获取文件: ${fileId}`);
+    }
+    return null;
+  } catch (error) {
+    console.error(`[getFile] 获取文件出错 (${fileId}):`, error);
+    return null;
+  }
+}
+
+// 从R2或Telegram删除文件
+async function deleteFile(fileId, config) {
+  try {
+    console.log(`[deleteFile] 尝试删除文件: ${fileId}`);
+    if (config.bucket) {
+      await config.bucket.delete(fileId);
+      console.log(`[deleteFile] 从R2删除文件成功: ${fileId}`);
+      return true;
+    } else {
+      console.log(`[deleteFile] 未配置R2存储，跳过物理文件删除: ${fileId}`);
+    }
+    return true; // 如果没有R2桶，假设文件已删除或不需要删除
+  } catch (error) {
+    console.error(`[deleteFile] 删除文件出错 (${fileId}):`, error);
+    return false;
+  }
 }
