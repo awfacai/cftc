@@ -977,16 +977,34 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     let fileName = '';
     let ext = '';
     
+    // 首先从文件名中识别扩展名
     if (isDocument && file.file_name) {
       fileName = file.file_name;
       ext = (fileName.split('.').pop() || '').toLowerCase();
-    } else {
-      ext = getExtensionFromMime(file.mime_type);
-      fileName = `image.${ext}`;
+    }
+    // 如果没有扩展名或不是文档，则从MIME类型获取扩展名
+    if (!ext || ext === fileName.toLowerCase()) {
+      ext = getExtensionFromMime(file.mime_type || 'application/octet-stream');
+      fileName = isDocument && file.file_name ? file.file_name : `file.${ext}`;
+      
+      // 如果文件名中没有扩展名，添加上
+      if (!fileName.includes('.')) {
+        fileName = `${fileName}.${ext}`;
+      }
     }
     
+    // 确保MIME类型正确
     const mimeType = file.mime_type || getContentType(ext);
-    const [mainType] = mimeType.split('/');
+    const [mainType, subType] = mimeType.split('/');
+    
+    console.log('处理文件:', { 
+      fileName, 
+      ext, 
+      mimeType, 
+      mainType, 
+      subType, 
+      size: contentLength 
+    });
     
     // 更新处理状态消息
     await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
@@ -1016,9 +1034,10 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     
     let finalUrl, dbFileId, dbMessageId;
     
-    // 与网页上传一致，使用时间戳作为文件名
+    // 使用时间戳+原文件名的组合作为文件名，保留原始文件名便于识别
     const timestamp = Date.now();
-    const key = `${timestamp}.${ext}`;
+    const originalFileName = fileName.replace(/[^a-zA-Z0-9\-\_\.]/g, '_'); // 去除不安全字符
+    const key = `${timestamp}_${originalFileName}`;
     
     if (storageType === 'r2' && config.bucket) {
       // 上传到R2存储
@@ -1032,17 +1051,25 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     } else {
       // 使用Telegram存储
       // 根据文件类型选择不同的发送方法
-      const typeMap = {
-        image: { method: 'sendPhoto', field: 'photo' },
-        video: { method: 'sendVideo', field: 'video' },
-        audio: { method: 'sendAudio', field: 'audio' }
-      };
-      let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
+      let method, field;
       
-      if (['application', 'text'].includes(mainType)) {
+      // 根据主类型和子类型确定使用哪种Telegram API方法
+      if (mainType === 'image' && !['svg+xml', 'x-icon'].includes(subType)) {
+        method = 'sendPhoto';
+        field = 'photo';
+      } else if (mainType === 'video') {
+        method = 'sendVideo';
+        field = 'video';
+      } else if (mainType === 'audio') {
+        method = 'sendAudio';
+        field = 'audio';
+      } else {
+        // 默认使用文档方式上传
         method = 'sendDocument';
         field = 'document';
       }
+      
+      console.log('Telegram上传方法:', { method, field });
       
       // 重新发送到存储聊天
       const arrayBuffer = await fileResponse.arrayBuffer();
@@ -1051,20 +1078,37 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       const blob = new Blob([arrayBuffer], { type: mimeType });
       tgFormData.append(field, blob, fileName);
       
+      // 添加文件说明，帮助识别
+      if (field !== 'photo') {
+        tgFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
+      }
+      
       const tgResponse = await fetch(
         `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
         { method: 'POST', body: tgFormData }
       );
       
-      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
+      if (!tgResponse.ok) {
+        console.error('Telegram API错误:', await tgResponse.text());
+        throw new Error('Telegram参数配置错误');
+      }
       
       const tgData = await tgResponse.json();
       const result = tgData.result;
       const messageId = result.message_id;
-      const fileId = result.document?.file_id ||
-                    result.video?.file_id ||
-                    result.audio?.file_id ||
-                    (result.photo && result.photo[result.photo.length - 1]?.file_id);
+      let fileId;
+      
+      // 根据不同类型提取file_id
+      if (field === 'photo') {
+        const photos = result.photo;
+        fileId = photos[photos.length - 1]?.file_id; // 获取最大尺寸的图片ID
+      } else if (field === 'video') {
+        fileId = result.video?.file_id;
+      } else if (field === 'audio') {
+        fileId = result.audio?.file_id;
+      } else {
+        fileId = result.document?.file_id;
+      }
                     
       if (!fileId) throw new Error('未获取到文件ID');
       if (!messageId) throw new Error('未获取到tg消息ID');
@@ -1106,7 +1150,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       dbFileId,
       dbMessageId,
       time,
-      key,  // 使用key作为file_name
+      fileName, // 现在使用原始文件名
       contentLength,
       mimeType,
       chatId,
@@ -1875,33 +1919,101 @@ async function handleDeleteRequest(request, config) {
 
 function getContentType(ext) {
   const types = {
+    // 图片类型
     jpg: 'image/jpeg',
     jpeg: 'image/jpeg',
     png: 'image/png',
     gif: 'image/gif',
     webp: 'image/webp',
     svg: 'image/svg+xml',
+    avif: 'image/avif',
+    ico: 'image/x-icon',
     icon: 'image/x-icon',
+    bmp: 'image/bmp',
+    tiff: 'image/tiff',
+    tif: 'image/tiff',
+    
+    // 视频类型
     mp4: 'video/mp4',
     webm: 'video/webm',
+    ogg: 'video/ogg',
+    ogv: 'video/ogg',
+    avi: 'video/x-msvideo',
+    mov: 'video/quicktime',
+    wmv: 'video/x-ms-wmv',
+    flv: 'video/x-flv',
+    mkv: 'video/x-matroska',
+    m4v: 'video/x-m4v',
+    ts: 'video/mp2t',
+    
+    // 音频类型
     mp3: 'audio/mpeg',
     wav: 'audio/wav',
     ogg: 'audio/ogg',
+    m4a: 'audio/mp4',
+    aac: 'audio/aac',
+    flac: 'audio/flac',
+    wma: 'audio/x-ms-wma',
+    
+    // 文档类型
     pdf: 'application/pdf',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    rtf: 'application/rtf',
+    
+    // 文本类型
     txt: 'text/plain',
     md: 'text/markdown',
+    csv: 'text/csv',
+    html: 'text/html',
+    htm: 'text/html',
+    css: 'text/css',
+    js: 'application/javascript',
+    xml: 'application/xml',
+    json: 'application/json',
+    
+    // 压缩文件
     zip: 'application/zip',
     rar: 'application/x-rar-compressed',
-    json: 'application/json',
-    xml: 'application/xml',
+    '7z': 'application/x-7z-compressed',
+    tar: 'application/x-tar',
+    gz: 'application/gzip',
+    
+    // 其他类型
+    swf: 'application/x-shockwave-flash',
+    ttf: 'font/ttf',
+    otf: 'font/otf',
+    woff: 'font/woff',
+    woff2: 'font/woff2',
+    eot: 'application/vnd.ms-fontobject',
+    
+    // 配置文件
     ini: 'text/plain',
-    js: 'application/javascript',
     yml: 'application/yaml',
     yaml: 'application/yaml',
+    toml: 'text/plain',
+    
+    // 编程类文件
     py: 'text/x-python',
-    sh: 'application/x-sh'
+    java: 'text/x-java',
+    c: 'text/x-c',
+    cpp: 'text/x-c++',
+    cs: 'text/x-csharp',
+    php: 'application/x-php',
+    rb: 'text/x-ruby',
+    go: 'text/x-go',
+    rs: 'text/x-rust',
+    sh: 'application/x-sh',
+    bat: 'application/x-bat',
+    sql: 'application/sql'
   };
-  return types[ext] || 'application/octet-stream';
+  
+  const lowerExt = ext.toLowerCase();
+  return types[lowerExt] || 'application/octet-stream';
 }
 
 async function handleBingImagesRequest() {
@@ -3896,6 +4008,7 @@ function getExtensionFromMime(mimeType) {
   if (!mimeType) return 'jpg';
   
   const mimeMap = {
+    // 图片类型
     'image/jpeg': 'jpg',
     'image/jpg': 'jpg',
     'image/png': 'png',
@@ -3903,23 +4016,70 @@ function getExtensionFromMime(mimeType) {
     'image/webp': 'webp',
     'image/svg+xml': 'svg',
     'image/bmp': 'bmp',
+    'image/avif': 'avif',
+    'image/tiff': 'tiff',
+    'image/x-icon': 'ico',
+    
+    // 视频类型
     'video/mp4': 'mp4',
     'video/webm': 'webm',
-    'video/ogg': 'ogg',
+    'video/ogg': 'ogv',
+    'video/x-msvideo': 'avi',
+    'video/quicktime': 'mov',
+    'video/x-ms-wmv': 'wmv',
+    'video/x-flv': 'flv',
+    'video/x-matroska': 'mkv',
+    'video/x-m4v': 'm4v',
+    'video/mp2t': 'ts',
+    
+    // 音频类型
     'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
     'audio/ogg': 'ogg',
     'audio/wav': 'wav',
+    'audio/mp4': 'm4a',
+    'audio/aac': 'aac',
+    'audio/flac': 'flac',
+    'audio/x-ms-wma': 'wma',
+    
+    // 文档类型
     'application/pdf': 'pdf',
     'application/msword': 'doc',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
     'application/vnd.ms-excel': 'xls',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'application/vnd.ms-powerpoint': 'ppt',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+    'application/rtf': 'rtf',
+    
+    // 压缩文件
     'application/zip': 'zip',
     'application/x-rar-compressed': 'rar',
+    'application/x-7z-compressed': '7z',
+    'application/x-tar': 'tar',
+    'application/gzip': 'gz',
+    
+    // 文本类型
     'text/plain': 'txt',
+    'text/markdown': 'md',
+    'text/csv': 'csv',
     'text/html': 'html',
     'text/css': 'css',
-    'text/javascript': 'js'
+    'text/javascript': 'js',
+    'application/javascript': 'js',
+    'application/json': 'json',
+    'application/xml': 'xml',
+    
+    // 字体类型
+    'font/ttf': 'ttf',
+    'font/otf': 'otf',
+    'font/woff': 'woff',
+    'font/woff2': 'woff2',
+    'application/vnd.ms-fontobject': 'eot',
+    
+    // 其他类型
+    'application/octet-stream': 'bin',
+    'application/x-shockwave-flash': 'swf'
   };
   
   return mimeMap[mimeType] || 'bin';
