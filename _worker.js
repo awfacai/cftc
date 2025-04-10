@@ -653,7 +653,7 @@ async function handleCallbackQuery(update, config, userSetting) {
 
 async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
   try {
-    let fileUrl = await getTelegramFileUrl(file.file_id, config.tgBotToken);
+    let fileUrl = await getTelegramFileUrl(file.file_id, config.tgBotToken, config);
     const response = await fetch(fileUrl);
     if (!response.ok) throw new Error(`Failed to fetch file: ${response.status} ${response.statusText}`);
     const contentLength = response.headers.get('content-length');
@@ -753,11 +753,23 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
   }
 }
 
-async function getTelegramFileUrl(fileId, botToken) {
+async function getTelegramFileUrl(fileId, botToken, config) {
   const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
   const data = await response.json();
-  if (!data.ok) throw new Error('获取文件路径失败');
-  return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
+  if (!data.ok) throw new Error('鑾峰彇鏂囦欢璺緞澶辫触');
+  
+  // 获取文件路径
+  const filePath = data.result.file_path;
+  
+  // 从路径中提取文件名
+  const fileName = filePath.split('/').pop();
+  
+  // 如果环境变量中设置了DOMAIN，就使用自定义域名，否则使用Telegram API链接
+  if (config && config.domain) {
+    return `https://${config.domain}/${fileName}`;
+  } else {
+    return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+  }
 }
 
 function authenticate(request, config) {
@@ -3249,26 +3261,26 @@ async function storeFile(arrayBuffer, fileName, mimeType, config) {
 
 async function storeFileInTelegram(arrayBuffer, fileName, mimeType, config) {
   if (!config.tgBotToken || !config.tgStorageChatId) {
-    throw new Error('未配置Telegram存储参数 (TG_BOT_TOKEN 和 TG_STORAGE_CHAT_ID)');
+    throw new Error('鏈厤缃甌elegram瀛樺偍鍙傛暟 (TG_BOT_TOKEN 鍜?TG_STORAGE_CHAT_ID)');
   }
-  
-  // 创建FormData对象模拟文件上传
+
+  // 鍒涘缓FormData瀵硅薄妯℃嫙鏂囦欢涓婁紶
   const formData = new FormData();
   const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
   formData.append('document', blob, fileName);
-  
+
   const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument?chat_id=${config.tgStorageChatId}`, {
     method: 'POST',
     body: formData
   });
-  
+
   const result = await response.json();
   if (result.ok) {
     const fileId = result.result.document.file_id;
-    const fileUrl = await getTelegramFileUrl(fileId, config.tgBotToken);
+    const fileUrl = await getTelegramFileUrl(fileId, config.tgBotToken, config);
     return fileUrl;
   } else {
-    throw new Error('Telegram存储失败：' + JSON.stringify(result));
+    throw new Error('Telegram瀛樺偍澶辫触: ' + JSON.stringify(result));
   }
 }
 
