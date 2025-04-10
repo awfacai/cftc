@@ -1357,7 +1357,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     }).catch(err => console.error('更新处理消息失败:', err));
     
     // 第四步：写入数据库，与网页上传完全一致的格式
-    const time = Math.floor(timestamp / 1000);
+    const time = Date.now(); // 毫秒级时间戳
     
     await config.database.prepare(`
       INSERT INTO files (
@@ -1376,7 +1376,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       finalUrl,
       dbFileId,
       dbMessageId,
-      time,
+      time, // 使用毫秒级时间戳
       fileName, // 现在使用原始文件名
       contentLength,
       mimeType,
@@ -1923,12 +1923,11 @@ async function handleAdminRequest(request, config) {
           <div class="file-info">
             <div>${getFileName(url)}</div>
             <div>大小: ${formatSize(file.file_size || 0)}</div>
-            <div>上传时间: ${new Date(file.created_at).toLocaleString()}</div>
+            <div>上传时间: ${formatDate(file.created_at)}</div>
             <div>分类: ${file.category_name || '无分类'}</div>
           </div>
           <div class="file-actions">
             <button class="btn btn-copy" onclick="copyToClipboard('${url}')">复制链接</button>
-            <a class="btn btn-down" href="${url}" target="_blank">查看</a>
             <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
             <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
             <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
@@ -2357,6 +2356,44 @@ function formatSize(bytes) {
     unitIndex++;
   }
   return `${size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+// 格式化日期，处理不同格式的时间戳
+function formatDate(timestamp) {
+  if (!timestamp) return '未知时间';
+  
+  let date;
+  
+  // 处理数字型时间戳（秒或毫秒）
+  if (typeof timestamp === 'number') {
+    // 判断是秒还是毫秒
+    date = timestamp > 9999999999 ? new Date(timestamp) : new Date(timestamp * 1000);
+  } 
+  // 处理字符串型时间戳
+  else if (typeof timestamp === 'string') {
+    // 尝试直接解析
+    date = new Date(timestamp);
+    
+    // 检查是否为有效日期，如果无效则尝试作为数字解析
+    if (isNaN(date.getTime())) {
+      const numTimestamp = parseInt(timestamp);
+      if (!isNaN(numTimestamp)) {
+        date = numTimestamp > 9999999999 ? new Date(numTimestamp) : new Date(numTimestamp * 1000);
+      }
+    }
+  }
+  // 默认返回当前时间
+  else {
+    date = new Date();
+  }
+  
+  // 检查日期是否有效
+  if (isNaN(date.getTime()) || date.getFullYear() < 2000) {
+    return '日期无效';
+  }
+  
+  // 格式化为本地时间字符串
+  return date.toLocaleString();
 }
 
 async function sendMessage(chatId, text, botToken, replyToMessageId = null) {
@@ -4271,7 +4308,7 @@ async function handleUpdateSuffixRequest(request, config) {
       msg: '更新后缀失败: ' + error.message
     }), { headers: { 'Content-Type': 'application/json' } });
   }
-}
+} 
 
 // 修改generateNewUrl函数，直接使用域名和文件名生成URL
 function generateNewUrl(url, suffix, config) {
