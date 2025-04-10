@@ -560,7 +560,7 @@ async function handleTelegramWebhook(request, config) {
         userSetting = { chat_id: chatId, storage_type: 'r2' };
       }
 
-      await handleCallbackQuery(update, config, userSetting);
+      await handleCallbackQuery(update.callback_query, config, userSetting);
     }
 
     return new Response('OK');
@@ -637,7 +637,7 @@ async function sendPanel(chatId, userSetting, config) {
 请发送图片或文件进行上传，或通过按钮修改设置。
     `;
     
-    await sendMessage(chatId, message, config.botToken, null, {
+    await sendMessage(chatId, message, config.tgBotToken, null, {
       reply_markup: JSON.stringify({
         inline_keyboard: inlineKeyboard
       }),
@@ -647,18 +647,40 @@ async function sendPanel(chatId, userSetting, config) {
     return true;
   } catch (error) {
     console.error(`发送面板时出错: ${error.message}`);
-    await sendMessage(chatId, `发送面板时出错: ${error.message}`, config.botToken);
+    await sendMessage(chatId, `发送面板时出错: ${error.message}`, config.tgBotToken);
     return false;
   }
 }
 
-async function handleCallbackQuery(update, config, userSetting) {
+async function handleCallbackQuery(callbackQuery, config, userSetting) {
   // 获取回调查询数据
-  const callbackQuery = update.callback_query;
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
   const data = callbackQuery.data;
   
+  try {
+    // 根据回调数据执行不同操作
+    if (data === 'close') {
+      // 关闭面板
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text: '面板已关闭'
+        })
+      });
+      return true;
+    } else if (data.startsWith('setStorage:')) {
+      // 设置存储类型
+      const newStorageType = data.split(':')[1];
+      
+      // 更新用户设置
+      await config.database.prepare(`
+        UPDATE user_settings 
+        SET storage_type = ? 
+        WHERE chat_id = ?
   // 根据回调数据执行不同操作
   if (data === 'close') {
     // 关闭面板
