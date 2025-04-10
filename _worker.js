@@ -76,6 +76,8 @@ async function recreateAllTables(config) {
         chat_id TEXT NOT NULL UNIQUE,
         storage_type TEXT DEFAULT 'telegram',
         current_category_id INTEGER,
+        waiting_for TEXT,
+        editing_file_id TEXT,
         FOREIGN KEY (current_category_id) REFERENCES categories(id)
       )
     `).run();
@@ -93,6 +95,7 @@ async function recreateAllTables(config) {
         mime_type TEXT,
         storage_type TEXT DEFAULT 'telegram',
         category_id INTEGER,
+        chat_id TEXT,
         FOREIGN KEY (category_id) REFERENCES categories(id)
       )
     `).run();
@@ -138,7 +141,9 @@ async function validateDatabaseStructure(config) {
         { name: 'id', type: 'INTEGER' },
         { name: 'chat_id', type: 'TEXT' },
         { name: 'storage_type', type: 'TEXT' },
-        { name: 'current_category_id', type: 'INTEGER' }
+        { name: 'current_category_id', type: 'INTEGER' },
+        { name: 'waiting_for', type: 'TEXT' },
+        { name: 'editing_file_id', type: 'TEXT' }
       ],
       files: [
         { name: 'id', type: 'INTEGER' },
@@ -150,7 +155,8 @@ async function validateDatabaseStructure(config) {
         { name: 'file_size', type: 'INTEGER' },
         { name: 'mime_type', type: 'TEXT' },
         { name: 'storage_type', type: 'TEXT' },
-        { name: 'category_id', type: 'INTEGER' }
+        { name: 'category_id', type: 'INTEGER' },
+        { name: 'chat_id', type: 'TEXT' }
       ]
     };
 
@@ -240,6 +246,7 @@ async function recreateUserSettingsTable(config) {
         category_id INTEGER,
         custom_suffix TEXT,
         waiting_for TEXT,
+        editing_file_id TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -337,6 +344,9 @@ async function checkAndAddMissingColumns(config) {
     
     // 检查用户设置表是否有waiting_for字段
     await ensureColumnExists(config, 'user_settings', 'waiting_for', 'TEXT');
+    
+    // 检查用户设置表是否有editing_file_id字段
+    await ensureColumnExists(config, 'user_settings', 'editing_file_id', 'TEXT');
     
     // 检查用户设置表是否有current_category_id列
     await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
@@ -550,6 +560,93 @@ async function handleTelegramWebhook(request, config) {
         await sendPanel(chatId, userSetting, config);
         return new Response('OK');
       }
+      // 处理修改后缀输入
+      else if (userSetting.waiting_for === 'new_suffix' && update.message.text && userSetting.editing_file_id) {
+        // 用户正在输入新后缀
+        const newSuffix = update.message.text.trim();
+        const fileId = userSetting.editing_file_id;
+        
+        try {
+          // 获取文件信息
+          const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
+          if (!file) {
+            await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
+          } else {
+            // 修改后缀
+            // 从URL提取文件名
+            const originalFileName = getFileName(file.url);
+            const fileExt = originalFileName.split('.').pop();
+            const newFileName = `${newSuffix}.${fileExt}`;
+            const fileUrl = `https://${config.domain}/${newFileName}`;
+            
+            // 根据存储类型处理文件
+            let success = false;
+            
+            if (file.storage_type === 'telegram') {
+              // 对于Telegram存储，只更新URL
+              await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+                .bind(fileUrl, file.id).run();
+              success = true;
+            } 
+            else if (file.storage_type === 'r2' && config.bucket) {
+              try {
+                const fileId = file.fileId || originalFileName;
+                const r2File = await config.bucket.get(fileId);
+                
+                if (r2File) {
+                  // 复制文件到新名称
+                  const fileData = await r2File.arrayBuffer();
+                  await storeFile(fileData, newFileName, r2File.httpMetadata.contentType, config);
+
+                  // 删除旧文件
+                  await deleteFile(fileId, config);
+                  
+                  // 更新数据库记录
+                  await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
+                    .bind(newFileName, fileUrl, file.id).run();
+                  success = true;
+                } else {
+                  // 如果R2中没有找到文件，只更新URL
+                  await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+                    .bind(fileUrl, file.id).run();
+                  success = true;
+                }
+              } catch (error) {
+                console.error('处理R2文件重命名失败:', error);
+                
+                // 即使R2操作失败，仍然更新URL
+                await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+                  .bind(fileUrl, file.id).run();
+                success = true;
+              }
+            } 
+            else {
+              // 其他情况，直接更新数据库
+              await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+                .bind(fileUrl, file.id).run();
+              success = true;
+            }
+            
+            if (success) {
+              await sendMessage(chatId, `✅ 后缀修改成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
+            } else {
+              await sendMessage(chatId, "❌ 后缀修改失败，请稍后重试", config.tgBotToken);
+            }
+          }
+        } catch (error) {
+          console.error('修改后缀失败:', error);
+          await sendMessage(chatId, `❌ 修改后缀失败: ${error.message}`, config.tgBotToken);
+        }
+        
+        // 清除等待状态和编辑文件ID
+        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
+        
+        // 更新面板
+        userSetting.waiting_for = null;
+        userSetting.editing_file_id = null;
+        await sendPanel(chatId, userSetting, config);
+        return new Response('OK');
+      }
 
       // 处理命令
       if (update.message.text === '/start') {
@@ -609,6 +706,10 @@ async function sendPanel(chatId, userSetting, config) {
       [
         { text: "📂 选择分类", callback_data: "list_categories" },
         { text: "➕ 新建分类", callback_data: "create_category" }
+      ],
+      [
+        { text: "📝 修改后缀", callback_data: "edit_suffix" },
+        { text: "📋 最近文件", callback_data: "recent_files" }
       ]
     ]
   };
@@ -699,6 +800,96 @@ async function handleCallbackQuery(update, config, userSetting) {
 📋 使用分类: ${stats.total_categories || 0}个`;
 
     await sendMessage(chatId, statsMessage, config.tgBotToken);
+  } else if (cbData === 'edit_suffix') {
+    // 获取用户最近的5个文件
+    const recentFiles = await config.database.prepare(`
+      SELECT id, url, fileId, file_name, created_at, storage_type 
+      FROM files 
+      WHERE chat_id = ?
+      ORDER BY created_at DESC 
+      LIMIT 5
+    `).bind(chatId).all();
+
+    if (!recentFiles.results || recentFiles.results.length === 0) {
+      await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
+      return;
+    }
+
+    const keyboard = {
+      inline_keyboard: recentFiles.results.map(file => {
+        const fileName = file.file_name || getFileName(file.url);
+        return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
+      }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
+    };
+
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: "📝 请选择要修改后缀的文件：",
+        reply_markup: keyboard
+      })
+    });
+  } else if (cbData.startsWith('edit_suffix_file_')) {
+    // 获取文件ID并请求用户输入新后缀
+    const fileId = cbData.split('_')[3];
+    
+    // 查询文件信息
+    const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
+    if (!file) {
+      await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
+      return;
+    }
+
+    // 从URL中提取文件名
+    const fileName = getFileName(file.url);
+    const fileNameParts = fileName.split('.');
+    const extension = fileNameParts.pop(); // 获取扩展名
+    const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
+
+    // 保存文件ID到user_settings，等待用户输入新后缀
+    await config.database.prepare('UPDATE user_settings SET waiting_for = ?, editing_file_id = ? WHERE chat_id = ?')
+      .bind('new_suffix', fileId, chatId).run();
+
+    await sendMessage(chatId, `📝 请回复此消息，输入文件的新后缀\n\n当前文件: ${fileName}\n当前后缀: ${currentSuffix}`, config.tgBotToken);
+  } else if (cbData === 'recent_files') {
+    // 获取用户最近的10个文件
+    const recentFiles = await config.database.prepare(`
+      SELECT id, url, created_at, file_name, storage_type 
+      FROM files 
+      WHERE chat_id = ?
+      ORDER BY created_at DESC 
+      LIMIT 10
+    `).bind(chatId).all();
+
+    if (!recentFiles.results || recentFiles.results.length === 0) {
+      await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
+      return;
+    }
+
+    const filesList = recentFiles.results.map((file, i) => {
+      const fileName = file.file_name || getFileName(file.url);
+      const date = new Date(file.created_at * 1000).toLocaleString();
+      return `${i + 1}. ${fileName}\n   📅 ${date}\n   🔗 ${file.url}`;
+    }).join('\n\n');
+
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: "« 返回", callback_data: "back_to_panel" }]
+      ]
+    };
+
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: "📋 您最近上传的文件：\n\n" + filesList,
+        reply_markup: keyboard,
+        disable_web_page_preview: true
+      })
+    });
   }
 }
 
