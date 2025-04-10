@@ -185,14 +185,53 @@ async function validateDatabaseStructure(config) {
       }
     }
 
-    // 检查默认分类是否存在
+    // 强化检查默认分类是否存在
+    console.log('检查默认分类...');
     const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
       .bind('默认分类').first();
     
     if (!defaultCategory) {
-      console.log('创建默认分类...');
-      await config.database.prepare('INSERT INTO categories (name) VALUES (?)')
-        .bind('默认分类').run();
+      console.log('默认分类不存在，正在创建...');
+      try {
+        // 尝试创建默认分类
+        const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+          .bind('默认分类', Date.now()).run();
+        
+        const newDefaultId = result.meta && result.meta.last_row_id;
+        console.log(`默认分类创建成功，ID: ${newDefaultId}`);
+        
+        // 检查是否有文件或用户设置需要更新到新的默认分类
+        if (newDefaultId) {
+          // 查找没有分类的文件
+          const filesResult = await config.database.prepare('SELECT COUNT(*) as count FROM files WHERE category_id IS NULL').first();
+          if (filesResult && filesResult.count > 0) {
+            console.log(`发现 ${filesResult.count} 个无分类文件，将它们分配到默认分类...`);
+            await config.database.prepare('UPDATE files SET category_id = ? WHERE category_id IS NULL')
+              .bind(newDefaultId).run();
+          }
+          
+          // 更新用户设置中没有分类的记录
+          const settingsResult = await config.database.prepare('SELECT COUNT(*) as count FROM user_settings WHERE current_category_id IS NULL').first();
+          if (settingsResult && settingsResult.count > 0) {
+            console.log(`发现 ${settingsResult.count} 条用户设置没有当前分类，更新为默认分类...`);
+            await config.database.prepare('UPDATE user_settings SET current_category_id = ? WHERE current_category_id IS NULL')
+              .bind(newDefaultId).run();
+          }
+        }
+      } catch (error) {
+        console.error('创建默认分类失败:', error);
+        throw new Error('无法创建默认分类: ' + error.message);
+      }
+    } else {
+      console.log(`默认分类存在，ID: ${defaultCategory.id}`);
+    }
+
+    // 再次验证默认分类是否存在
+    const checkAgain = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
+      .bind('默认分类').first();
+    
+    if (!checkAgain) {
+      throw new Error('验证失败：即使尝试创建后，默认分类仍然不存在');
     }
 
     return true;
@@ -738,10 +777,61 @@ async function handleTelegramWebhook(request, config) {
 async function sendPanel(chatId, userSetting, config) {
   // 获取当前分类
   let categoryName = '默认';
-  if (userSetting && userSetting.category_id) {
-    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(userSetting.category_id).first();
+  let categoryId = userSetting && userSetting.category_id;
+  
+  // 检查该分类是否存在
+  if (categoryId) {
+    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(categoryId).first();
     if (category) {
       categoryName = category.name;
+    } else {
+      // 用户当前分类不存在，需要重置
+      categoryId = null;
+    }
+  }
+  
+  // 如果没有有效的分类，检查默认分类
+  if (!categoryId) {
+    let defaultCategory = await config.database.prepare('SELECT id, name FROM categories WHERE name = ?').bind('默认分类').first();
+    
+    // 如果默认分类不存在，创建它
+    if (!defaultCategory) {
+      try {
+        console.log('默认分类不存在，正在创建...');
+        const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+          .bind('默认分类', Date.now()).run();
+        
+        const newDefaultId = result.meta && result.meta.last_row_id;
+        if (newDefaultId) {
+          defaultCategory = { id: newDefaultId, name: '默认分类' };
+          console.log(`已创建新的默认分类，ID: ${newDefaultId}`);
+          
+          // 更新用户设置
+          if (userSetting) {
+            await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
+              .bind(newDefaultId, chatId).run();
+            
+            // 更新本地userSetting对象
+            userSetting.category_id = newDefaultId;
+            categoryId = newDefaultId;
+          }
+        }
+      } catch (error) {
+        console.error('创建默认分类失败:', error);
+      }
+    } else {
+      // 使用默认分类
+      categoryId = defaultCategory.id;
+      categoryName = defaultCategory.name;
+      
+      // 更新用户设置
+      if (userSetting) {
+        await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
+          .bind(categoryId, chatId).run();
+            
+        // 更新本地userSetting对象
+        userSetting.category_id = categoryId;
+      }
     }
   }
 
@@ -1111,8 +1201,27 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     if (userSetting && userSetting.category_id) {
       categoryId = userSetting.category_id;
     } else {
-      // 找默认分类
-      const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      // 查找默认分类
+      let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      
+      // 如果默认分类不存在，创建它
+      if (!defaultCategory) {
+        try {
+          console.log('默认分类不存在，正在创建...');
+          const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+            .bind('默认分类', Date.now()).run();
+          
+          const newDefaultId = result.meta && result.meta.last_row_id;
+          if (newDefaultId) {
+            defaultCategory = { id: newDefaultId };
+            console.log(`已创建新的默认分类，ID: ${newDefaultId}`);
+          }
+        } catch (error) {
+          console.error('创建默认分类失败:', error);
+          // 继续处理，但不使用分类
+        }
+      }
+      
       if (defaultCategory) {
         categoryId = defaultCategory.id;
       }
@@ -1465,6 +1574,17 @@ async function handleDeleteCategoryRequest(request, config) {
       });
     }
 
+    // 检查是否是默认分类
+    const isDefaultCategory = await config.database.prepare('SELECT id FROM categories WHERE id = ? AND name = ?')
+      .bind(id, '默认分类').first();
+    
+    if (isDefaultCategory) {
+      return new Response(JSON.stringify({ status: 0, msg: "默认分类不能删除" }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(id).first();
     if (!category) {
       return new Response(JSON.stringify({ status: 0, msg: "分类不存在" }), {
@@ -1473,14 +1593,48 @@ async function handleDeleteCategoryRequest(request, config) {
       });
     }
 
-    await config.database.prepare('UPDATE files SET category_id = NULL WHERE category_id = ?').bind(id).run();
-    await config.database.prepare('UPDATE user_settings SET current_category_id = NULL WHERE current_category_id = ?').bind(id).run();
+    // 获取默认分类的ID
+    const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
+      .bind('默认分类').first();
+    
+    // 如果默认分类不存在，先创建它
+    let defaultCategoryId;
+    if (!defaultCategory) {
+      // 创建默认分类
+      const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+        .bind('默认分类', Date.now()).run();
+      
+      defaultCategoryId = result.meta && result.meta.last_row_id ? result.meta.last_row_id : null;
+      console.log('创建了新的默认分类，ID:', defaultCategoryId);
+    } else {
+      defaultCategoryId = defaultCategory.id;
+    }
+
+    // 将当前分类下的文件移动到默认分类，而不是设为NULL
+    if (defaultCategoryId) {
+      await config.database.prepare('UPDATE files SET category_id = ? WHERE category_id = ?')
+        .bind(defaultCategoryId, id).run();
+      
+      // 更新用户设置中的当前分类
+      await config.database.prepare('UPDATE user_settings SET current_category_id = ? WHERE current_category_id = ?')
+        .bind(defaultCategoryId, id).run();
+    } else {
+      // 如果无法创建默认分类，则设为NULL
+      await config.database.prepare('UPDATE files SET category_id = NULL WHERE category_id = ?').bind(id).run();
+      await config.database.prepare('UPDATE user_settings SET current_category_id = NULL WHERE current_category_id = ?').bind(id).run();
+    }
+
+    // 删除请求的分类
     await config.database.prepare('DELETE FROM categories WHERE id = ?').bind(id).run();
 
-    return new Response(JSON.stringify({ status: 1, msg: `分类 "${category.name}" 删除成功` }), {
+    return new Response(JSON.stringify({ 
+      status: 1, 
+      msg: `分类 "${category.name}" 删除成功${defaultCategoryId ? '，相关文件已移至默认分类' : ''}` 
+    }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
+    console.error('删除分类失败:', error);
     return new Response(JSON.stringify({ status: 0, msg: `删除分类失败：${error.message}` }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -1524,8 +1678,29 @@ async function handleUploadRequest(request, config) {
     if (file.size > config.maxSizeMB * 1024 * 1024) throw new Error(`文件超过${config.maxSizeMB}MB限制`);
 
     const chatId = config.tgChatId[0];
-    const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-    const finalCategoryId = categoryId || defaultCategory.id;
+    // 查找默认分类
+    let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+    
+    // 如果默认分类不存在，创建它
+    if (!defaultCategory) {
+      try {
+        console.log('默认分类不存在，正在创建...');
+        const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+          .bind('默认分类', Date.now()).run();
+        
+        const newDefaultId = result.meta && result.meta.last_row_id;
+        if (newDefaultId) {
+          defaultCategory = { id: newDefaultId };
+          console.log(`已创建新的默认分类，ID: ${newDefaultId}`);
+        }
+      } catch (error) {
+        console.error('创建默认分类失败:', error);
+        // 使用categoryId参数或null
+        defaultCategory = { id: categoryId || null };
+      }
+    }
+    
+    const finalCategoryId = categoryId || (defaultCategory ? defaultCategory.id : null);
     await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
       .bind(storageType, finalCategoryId, chatId).run();
 
