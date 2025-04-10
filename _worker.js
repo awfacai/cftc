@@ -3678,6 +3678,28 @@ async function handleUpdateSuffixRequest(request, config) {
     const newFileName = `${suffix}.${fileExt}`;
     let fileUrl = `https://${config.domain}/${newFileName}`;
     
+    // 检查后缀是否已被使用
+    const existingFile = await config.database.prepare('SELECT * FROM files WHERE fileId = ? AND id != ?')
+      .bind(newFileName, fileRecord.id).first();
+      
+    if (existingFile) {
+      return new Response(JSON.stringify({
+        status: 0,
+        msg: '后缀已存在，无法修改'
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    // 同时检查URL是否已存在
+    const existingUrl = await config.database.prepare('SELECT * FROM files WHERE url = ? AND id != ?')
+      .bind(fileUrl, fileRecord.id).first();
+      
+    if (existingUrl) {
+      return new Response(JSON.stringify({
+        status: 0,
+        msg: '该URL已被使用，请尝试其他后缀'
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
     console.log('准备更新文件:', {
       记录ID: fileRecord.id,
       原URL: fileRecord.url,
@@ -3913,4 +3935,3 @@ async function fetchNotification() {
     return null;
   }
 }
-  
