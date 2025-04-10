@@ -688,12 +688,7 @@ async function sendPanel(chatId, userSetting, config) {
   }
 
   // 尝试获取GitHub通知内容
-  let notificationText = null;
-  try {
-    notificationText = await fetchNotification();
-  } catch (error) {
-    console.error('获取通知失败:', error);
-  }
+  let notificationText = await fetchNotification();
 
   // 如果无法获取通知，使用默认文本
   const defaultNotification = `➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
@@ -1650,7 +1645,10 @@ async function handleFileRequest(request, config) {
           return new Response(object.body, { headers });
         }
       } catch (error) {
-        console.error('R2获取文件出错:', error);
+        // 只记录真正的错误，避免记录文件不存在的普通情况
+        if (error.name !== 'NoSuchKey') {
+          console.error('R2获取文件错误:', error.name);
+        }
         // 继续尝试其他方式获取文件
       }
     }
@@ -1676,11 +1674,9 @@ async function handleFileRequest(request, config) {
     }
 
     if (!file) {
-      console.log(`文件未找到: path=${path}, url=${urlPattern}`);
+      // 文件不存在属于正常情况，不需要记录
       return new Response('File not found', { status: 404 });
     }
-
-    console.log(`找到文件: id=${file.id}, storage_type=${file.storage_type}, fileId=${file.fileId}`);
 
     // 根据存储类型处理文件
     if (file.storage_type === 'telegram') {
@@ -1690,46 +1686,40 @@ async function handleFileRequest(request, config) {
         const telegramFileId = file.fileId;
         
         if (!telegramFileId) {
-          console.error('文件记录缺少Telegram fileId:', file);
+          console.error('文件记录缺少Telegram fileId');
           return new Response('Missing Telegram file ID', { status: 500 });
         }
-        
-        console.log(`尝试从Telegram获取文件: fileId=${telegramFileId}`);
         
         // 从Telegram获取文件链接
         const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
         const data = await response.json();
         
         if (!data.ok) {
-          console.error('Telegram getFile 失败:', data);
+          console.error('Telegram getFile 失败:', data.description);
           return new Response('Failed to get file from Telegram', { status: 500 });
         }
         
         const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-        console.log(`获取到Telegram文件URL: ${telegramUrl}`);
         
         const fileResponse = await fetch(telegramUrl);
         
         if (!fileResponse.ok) {
-          console.error(`从Telegram获取文件内容失败: ${fileResponse.status}`);
+          console.error(`从Telegram获取文件失败: ${fileResponse.status}`);
           return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
         }
         
         const contentType = file.mime_type || getContentType(path.split('.').pop());
         const headers = getCommonHeaders(contentType);
         
-        console.log(`准备返回Telegram文件: contentType=${contentType}`);
-        
         // 流式传输文件内容，避免内存占用过大
         return new Response(fileResponse.body, { headers });
       } catch (error) {
-        console.error('处理Telegram文件出错:', error);
+        console.error('处理Telegram文件出错:', error.message);
         return new Response('Error processing Telegram file', { status: 500 });
       }
     } else if (file.storage_type === 'r2' && config.bucket) {
       // 如果是R2存储但前面直接访问失败，再尝试通过fileId获取
       try {
-        console.log(`尝试通过fileId从R2获取文件: fileId=${file.fileId}`);
         const object = await config.bucket.get(file.fileId);
         
         if (object) {
@@ -1738,26 +1728,21 @@ async function handleFileRequest(request, config) {
           object.writeHttpMetadata(headers);
           headers.set('etag', object.httpEtag);
           
-          console.log(`准备返回R2文件: contentType=${contentType}`);
           return new Response(object.body, { headers });
-        } else {
-          console.log(`在R2中未找到文件: fileId=${file.fileId}`);
         }
       } catch (error) {
-        console.error('通过fileId从R2获取文件出错:', error);
+        console.error('通过fileId从R2获取文件出错:', error.message);
       }
     }
     
     // 如果上述方法都失败，尝试重定向到文件URL
     if (file.url && file.url !== urlPattern) {
-      console.log(`重定向到文件URL: ${file.url}`);
       return Response.redirect(file.url, 302);
     }
     
-    console.log('无法获取文件内容');
     return new Response('File not available', { status: 404 });
   } catch (error) {
-    console.error('处理文件请求出错:', error);
+    console.error('处理文件请求出错:', error.message);
     return new Response('Internal Server Error', { status: 500 });
   }
 }
@@ -3850,8 +3835,9 @@ async function storeFile(arrayBuffer, fileName, mimeType, config) {
       });
       return `https://${config.domain}/${fileName}`;
     } catch (error) {
-      console.error('R2存储失败，尝试退回到Telegram存储:', error);
-      // 如果R2操作失败，尝试使用Telegram
+      // 减少日志输出，使用更简洁的错误消息
+      console.error(`R2存储失败: ${error.message}`);
+      // 尝试使用Telegram作为备选存储
       return await storeFileInTelegram(arrayBuffer, fileName, mimeType, config);
     }
   } else {
@@ -3862,10 +3848,10 @@ async function storeFile(arrayBuffer, fileName, mimeType, config) {
 
 async function storeFileInTelegram(arrayBuffer, fileName, mimeType, config) {
   if (!config.tgBotToken || !config.tgStorageChatId) {
-    throw new Error('鏈厤缃甌elegram瀛樺偍鍙傛暟 (TG_BOT_TOKEN 鍜?TG_STORAGE_CHAT_ID)');
+    throw new Error('未配置Telegram存储参数 (TG_BOT_TOKEN 和 TG_STORAGE_CHAT_ID)');
   }
 
-  // 鍒涘缓FormData瀵硅薄妯℃嫙鏂囦欢涓婁紶
+  // 创建FormData对象模拟文件上传
   const formData = new FormData();
   const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
   formData.append('document', blob, fileName);
@@ -3881,7 +3867,7 @@ async function storeFileInTelegram(arrayBuffer, fileName, mimeType, config) {
     const fileUrl = await getTelegramFileUrl(fileId, config.tgBotToken, config);
     return fileUrl;
   } else {
-    throw new Error('Telegram瀛樺偍澶辫触: ' + JSON.stringify(result));
+    throw new Error('Telegram存储失败: ' + JSON.stringify(result));
   }
 }
 
@@ -3914,16 +3900,16 @@ async function deleteFile(fileId, config) {
 // 从GitHub获取通知内容
 async function fetchNotification() {
   try {
-    const response = await fetch('https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/cftc.md?token=GHSAT0AAAAAADAQE7XCIJR632MKTZ2CXN6YZ7X5JXQ');
+    const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
     
-    if (response.ok) {
-      return await response.text();
-    } else {
-      console.error('获取通知内容失败:', response.status);
+    if (!response.ok) {
+      // 静默失败，返回null而不打印错误日志
       return null;
     }
+    
+    return await response.text();
   } catch (error) {
-    console.error('获取通知内容出错:', error);
+    // 静默失败，返回null而不打印错误日志
     return null;
   }
 }
