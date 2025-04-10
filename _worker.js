@@ -464,127 +464,180 @@ export default {
 async function handleTelegramWebhook(request, config) {
   try {
     const update = await request.json();
+    
+    // 优化：立即发送HTTP 200响应，防止Telegram重发消息，加速用户体验
+    const responsePromise = new Response(JSON.stringify({ ok: true }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
 
-    // 如果收到的是消息
-    if (update.message) {
-      const chatId = update.message.chat.id.toString();
-
-      // 检查用户是否有设置记录，没有则创建
-      let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
-      if (!userSetting) {
-        await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
-        userSetting = { chat_id: chatId, storage_type: 'r2' };
-      }
-
-      // 检查用户是否在等待输入
-      if (userSetting.waiting_for === 'new_category' && update.message.text) {
-        // 用户正在创建新分类
-        const categoryName = update.message.text.trim();
-        
-        try {
-          // 检查分类名是否已存在
-          const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-          if (existingCategory) {
-            await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
-          } else {
-            // 创建新分类
-            const time = Date.now();
-            await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)').bind(categoryName, time).run();
+    // 以下处理逻辑不会阻塞响应，将在后台异步处理
+    (async () => {
+      try {
+        if (update.message && update.message.chat) {
+          const chatId = update.message.chat.id;
+          
+          // 检查用户设置，如果不存在则创建
+          let userSetting = await config.database
+            .prepare('SELECT * FROM user_settings WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
             
-            // 获取新创建的分类ID
-            const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-            
-            // 设置为当前分类
-            await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
-            
-            await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
+          if (!userSetting) {
+            await config.database
+              .prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)')
+              .bind(chatId, 'r2')
+              .run();
+              
+            userSetting = {
+              chat_id: chatId,
+              storage_type: 'r2',
+              category_id: null
+            };
           }
-        } catch (error) {
-          console.error('创建分类失败:', error);
-          await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
+          
+          // 回复键盘命令
+          if (update.message.text === '/start') {
+            await sendPanel(chatId, userSetting, config);
+            return;
+          }
+
+          // 处理媒体上传 - 针对不同类型媒体进行快速处理
+          const msg = update.message;
+          const mediaTypes = [
+            { check: msg.photo, file: msg.photo ? msg.photo[msg.photo.length - 1] : null, isDoc: false },
+            { check: msg.document, file: msg.document, isDoc: true },
+            { check: msg.video, file: msg.video, isDoc: false },
+            { check: msg.audio, file: msg.audio, isDoc: false }
+          ];
+          
+          const mediaType = mediaTypes.find(type => type.check);
+          if (mediaType) {
+            // 向用户发送处理中消息，提升用户体验
+            const processingMsg = await sendMessage(chatId, "⏳ 正在处理您的媒体文件，请稍候...", config.tgBotToken);
+            
+            await handleMediaUpload(chatId, mediaType.file, mediaType.isDoc, config, userSetting);
+            
+            // 如有需要，可以删除处理中的消息
+            // await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${chatId}&message_id=${processingMsg.message_id}`);
+            return;
+          }
+          
+          // 对于其他类型的消息，发送帮助面板
+          await sendPanel(chatId, userSetting, config);
+        } else if (update.callback_query) {
+          // 处理回调查询
+          const userSetting = await config.database
+            .prepare('SELECT * FROM user_settings WHERE chat_id = ?')
+            .bind(update.callback_query.from.id)
+            .first();
+            
+          await handleCallbackQuery(update, config, userSetting || {
+            chat_id: update.callback_query.from.id,
+            storage_type: 'r2',
+            category_id: null
+          });
         }
-        
-        // 清除等待状态
-        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
-        
-        // 更新面板
-        userSetting.waiting_for = null;
-        await sendPanel(chatId, userSetting, config);
-        return new Response('OK');
+      } catch (error) {
+        console.error('Telegram webhook处理错误:', error);
+        // 尝试向用户发送错误信息
+        if (update.message && update.message.chat) {
+          await sendMessage(update.message.chat.id, `❌ 操作出错: ${error.message}`, config.tgBotToken);
+        }
       }
-
-      // 处理命令
-      if (update.message.text === '/start') {
-        await sendPanel(chatId, userSetting, config);
-      }
-      // 处理文件上传
-      else if (update.message.photo || update.message.document) {
-        const file = update.message.document || update.message.photo?.slice(-1)[0];
-        await handleMediaUpload(chatId, file, !!update.message.document, config, userSetting);
-      }
-    }
-    // 处理回调查询（按钮点击）
-    else if (update.callback_query) {
-      const chatId = update.callback_query.from.id.toString();
-      let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
-      if (!userSetting) {
-        await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
-        userSetting = { chat_id: chatId, storage_type: 'r2' };
-      }
-
-      await handleCallbackQuery(update, config, userSetting);
-    }
-
-    return new Response('OK');
+    })();
+    
+    return responsePromise;
   } catch (error) {
-    console.error('Error handling webhook:', error);
-    return new Response('Error processing webhook', { status: 500 });
+    console.error('Webhook解析错误:', error);
+    return new Response(JSON.stringify({ error: 'Invalid webhook data' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
 async function sendPanel(chatId, userSetting, config) {
-  // 获取当前分类
-  let categoryName = '默认';
-  if (userSetting && userSetting.category_id) {
-    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(userSetting.category_id).first();
-    if (category) {
-      categoryName = category.name;
-    }
-  }
+  try {
+    // 提前准备数据，并行获取
+    const [categoriesPromise, mediaStatsPromise] = await Promise.all([
+      // 获取所有分类
+      config.database.prepare('SELECT * FROM categories ORDER BY name').all(),
+      // 获取用户媒体统计
+      config.database.prepare(`
+        SELECT COUNT(*) as count, SUM(file_size) as total_size 
+        FROM media 
+        WHERE chat_id = ?
+      `).bind(chatId).first()
+    ]);
 
-  const message = `📲 图床助手 3.0
-  
-📡 系统状态 ─────────────
-🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}
-🔹 当前分类: ${categoryName}
-🔹 文件大小: 最大${config.maxSizeMB}MB
-
-➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
-➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作`;
-
-  const keyboard = {
-    inline_keyboard: [
+    const categories = await categoriesPromise;
+    const mediaStats = await mediaStatsPromise;
+    
+    // 构建按钮
+    let keyboard = [
       [
-        { text: "🔄 切换存储方式", callback_data: "switch_storage" },
-        { text: "📊 统计信息", callback_data: "stats" }
-      ],
-      [
-        { text: "📂 选择分类", callback_data: "list_categories" },
-        { text: "➕ 新建分类", callback_data: "create_category" }
+        { text: '🗂 选择分类', callback_data: 'select_category' },
+        { text: '📝 创建分类', callback_data: 'new_category' }
       ]
-    ]
-  };
+    ];
+    
+    // 显示当前选择的分类名称
+    let currentCategory = '未选择';
+    if (userSetting.category_id) {
+      const category = categories.results.find(c => c.id === userSetting.category_id);
+      if (category) {
+        currentCategory = category.name;
+      }
+    }
+    
+    // 构建消息文本
+    const fileCount = mediaStats?.count || 0;
+    const totalSize = mediaStats?.total_size || 0;
+    const readableSize = formatBytes(totalSize);
+    
+    const messageText = `
+🤖 *媒体管家机器人*
+---------------------
+👤 用户ID: \`${chatId}\`
+🗂 当前分类: *${currentCategory}*
+📊 统计信息:
+  📁 文件数量: ${fileCount}
+  💾 总大小: ${readableSize}
+---------------------
+发送图片或文件即可上传并分享
+    `;
+    
+    // 发送带有内联键盘的消息
+    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: messageText,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: keyboard }
+      })
+    });
+    
+    return await response.json();
+  } catch (error) {
+    console.error('发送面板失败:', error);
+    // 发送简化版面板以确保用户收到响应
+    await sendMessage(chatId, '❌ 加载面板时出错。请发送图片或文件进行上传。', config.tgBotToken);
+  }
+}
 
-  await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: message,
-      reply_markup: keyboard,
-      parse_mode: 'HTML'
-    })
-  });
+// 格式化字节大小为可读格式
+function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
 async function handleCallbackQuery(update, config, userSetting) {
@@ -664,163 +717,58 @@ async function handleCallbackQuery(update, config, userSetting) {
   }
 }
 
-async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
+async function handleMediaUpload(message, chatId, userSetting, config) {
   try {
-    // 第一步：获取文件内容
-    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
-    const data = await response.json();
-    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
-
-    const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-    const fileResponse = await fetch(telegramUrl);
-
-    if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
-    const contentLength = fileResponse.headers.get('content-length');
-  
-    // 检查文件大小
-    if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
-      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
+    // 发送处理中消息
+    const processingMessage = await sendMessage(chatId, '⏳ 正在处理您的媒体文件...', config.tgBotToken);
+    
+    // 获取文件信息
+    const file = getFileFromMessage(message);
+    if (!file) {
+      await sendMessage(chatId, '❌ 无法识别的文件类型', config.tgBotToken);
       return;
     }
+    
+    // 获取文件详情
+    const fileInfo = await getFileInfo(file.file_id, config.tgBotToken);
+    if (!fileInfo || !fileInfo.result || !fileInfo.result.file_path) {
+      await sendMessage(chatId, '❌ 无法获取文件信息', config.tgBotToken);
+      return;
+    }
+    
+    // 下载文件
+    const downloadUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${fileInfo.result.file_path}`;
+    const fileResponse = await fetch(downloadUrl);
+    const fileData = await fileResponse.arrayBuffer();
+    
+    // 生成唯一文件名
+    const timestamp = Math.floor(Date.now() / 1000); // 使用秒级时间戳
+    const fileExt = getFileExtension(file.file_name || fileInfo.result.file_path);
+    const uniqueFileName = `${timestamp}_${Math.random().toString(36).substring(2, 8)}.${fileExt}`;
+    
+    // 保存文件到数据库
+    const categoryId = userSetting.category_id || 1; // 默认分类ID为1
+    const mediaId = await saveMediaRecord(chatId, uniqueFileName, fileData.byteLength, categoryId, timestamp, config);
+    
+    // 构建文件访问链接
+    const fileUrl = `${config.domain}/media/${mediaId}`;
+    
+    // 发送成功消息
+    const dateStr = new Date(timestamp * 1000).toLocaleString(); // 将秒级时间戳转换为日期
+    await deleteMessage(chatId, processingMessage.result.message_id, config.tgBotToken);
+    await sendMessage(chatId, `✅ 媒体上传成功!
+    
+📋 文件信息:
+- 📝 文件名: ${uniqueFileName}
+- 📅 上传时间: ${dateStr}
+- 📦 文件大小: ${formatBytes(fileData.byteLength)}
+- 🔗 访问链接: ${fileUrl}`, config.tgBotToken);
 
-    // 第二步：准备文件数据，与网页上传保持一致的格式
-    // 获取文件扩展名和MIME类型
-    let fileName = '';
-    let ext = '';
-    
-    if (isDocument && file.file_name) {
-      fileName = file.file_name;
-      ext = (fileName.split('.').pop() || '').toLowerCase();
-    } else {
-      ext = getExtensionFromMime(file.mime_type);
-      fileName = `image.${ext}`;
-    }
-    
-    const mimeType = file.mime_type || getContentType(ext);
-    const [mainType] = mimeType.split('/');
-    
-    // 第三步：根据存储类型(r2 或 telegram)处理文件存储
-    const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
-    
-    // 获取分类ID
-    let categoryId = null;
-    if (userSetting && userSetting.category_id) {
-      categoryId = userSetting.category_id;
-    } else {
-      // 找默认分类
-      const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-      if (defaultCategory) {
-        categoryId = defaultCategory.id;
-      }
-    }
-    
-    let finalUrl, dbFileId, dbMessageId;
-    
-    // 与网页上传一致，使用时间戳作为文件名
-    const timestamp = Date.now();
-    const key = `${timestamp}.${ext}`;
-    
-    if (storageType === 'r2' && config.bucket) {
-      // 上传到R2存储
-      const arrayBuffer = await fileResponse.arrayBuffer();
-      await config.bucket.put(key, arrayBuffer, { 
-        httpMetadata: { contentType: mimeType } 
-      });
-      finalUrl = `https://${config.domain}/${key}`;
-      dbFileId = key;
-      dbMessageId = 0;
-    } else {
-      // 使用Telegram存储
-      // 根据文件类型选择不同的发送方法
-      const typeMap = {
-        image: { method: 'sendPhoto', field: 'photo' },
-        video: { method: 'sendVideo', field: 'video' },
-        audio: { method: 'sendAudio', field: 'audio' }
-      };
-      let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
-      
-      if (['application', 'text'].includes(mainType)) {
-        method = 'sendDocument';
-        field = 'document';
-      }
-      
-      // 重新发送到存储聊天
-      const arrayBuffer = await fileResponse.arrayBuffer();
-      const tgFormData = new FormData();
-      tgFormData.append('chat_id', config.tgStorageChatId);
-      const blob = new Blob([arrayBuffer], { type: mimeType });
-      tgFormData.append(field, blob, fileName);
-      
-      const tgResponse = await fetch(
-        `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
-        { method: 'POST', body: tgFormData }
-      );
-      
-      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
-      
-      const tgData = await tgResponse.json();
-      const result = tgData.result;
-      const messageId = result.message_id;
-      const fileId = result.document?.file_id ||
-                    result.video?.file_id ||
-                    result.audio?.file_id ||
-                    (result.photo && result.photo[result.photo.length - 1]?.file_id);
-                    
-      if (!fileId) throw new Error('未获取到文件ID');
-      if (!messageId) throw new Error('未获取到tg消息ID');
-      
-      finalUrl = `https://${config.domain}/${key}`;
-      dbFileId = fileId;
-      dbMessageId = messageId;
-    }
-    
-    // 第四步：写入数据库，与网页上传完全一致的格式
-    // 修正时间格式，使用ISO标准格式
-    const now = new Date();
-    const isoTimeString = now.toISOString(); // 使用ISO格式的时间
-    
-    await config.database.prepare(`
-      INSERT INTO files (
-        url, 
-        fileId, 
-        message_id, 
-        created_at, 
-        file_name, 
-        file_size, 
-        mime_type, 
-        chat_id, 
-        category_id, 
-        storage_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      finalUrl,
-      dbFileId,
-      dbMessageId,
-      isoTimeString, // 使用ISO格式的时间字符串
-      key,  // 使用key作为file_name
-      contentLength,
-      mimeType,
-      chatId,
-      categoryId,
-      storageType
-    ).run();
-    
-    // 第五步：发送成功消息给用户
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
-    
-    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        photo: qrCodeUrl,
-        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`,
-        parse_mode: 'HTML'
-      })
-    });
+    return { success: true, fileUrl };
   } catch (error) {
-    console.error("Error handling media upload:", error);
-    await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
+    console.error('媒体上传失败:', error);
+    await sendMessage(chatId, `❌ 媒体上传失败: ${error.message}`, config.tgBotToken);
+    return { success: false, error: error.message };
   }
 }
 
@@ -2365,13 +2313,310 @@ function generateAdminPage(fileCards, categoryOptions) {
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
+    <link rel="shortcut icon" href="https://pan.811520.xyz/2025-02/1739241502-tgfile-favicon.ico" type="image/x-icon">
+    <meta name="description" content="Telegram文件存储与分享平台">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>文件管理</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons/font/bootstrap-icons.css">
     <style>
-      /* CSS样式（保留原有样式）*/
-      /* ... existing code ... */
+      body {
+        font-family: 'Segoe UI', Arial, sans-serif;
+        margin: 0;
+        padding: 20px;
+        min-height: 100vh;
+        background: linear-gradient(135deg, #f0f4f8, #d9e2ec);
+      }
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .header {
+        background: rgba(255, 255, 255, 0.95);
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        margin-bottom: 1.5rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      h2 {
+        color: #2c3e50;
+        margin: 0;
+        font-size: 1.8rem;
+      }
+      .right-content {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      .search, .category-filter {
+        padding: 0.7rem;
+        border: 2px solid #dfe6e9;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        background: #fff;
+        transition: border-color 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+      }
+      .search:focus, .category-filter:focus {
+        outline: none;
+        border-color: #3498db;
+      }
+      .backup {
+        color: #3498db;
+        text-decoration: none;
+        font-size: 1rem;
+        transition: color 0.3s ease;
+      }
+      .backup:hover {
+        color: #2980b9;
+      }
+      .action-bar {
+        background: rgba(255, 255, 255, 0.95);
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        margin-bottom: 1.5rem;
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .action-bar-left {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      .action-bar-right {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      .action-bar h3 {
+        margin: 0;
+        color: #2c3e50;
+        font-size: 1.2rem;
+      }
+      .action-bar select {
+        padding: 0.7rem;
+        border: 2px solid #dfe6e9;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        background: #fff;
+        transition: border-color 0.3s ease;
+      }
+      .action-bar select:focus {
+        outline: none;
+        border-color: #3498db;
+      }
+      .action-button {
+        padding: 0.7rem 1.5rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.9rem;
+      }
+      .select-all-btn {
+        background: #3498db;
+        color: white;
+      }
+      .delete-files-btn {
+        background: #e74c3c;
+        color: white;
+      }
+      .delete-category-btn {
+        background: #e74c3c;
+        color: white;
+      }
+      .action-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .select-all-btn:hover {
+        background: #2980b9;
+      }
+      .delete-files-btn:hover {
+        background: #c0392b;
+      }
+      .delete-category-btn:hover {
+        background: #c0392b;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+        gap: 1.5rem;
+      }
+      .file-card {
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 15px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        overflow: hidden;
+        position: relative;
+        transition: all 0.3s ease;
+        cursor: pointer;
+      }
+      .file-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+      }
+      .file-card.selected {
+        border: 3px solid #3498db;
+      }
+      .file-checkbox {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 5;
+        width: 20px;
+        height: 20px;
+      }
+      .file-preview {
+        height: 150px;
+        background: #f8f9fa;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .file-preview img, .file-preview video {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+      }
+      .file-info {
+        padding: 1rem;
+        font-size: 0.9rem;
+        color: #2c3e50;
+      }
+      .file-actions {
+        padding: 1rem;
+        border-top: 1px solid #eee;
+        display: flex;
+        justify-content: space-between;
+        gap: 0.5rem;
+      }
+      .btn {
+        padding: 0.5rem 1rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.9rem;
+      }
+      .btn-copy {
+        background: #3498db;
+        color: white;
+      }
+      .btn-down {
+        background: #2ecc71;
+        color: white;
+        text-decoration: none;
+      }
+      .btn-delete {
+        background: #e74c3c;
+        color: white;
+      }
+      .btn-edit {
+        background: #f39c12;
+        color: white;
+      }
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .btn-copy:hover {
+        background: #2980b9;
+      }
+      .btn-down:hover {
+        background: #27ae60;
+      }
+      .btn-delete:hover {
+        background: #c0392b;
+      }
+      .btn-edit:hover {
+        background: #e67e22;
+      }
+      
+      /* 美化弹窗样式 */
+      .modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .modal.show {
+        display: flex;
+        opacity: 1;
+      }
+      .modal-content {
+        background: white;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        text-align: center;
+        width: 90%;
+        max-width: 400px;
+        transform: scale(0.9);
+        transition: transform 0.3s ease;
+      }
+      .modal.show .modal-content {
+        transform: scale(1);
+      }
+      .modal-title {
+        color: #2c3e50;
+        font-size: 1.3rem;
+        margin-top: 0;
+        margin-bottom: 1rem;
+      }
+      .modal-message {
+        margin-bottom: 1.5rem;
+        color: #34495e;
+        line-height: 1.5;
+      }
+      .modal-buttons {
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+      }
+      .modal-button {
+        padding: 0.8rem 1.8rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.95rem;
+        font-weight: 500;
+      }
+      .modal-confirm {
+        background: #3498db;
+        color: white;
+      }
+      .modal-cancel {
+        background: #95a5a6;
+        color: white;
+      }
+      .modal-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .modal-confirm:hover {
+        background: #2980b9;
+      }
+      .modal-cancel:hover {
+        background: #7f8c8d;
+      }
       
       /* 二维码弹窗样式 */
       #qrModal {
@@ -2415,15 +2660,6 @@ function generateAdminPage(fileCards, categoryOptions) {
       #qrcode {
         margin: 1.5rem auto;
       }
-      .qr-url {
-        word-break: break-all;
-        margin-bottom: 1.5rem;
-        padding: 0.7rem;
-        background: #f5f6fa;
-        border-radius: 5px;
-        border: 1px solid #dfe4ea;
-        color: #2c3e50;
-      }
       .qr-buttons {
         display: flex;
         gap: 1rem;
@@ -2458,6 +2694,40 @@ function generateAdminPage(fileCards, categoryOptions) {
       .qr-close:hover {
         background: #7f8c8d;
       }
+      
+      /* 修改后缀弹窗样式 */
+      #editSuffixModal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      }
+      #editSuffixModal.show {
+        display: flex;
+      }
+      #editSuffixModal .modal-content {
+        background: white;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        text-align: center;
+        width: 90%;
+        max-width: 400px;
+      }
+      #editSuffixModal input {
+        width: 100%;
+        padding: 0.8rem;
+        margin: 1rem 0;
+        border: 2px solid #dfe6e9;
+        border-radius: 8px;
+        font-size: 1rem;
+      }
     </style>
   </head>
   <body>
@@ -2473,7 +2743,7 @@ function generateAdminPage(fileCards, categoryOptions) {
           <input type="text" class="search" placeholder="搜索文件..." id="searchInput">
         </div>
       </div>
-
+      
       <div class="action-bar">
         <div class="action-bar-left">
           <button class="action-button select-all-btn" id="selectAllBtn">全选</button>
@@ -2488,11 +2758,11 @@ function generateAdminPage(fileCards, categoryOptions) {
           <button class="action-button delete-category-btn" id="deleteCategoryBtn">删除分类</button>
         </div>
       </div>
-
+      
       <div class="grid" id="fileGrid">
         ${fileCards}
       </div>
-
+      
       <!-- 通用确认弹窗 -->
       <div id="confirmModal" class="modal">
         <div class="modal-content">
@@ -2504,20 +2774,19 @@ function generateAdminPage(fileCards, categoryOptions) {
           </div>
         </div>
       </div>
-
+      
       <!-- 二维码弹窗 -->
       <div id="qrModal" class="modal">
         <div class="qr-content">
           <h3 class="qr-title">分享文件</h3>
           <div id="qrcode"></div>
-          <p class="qr-url" id="qrUrl"></p>
           <div class="qr-buttons">
             <button class="qr-copy" id="qrCopyBtn">复制链接</button>
             <button class="qr-close" id="qrCloseBtn">关闭</button>
           </div>
         </div>
       </div>
-
+      
       <!-- 修改后缀弹窗 -->
       <div id="editSuffixModal" class="modal">
         <div class="modal-content">
@@ -2543,7 +2812,7 @@ function generateAdminPage(fileCards, categoryOptions) {
             document.body.style.backgroundImage = \`url(\${data.data[randomIndex].url})\`;
           }
         } catch (error) {
-          console.error('获取背景图失败', error);
+          console.error('获取背景图失败:', error);
         }
       }
       setBingBackground();
@@ -2564,12 +2833,11 @@ function generateAdminPage(fileCards, categoryOptions) {
       const qrModal = document.getElementById('qrModal');
       const qrCopyBtn = document.getElementById('qrCopyBtn');
       const qrCloseBtn = document.getElementById('qrCloseBtn');
-      const qrUrl = document.getElementById('qrUrl');
       const editSuffixModal = document.getElementById('editSuffixModal');
       const editSuffixInput = document.getElementById('editSuffixInput');
       const editSuffixConfirm = document.getElementById('editSuffixConfirm');
       const editSuffixCancel = document.getElementById('editSuffixCancel');
-
+      
       let currentShareUrl = '';
       let currentConfirmCallback = null;
 
@@ -2579,22 +2847,22 @@ function generateAdminPage(fileCards, categoryOptions) {
       // 初始化文件点击事件
       fileCards.forEach(card => {
         const checkbox = card.querySelector('.file-checkbox');
-
+        
         // 点击卡片区域就可以选中/取消选中文件
         card.addEventListener('click', (e) => {
           // 如果点击在按钮上则不触发选择
-          if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A' ||
+          if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A' || 
               e.target.closest('.btn') || e.target.closest('.file-actions')) {
             return;
           }
-
+          
           // 切换复选框状态
           checkbox.checked = !checkbox.checked;
           // 更新卡片选中状态
           card.classList.toggle('selected', checkbox.checked);
           e.preventDefault(); // 防止其他点击事件
         });
-
+        
         // 复选框状态变化时更新卡片选中状态
         checkbox.addEventListener('change', () => {
           card.classList.toggle('selected', checkbox.checked);
@@ -2620,7 +2888,7 @@ function generateAdminPage(fileCards, categoryOptions) {
       selectAllBtn.addEventListener('click', () => {
         const visibleCards = fileCards.filter(card => card.style.display !== 'none');
         const allSelected = visibleCards.every(card => card.querySelector('.file-checkbox').checked);
-
+        
         visibleCards.forEach(card => {
           const checkbox = card.querySelector('.file-checkbox');
           checkbox.checked = !allSelected;
@@ -2635,9 +2903,9 @@ function generateAdminPage(fileCards, categoryOptions) {
           showConfirmModal('请先选择要删除的文件！', null, true);
           return;
         }
-
+        
         showConfirmModal(
-          \`确定要删除选中的 \${selectedCheckboxes.length} 个文件吗？\`,
+          \`确定要删除选中的 \${selectedCheckboxes.length} 个文件吗？\`, 
           deleteSelectedFiles
         );
       });
@@ -2653,7 +2921,7 @@ function generateAdminPage(fileCards, categoryOptions) {
 
         const categoryName = select.options[select.selectedIndex].text;
         showConfirmModal(
-          \`确定要删除分类 "\${categoryName}" 吗？这将清空所有关联文件的分类！\`,
+          \`确定要删除分类 "\${categoryName}" 吗？这将清空所有关联文件的分类！\`, 
           deleteCategory
         );
       });
@@ -2671,7 +2939,6 @@ function generateAdminPage(fileCards, categoryOptions) {
           colorLight: "#ffffff",
           correctLevel: QRCode.CorrectLevel.H
         });
-        qrUrl.textContent = url;
         qrModal.classList.add('show');
       }
 
@@ -2699,7 +2966,7 @@ function generateAdminPage(fileCards, categoryOptions) {
       function showConfirmModal(message, callback, alertOnly = false) {
         confirmModalMessage.textContent = message;
         currentConfirmCallback = callback;
-
+        
         if (alertOnly) {
           confirmModalConfirm.textContent = '确定';
           confirmModalCancel.style.display = 'none';
@@ -2707,7 +2974,7 @@ function generateAdminPage(fileCards, categoryOptions) {
           confirmModalConfirm.textContent = '确认';
           confirmModalCancel.style.display = 'inline-block';
         }
-
+        
         confirmModal.classList.add('show');
       }
 
@@ -2753,7 +3020,7 @@ function generateAdminPage(fileCards, categoryOptions) {
             const errorData = await response.json();
             throw new Error(errorData.error || '删除失败');
           }
-
+          
           if (card) {
             card.remove();
           } else {
@@ -2819,30 +3086,18 @@ function generateAdminPage(fileCards, categoryOptions) {
         }
       }
 
-      // 分享文件 - 新版实现，显示二维码弹窗
+      // 分享文件
       function shareFile(url) {
         showQRCode(url);
       }
-      
-      // 复制链接时也显示二维码
-      const copyBtns = document.querySelectorAll('.btn-copy');
-      copyBtns.forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          const url = btn.getAttribute('data-url');
-          if(url) {
-            showQRCode(url);
-          }
-        });
-      });
 
-      // 后缀相关功能
+      // 淇敼鍚庣紑
       let currentEditUrl = '';
 
       // 修改后缀
       function showEditSuffixModal(url) {
         currentEditUrl = url;
-
+        
         // 获取当前后缀
         const urlObj = new URL(url);
         const pathParts = urlObj.pathname.split('/');
@@ -2850,7 +3105,7 @@ function generateAdminPage(fileCards, categoryOptions) {
         const fileNameParts = fileName.split('.');
         const extension = fileNameParts.pop(); // 获取扩展名
         const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
-                                                                          
+        
         if (editSuffixInput) {
           editSuffixInput.value = currentSuffix;
           editSuffixModal.classList.add('show');
@@ -2866,40 +3121,40 @@ function generateAdminPage(fileCards, categoryOptions) {
       if (editSuffixConfirm) {
         editSuffixConfirm.addEventListener('click', async () => {
           const newSuffix = editSuffixInput.value;
-
+          
           try {
             const response = await fetch('/update-suffix', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
+              body: JSON.stringify({ 
                 url: currentEditUrl,
                 suffix: newSuffix
               })
             });
-
+            
             const data = await response.json();
-
+            
             if (data.status === 1) {
               // 更新成功，隐藏弹窗
               editSuffixModal.classList.remove('show');
-
+              
               // 更新页面上的URL
               const card = document.querySelector('[data-url="' + currentEditUrl + '"]');
               if (card) {
                 // 更新卡片的URL值
                 card.setAttribute('data-url', data.newUrl);
-
+                
                 // 更新卡片中的按钮URL
                 const copyBtn = card.querySelector('.btn-copy');
                 const downBtn = card.querySelector('.btn-down');
                 const shareBtn = card.querySelector('.btn-share');
                 const editBtn = card.querySelector('.btn-edit');
-
+                
                 if (copyBtn) copyBtn.setAttribute('data-url', data.newUrl);
                 if (downBtn) downBtn.href = data.newUrl;
                 if (shareBtn) shareBtn.setAttribute('data-url', data.newUrl);
                 if (editBtn) editBtn.setAttribute('data-url', data.newUrl);
-
+                
                 // 更新描述中的文件名
                 const fileNameElement = card.querySelector('.file-info div:first-child');
                 if (fileNameElement) {
@@ -2908,7 +3163,7 @@ function generateAdminPage(fileCards, categoryOptions) {
                   fileNameElement.textContent = fileName;
                 }
               }
-
+              
               showConfirmModal(data.msg, null, true);
             } else {
               showConfirmModal(data.msg || '修改后缀失败', null, true);
@@ -2929,6 +3184,19 @@ function generateAdminPage(fileCards, categoryOptions) {
             showConfirmModal('复制失败，请手动复制', null, true);
           });
       }
+
+      // 点击弹窗外部关闭弹窗
+      window.addEventListener('click', (event) => {
+        if (event.target === confirmModal) {
+          closeConfirmModal();
+        }
+        if (event.target === qrModal) {
+          qrModal.classList.remove('show');
+        }
+        if (event.target === editSuffixModal) {
+          editSuffixModal.classList.remove('show');
+        }
+      });
     </script>
   </body>
   </html>`;
