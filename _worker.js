@@ -512,34 +512,54 @@ async function handleTelegramWebhook(request, config) {
         await sendPanel(chatId, userSetting, config);
         return new Response('OK');
       }
-      // 处理后缀设置
-      else if (update.message.text && userSetting.waiting_for === 'waiting_suffix') {
-        // 用户正在设置后缀
-        let newSuffix = update.message.text.trim();
+
+      // 处理用户设置后缀的情况
+      else if (userSetting.status === 'waiting_suffix' && update.message.text) {
+        const suffix = update.message.text.trim();
         
-        // 检查是否要清除后缀
-        if (newSuffix.toLowerCase() === '无' || newSuffix.toLowerCase() === 'none') {
-          newSuffix = null;
+        try {
+          // 如果用户输入"无"或"none"，则清除后缀
+          const customSuffix = (suffix === '无' || suffix === 'none') ? '' : suffix;
+          
+          // 更新用户设置
+          await config.database.prepare(`
+            UPDATE user_settings
+            SET custom_suffix = ?, status = NULL
+            WHERE chat_id = ?
+          `).bind(customSuffix, chatId).run();
+          
+          // 更新用户设置对象
+          userSetting.custom_suffix = customSuffix;
+          userSetting.status = null;
+          
+          let message = '';
+          if (customSuffix) {
+            message = `✅ 默认后缀已设置为: ${customSuffix}`;
+          } else {
+            message = `✅ 默认后缀已清除`;
+          }
+          
+          await sendMessage(chatId, message, config.tgBotToken);
+          
+          // 重新发送面板
+          await sendPanel(chatId, userSetting, config);
+          return new Response('OK');
+        } catch (error) {
+          console.error('设置后缀失败:', error);
+          await sendMessage(chatId, `❌ 设置后缀失败: ${error.message}`, config.tgBotToken);
+          
+          // 清除等待状态
+          await config.database.prepare(`
+            UPDATE user_settings
+            SET status = NULL
+            WHERE chat_id = ?
+          `).bind(chatId).run();
+          
+          // 重新发送面板
+          userSetting.status = null;
+          await sendPanel(chatId, userSetting, config);
+          return new Response('OK');
         }
-        
-        // 更新用户设置
-        await config.database.prepare(`
-          UPDATE user_settings 
-          SET custom_suffix = ?, waiting_for = NULL 
-          WHERE chat_id = ?
-        `).bind(newSuffix, chatId).run();
-        
-        // 发送确认消息
-        await sendMessage(
-          chatId, 
-          newSuffix ? `✅ 后缀已设置为: ${newSuffix}` : '✅ 后缀已清除', 
-          config.tgBotToken
-        );
-        
-        // 重新发送设置面板
-        userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
-        await sendPanel(chatId, userSetting, config);
-        return new Response('OK');
       }
 
       // 处理命令
@@ -561,7 +581,7 @@ async function handleTelegramWebhook(request, config) {
         userSetting = { chat_id: chatId, storage_type: 'r2' };
       }
 
-      await handleCallbackQuery(update.callback_query, config, userSetting);
+      await handleCallbackQuery(update, config, userSetting);
     }
 
     return new Response('OK');
@@ -625,7 +645,6 @@ async function sendPanel(chatId, userSetting, config) {
       ? categories.results.find(c => c.id === categoryId)?.name || '无' 
       : '无';
     
-    // 添加后缀显示
     const customSuffix = userSetting.custom_suffix || '无';
     
     const message = `
@@ -638,7 +657,7 @@ async function sendPanel(chatId, userSetting, config) {
 请发送图片或文件进行上传，或通过按钮修改设置。
     `;
     
-    await sendMessage(chatId, message, config.tgBotToken, null, {
+    await sendMessage(chatId, message, config.botToken, null, {
       reply_markup: JSON.stringify({
         inline_keyboard: inlineKeyboard
       }),
@@ -648,91 +667,78 @@ async function sendPanel(chatId, userSetting, config) {
     return true;
   } catch (error) {
     console.error(`发送面板时出错: ${error.message}`);
-    await sendMessage(chatId, `发送面板时出错: ${error.message}`, config.tgBotToken);
+    await sendMessage(chatId, `发送面板时出错: ${error.message}`, config.botToken);
     return false;
   }
 }
 
-async function handleCallbackQuery(callbackQuery, config, userSetting) {
+async function handleCallbackQuery(update, config, userSetting) {
   // 获取回调查询数据
+  const callbackQuery = update.callback_query;
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
   const data = callbackQuery.data;
   
-  try {
-    // 根据回调数据执行不同操作
-    if (data === 'close') {
-      // 关闭面板
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: messageId,
-          text: '面板已关闭'
+  // 根据回调数据执行不同操作
+  if (data === 'close') {
+    // 关闭面板
+    await config.telegramClient.editMessageText(chatId, messageId, null, '面板已关闭');
+    return true;
+  } else if (data.startsWith('setStorage:')) {
+    // 设置存储类型
+    const newStorageType = data.split(':')[1];
+    
+    // 更新用户设置
+    await config.database.prepare(`
+      UPDATE user_settings 
+      SET storage_type = ? 
+      WHERE chat_id = ?
+    `).bind(newStorageType, chatId.toString()).run();
+    
+    // 重新发送面板
+    await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
+    return true;
+  } else if (data.startsWith('setCategory:')) {
+    // 设置分类
+    const categoryId = parseInt(data.split(':')[1]);
+    
+    // 更新用户设置
+    await config.database.prepare(`
+      UPDATE user_settings 
+      SET category_id = ? 
+      WHERE chat_id = ?
+    `).bind(categoryId, chatId.toString()).run();
+    
+    // 重新发送面板
+    await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
+    return true;
+  } else if (data === 'setSuffix') {
+    // 提示用户输入新的后缀
+    await config.telegramClient.editMessageText(
+      chatId, 
+      messageId, 
+      null, 
+      '请回复此消息，输入您想要设置的文件后缀\n(例如：.jpg 或 _thumb)\n\n输入"无"或"none"可清除后缀',
+      {
+        reply_markup: JSON.stringify({
+          force_reply: true,
+          selective: true
         })
-      });
-      return true;
-    } else if (data.startsWith('setStorage:')) {
-      // 设置存储类型
-      const newStorageType = data.split(':')[1];
-      
-      // 更新用户设置
-      await config.database.prepare(`
-        UPDATE user_settings 
-        SET storage_type = ? 
-        WHERE chat_id = ?
-      `).bind(newStorageType, chatId.toString()).run();
-      
-      // 重新发送面板
-      await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
-      return true;
-    } else if (data.startsWith('setCategory:')) {
-      // 设置分类
-      const categoryId = parseInt(data.split(':')[1]);
-      
-      // 更新用户设置
-      await config.database.prepare(`
-        UPDATE user_settings 
-        SET category_id = ? 
-        WHERE chat_id = ?
-      `).bind(categoryId, chatId.toString()).run();
-      
-      // 重新发送面板
-      await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
-      return true;
-    } else if (data === 'setSuffix') {
-      // 提示用户输入新的后缀
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: messageId,
-          text: '请回复此消息，输入您想要设置的文件后缀\n(例如：.jpg 或 _thumb)\n\n输入"无"或"none"可清除后缀',
-          reply_markup: JSON.stringify({
-            force_reply: true,
-            selective: true
-          })
-        })
-      });
-      
-      // 设置用户状态为等待输入后缀
-      await config.database.prepare(`
-        UPDATE user_settings 
-        SET waiting_for = 'waiting_suffix' 
-        WHERE chat_id = ?
-      `).bind(chatId.toString()).run();
-      
-      return true;
-    } else {
-      // 重新发送面板
-      await sendPanel(chatId, userSetting, config);
-      return true;
-    }
-  } catch (error) {
-    console.error(`处理回调查询时出错: ${error.message}`);
-    return false;
+      }
+    );
+    
+    // 设置用户状态为等待输入后缀
+    await config.database.prepare(`
+      UPDATE user_settings 
+      SET status = 'waiting_suffix' 
+      WHERE chat_id = ?
+    `).bind(chatId.toString()).run();
+    
+    return true;
+  } else {
+    // 重新发送面板
+    await sendPanel(chatId, userSetting, config);
+    return true;
   }
 }
 
@@ -744,23 +750,32 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
 
     const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-
-    // 获取文件内容
     const fileResponse = await fetch(telegramUrl);
-    const fileBuffer = await fileResponse.arrayBuffer();
 
-    // 第二步：处理文件名和类型
+    if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
+    const contentLength = fileResponse.headers.get('content-length');
+  
+    // 检查文件大小
+    if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
+      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
+      return;
+    }
+
+    // 第二步：准备文件数据，与网页上传保持一致的格式
+    // 获取文件扩展名和MIME类型
     let fileName = '';
     let ext = '';
-
-    if (isDocument) {
+    
+    if (isDocument && file.file_name) {
       fileName = file.file_name;
-      ext = fileName.split('.').pop();
+      ext = (fileName.split('.').pop() || '').toLowerCase();
     } else {
-      // 照片没有文件名，使用时间戳
-      ext = 'jpg';
-      fileName = `${Date.now()}.${ext}`;
+      ext = getExtensionFromMime(file.mime_type);
+      fileName = `image.${ext}`;
     }
+    
+    const mimeType = file.mime_type || getContentType(ext);
+    const [mainType] = mimeType.split('/');
     
     // 第三步：根据存储类型(r2 或 telegram)处理文件存储
     const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
@@ -785,8 +800,9 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     
     if (storageType === 'r2' && config.bucket) {
       // 上传到R2存储
-      await config.bucket.put(key, fileBuffer, { 
-        httpMetadata: { contentType: `image/${ext}` } 
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      await config.bucket.put(key, arrayBuffer, { 
+        httpMetadata: { contentType: mimeType } 
       });
       finalUrl = `https://${config.domain}/${key}`;
       dbFileId = key;
@@ -799,17 +815,19 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
         video: { method: 'sendVideo', field: 'video' },
         audio: { method: 'sendAudio', field: 'audio' }
       };
-      let { method = 'sendDocument', field = 'document' } = typeMap[ext] || {};
+      let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
       
-      if (['application', 'text'].includes(ext)) {
+      if (['application', 'text'].includes(mainType)) {
         method = 'sendDocument';
         field = 'document';
       }
       
       // 重新发送到存储聊天
+      const arrayBuffer = await fileResponse.arrayBuffer();
       const tgFormData = new FormData();
       tgFormData.append('chat_id', config.tgStorageChatId);
-      tgFormData.append(field, new Blob([fileBuffer], { type: `image/${ext}` }), fileName);
+      const blob = new Blob([arrayBuffer], { type: mimeType });
+      tgFormData.append(field, blob, fileName);
       
       const tgResponse = await fetch(
         `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
@@ -856,8 +874,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       dbMessageId,
       time,
       key,  // 使用key作为file_name
-      fileBuffer.length,
-      `image/${ext}`,
+      contentLength,
+      mimeType,
       chatId,
       categoryId,
       storageType
@@ -883,15 +901,27 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
 }
 
 async function getTelegramFileUrl(fileId, botToken, config) {
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
-    const data = await response.json();
-    if (!data.ok) throw new Error('获取文件路径失败');
-    
-    return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
-  } catch (error) {
-    console.error('获取Telegram文件URL失败:', error);
-    throw error;
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+  const data = await response.json();
+  if (!data.ok) throw new Error('获取文件路径失败');
+  
+  // 获取文件路径
+  const filePath = data.result.file_path;
+  
+  // 从路径中提取文件名和扩展名
+  const fileName = filePath.split('/').pop();
+  
+  // 使用时间戳重命名文件，保持与其他上传一致
+  const timestamp = Date.now();
+  const fileExt = fileName.split('.').pop();
+  const newFileName = `${timestamp}.${fileExt}`;
+  
+  // 返回域名格式URL
+  if (config && config.domain) {
+    return `https://${config.domain}/${newFileName}`;
+  } else {
+    // 仅在没有配置域名时才返回Telegram API链接
+    return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
   }
 }
 
@@ -2076,298 +2106,1300 @@ function generateUploadPage(categoryOptions, storageType) {
       }
     </style>
   </head>
-```
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>文件上传</h1>
+        <a href="/admin" class="admin-link">管理文件</a>
+      </div>
+      <div class="options">
+        <select id="categorySelect" class="category-select">
+          <option value="">选择分类</option>
+          ${categoryOptions}
+        </select>
+        <div class="new-category">
+          <input type="text" id="newCategoryInput" placeholder="输入新分类名称">
+          <button onclick="createNewCategory()">新建分类</button>
+        </div>
+        <div class="storage-toggle">
+          <button class="storage-btn ${storageType === 'telegram' ? 'active' : ''}" data-storage="telegram">Telegram</button>
+          <button class="storage-btn ${storageType === 'r2' ? 'active' : ''}" data-storage="r2">R2</button>
+        </div>
+      </div>
+      <div class="upload-area" id="uploadArea">
+        <p>点击选择 或 拖拽文件到此处</p>
+        <input type="file" id="fileInput" multiple style="display: none">
+      </div>
+      <div class="preview-area" id="previewArea"></div>
+      <div class="url-area">
+        <textarea id="urlArea" readonly placeholder="上传完成后的链接将显示在这里"></textarea>
+        <div class="button-group">
+          <div class="button-container">
+            <button onclick="copyUrls('url')">复制URL</button>
+            <button onclick="copyUrls('markdown')">复制Markdown</button>
+            <button onclick="copyUrls('html')">复制HTML</button>
+          </div>
+          <div class="copyright">
+            <span>© 2025 Copyright by <a href="https://github.com/yutian81/CF-tgfile" target="_blank">yutian81's GitHub</a> | <a href="https://blog.811520.xyz/" target="_blank">青云志</a></span>
+          </div>
+        </div>
+      </div>
+      
+      <!-- 通用确认弹窗 -->
+      <div id="confirmModal" class="modal">
+        <div class="modal-content">
+          <h3 class="modal-title">提示</h3>
+          <p class="modal-message" id="confirmModalMessage"></p>
+          <div class="modal-buttons">
+            <button class="modal-button modal-confirm" id="confirmModalConfirm">确认</button>
+            <button class="modal-button modal-cancel" id="confirmModalCancel">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      async function setBingBackground() {
+        try {
+          const response = await fetch('/bing', { cache: 'no-store' });
+          const data = await response.json();
+          if (data.status && data.data && data.data.length > 0) {
+            const randomIndex = Math.floor(Math.random() * data.data.length);
+            document.body.style.backgroundImage = \`url(\${data.data[randomIndex].url})\`;
+          }
+        } catch (error) {
+          console.error('获取背景图失败:', error);
+        }
+      }
+      setBingBackground();
+      setInterval(setBingBackground, 3600000);
+
+      const uploadArea = document.getElementById('uploadArea');
+      const fileInput = document.getElementById('fileInput');
+      const previewArea = document.getElementById('previewArea');
+      const urlArea = document.getElementById('urlArea');
+      const categorySelect = document.getElementById('categorySelect');
+      const newCategoryInput = document.getElementById('newCategoryInput');
+      const storageButtons = document.querySelectorAll('.storage-btn');
+      const confirmModal = document.getElementById('confirmModal');
+      const confirmModalMessage = document.getElementById('confirmModalMessage');
+      const confirmModalConfirm = document.getElementById('confirmModalConfirm');
+      const confirmModalCancel = document.getElementById('confirmModalCancel');
+      
+      let uploadedUrls = [];
+      let currentConfirmCallback = null;
+
+      storageButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+          storageButtons.forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+        });
+      });
+
+      async function createNewCategory() {
+        const categoryName = newCategoryInput.value.trim();
+        if (!categoryName) {
+          showConfirmModal('分类名称不能为空！', null, true);
+          return;
+        }
+
+        try {
+          const response = await fetch('/create-category', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: categoryName })
+          });
+          const data = await response.json();
+
+          if (data.status === 1) {
+            const option = document.createElement('option');
+            option.value = data.category.id;
+            option.textContent = data.category.name;
+            categorySelect.appendChild(option);
+            categorySelect.value = data.category.id;
+            newCategoryInput.value = '';
+            showConfirmModal(data.msg, null, true);
+          } else {
+            showConfirmModal(data.msg, null, true);
+          }
+        } catch (error) {
+          showConfirmModal('创建分类失败：' + error.message, null, true);
+        }
+      }
+
+      // 显示确认弹窗
+      function showConfirmModal(message, callback, alertOnly = false) {
+        confirmModalMessage.textContent = message;
+        currentConfirmCallback = callback;
+        
+        if (alertOnly) {
+          confirmModalConfirm.textContent = '确定';
+          confirmModalCancel.style.display = 'none';
+        } else {
+          confirmModalConfirm.textContent = '确认';
+          confirmModalCancel.style.display = 'inline-block';
+        }
+        
+        confirmModal.classList.add('show');
+      }
+
+      // 关闭确认弹窗
+      function closeConfirmModal() {
+        confirmModal.classList.remove('show');
+      }
+
+      // 确认按钮事件
+      confirmModalConfirm.addEventListener('click', () => {
+        if (currentConfirmCallback) {
+          currentConfirmCallback();
+        }
+        closeConfirmModal();
+      });
+
+      // 取消按钮事件
+      confirmModalCancel.addEventListener('click', closeConfirmModal);
+
+      // 点击弹窗外部关闭弹窗
+      window.addEventListener('click', (event) => {
+        if (event.target === confirmModal) {
+          closeConfirmModal();
+        }
+      });
+
+      ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        uploadArea.addEventListener(eventName, preventDefaults, false);
+        document.body.addEventListener(eventName, preventDefaults, false);
+      });
+
+      function preventDefaults(e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+
+      ['dragenter', 'dragover'].forEach(eventName => {
+        uploadArea.addEventListener(eventName, highlight, false);
+      });
+
+      ['dragleave', 'drop'].forEach(eventName => {
+        uploadArea.addEventListener(eventName, unhighlight, false);
+      });
+
+      function highlight(e) {
+        uploadArea.classList.add('dragover');
+      }
+
+      function unhighlight(e) {
+        uploadArea.classList.remove('dragover');
+      }
+
+      uploadArea.addEventListener('drop', handleDrop, false);
+      uploadArea.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', handleFiles);
+
+      function handleDrop(e) {
+        const dt = e.dataTransfer;
+        const files = dt.files;
+        handleFiles({ target: { files } });
+      }
+
+      document.addEventListener('paste', async (e) => {
+        const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+        for (let item of items) {
+          if (item.kind === 'file') {
+            const file = item.getAsFile();
+            await uploadFile(file);
+          }
+        }
+      });
+
+      async function handleFiles(e) {
+        const response = await fetch('/config');
+        if (!response.ok) {
+          throw new Error('Failed to fetch config');
+        }
+        const config = await response.json();
+        const files = Array.from(e.target.files);
+        for (let file of files) {
+          if (file.size > config.maxSizeMB * 1024 * 1024) {
+            showConfirmModal(\`文件超过\${config.maxSizeMB}MB限制\`, null, true);
+            return;
+          }
+          await uploadFile(file);
+        }
+      }
+
+      async function uploadFile(file) {
+        const preview = createPreview(file);
+        previewArea.appendChild(preview);
+
+        const xhr = new XMLHttpRequest();
+        const progressTrack = preview.querySelector('.progress-track');
+        const progressText = preview.querySelector('.progress-text');
+
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 100);
+            progressTrack.style.width = \`\${percent}%\`;
+            progressText.textContent = \`\${percent}%\`;
+          }
+        });
+
+        xhr.addEventListener('load', () => {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            const progressText = preview.querySelector('.progress-text');
+            if (xhr.status >= 200 && xhr.status < 300 && data.status === 1) {
+              progressText.textContent = data.msg;
+              uploadedUrls.push(data.url);
+              updateUrlArea();
+              preview.classList.add('success');
+            } else {
+              const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
+              progressText.textContent = errorMsg;
+              preview.classList.add('error');
+            }
+          } catch (e) {
+            preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
+            preview.classList.add('error');
+          }
+        });
+
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('category', categorySelect.value);
+        formData.append('storage_type', document.querySelector('.storage-btn.active').dataset.storage);
+        xhr.open('POST', '/upload');
+        xhr.send(formData);
+      }
+
+      function createPreview(file) {
+        const div = document.createElement('div');
+        div.className = 'preview-item';
+        
+        if (file.type.startsWith('image/')) {
+          const img = document.createElement('img');
+          img.src = URL.createObjectURL(file);
+          div.appendChild(img);
+        }
+
+        const info = document.createElement('div');
+        info.className = 'info';
+        info.innerHTML = \`
+          <div>\${file.name}</div>
+          <div>\${formatSize(file.size)}</div>
+          <div class="progress-bar">
+            <div class="progress-track"></div>
+            <span class="progress-text">0%</span>
+          </div>
+        \`;
+        div.appendChild(info);
+
+        return div;
+      }
+
+      function formatSize(bytes) {
+        const units = ['B', 'KB', 'MB', 'GB'];
+        let size = bytes;
+        let unitIndex = 0;
+        while (size >= 1024 && unitIndex < units.length - 1) {
+          size /= 1024;
+          unitIndex++;
+        }
+        return \`\${size.toFixed(2)} \${units[unitIndex]}\`;
+      }
+
+      function updateUrlArea() {
+        urlArea.value = uploadedUrls.join('\\n');
+      }
+
+      function copyUrls(format) {
+        let text = '';
+        switch (format) {
+          case 'url':
+            text = uploadedUrls.join('\\n');
+            break;
+          case 'markdown':
+            text = uploadedUrls.map(url => \`![](\${url})\`).join('\\n');
+            break;
+          case 'html':
+            text = uploadedUrls.map(url => \`<img src="\${url}" />\`).join('\\n');
+            break;
+        }
+        navigator.clipboard.writeText(text)
+          .then(() => {
+            showConfirmModal('已复制到剪贴板', null, true);
+          })
+          .catch(() => {
+            showConfirmModal('复制失败，请手动复制', null, true);
+          });
+      }
+    </script>
+  </body>
+  </html>`;
+}
+
+function generateAdminPage(fileCards, categoryOptions) {
+  return `<!DOCTYPE html>
+  <html lang="zh-CN">
+  <head>
+    <link rel="shortcut icon" href="https://pan.811520.xyz/2025-02/1739241502-tgfile-favicon.ico" type="image/x-icon">
+    <meta name="description" content="Telegram文件存储与分享平台">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文件管理</title>
+    <style>
+      body {
+        font-family: 'Segoe UI', Arial, sans-serif;
+        margin: 0;
+        padding: 20px;
+        min-height: 100vh;
+        background: linear-gradient(135deg, #f0f4f8, #d9e2ec);
+      }
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .header {
+        background: rgba(255, 255, 255, 0.95);
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        margin-bottom: 1.5rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      h2 {
+        color: #2c3e50;
+        margin: 0;
+        font-size: 1.8rem;
+      }
+      .right-content {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      .search, .category-filter {
+        padding: 0.7rem;
+        border: 2px solid #dfe6e9;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        background: #fff;
+        transition: border-color 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+      }
+      .search:focus, .category-filter:focus {
+        outline: none;
+        border-color: #3498db;
+      }
+      .backup {
+        color: #3498db;
+        text-decoration: none;
+        font-size: 1rem;
+        transition: color 0.3s ease;
+      }
+      .backup:hover {
+        color: #2980b9;
+      }
+      .action-bar {
+        background: rgba(255, 255, 255, 0.95);
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        margin-bottom: 1.5rem;
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .action-bar-left {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      .action-bar-right {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+      }
+      .action-bar h3 {
+        margin: 0;
+        color: #2c3e50;
+        font-size: 1.2rem;
+      }
+      .action-bar select {
+        padding: 0.7rem;
+        border: 2px solid #dfe6e9;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        background: #fff;
+        transition: border-color 0.3s ease;
+      }
+      .action-bar select:focus {
+        outline: none;
+        border-color: #3498db;
+      }
+      .action-button {
+        padding: 0.7rem 1.5rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.9rem;
+      }
+      .select-all-btn {
+        background: #3498db;
+        color: white;
+      }
+      .delete-files-btn {
+        background: #e74c3c;
+        color: white;
+      }
+      .delete-category-btn {
+        background: #e74c3c;
+        color: white;
+      }
+      .action-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .select-all-btn:hover {
+        background: #2980b9;
+      }
+      .delete-files-btn:hover {
+        background: #c0392b;
+      }
+      .delete-category-btn:hover {
+        background: #c0392b;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+        gap: 1.5rem;
+      }
+      .file-card {
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 15px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        overflow: hidden;
+        position: relative;
+        transition: all 0.3s ease;
+        cursor: pointer;
+      }
+      .file-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+      }
+      .file-card.selected {
+        border: 3px solid #3498db;
+      }
+      .file-checkbox {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 5;
+        width: 20px;
+        height: 20px;
+      }
+      .file-preview {
+        height: 150px;
+        background: #f8f9fa;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .file-preview img, .file-preview video {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+      }
+      .file-info {
+        padding: 1rem;
+        font-size: 0.9rem;
+        color: #2c3e50;
+      }
+      .file-actions {
+        padding: 1rem;
+        border-top: 1px solid #eee;
+        display: flex;
+        justify-content: space-between;
+        gap: 0.5rem;
+      }
+      .btn {
+        padding: 0.5rem 1rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.9rem;
+      }
+      .btn-copy {
+        background: #3498db;
+        color: white;
+      }
+      .btn-down {
+        background: #2ecc71;
+        color: white;
+        text-decoration: none;
+      }
+      .btn-delete {
+        background: #e74c3c;
+        color: white;
+      }
+      .btn-edit {
+        background: #f39c12;
+        color: white;
+      }
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .btn-copy:hover {
+        background: #2980b9;
+      }
+      .btn-down:hover {
+        background: #27ae60;
+      }
+      .btn-delete:hover {
+        background: #c0392b;
+      }
+      .btn-edit:hover {
+        background: #e67e22;
+      }
+      
+      /* 美化弹窗样式 */
+      .modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .modal.show {
+        display: flex;
+        opacity: 1;
+      }
+      .modal-content {
+        background: white;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        text-align: center;
+        width: 90%;
+        max-width: 400px;
+        transform: scale(0.9);
+        transition: transform 0.3s ease;
+      }
+      .modal.show .modal-content {
+        transform: scale(1);
+      }
+      .modal-title {
+        color: #2c3e50;
+        font-size: 1.3rem;
+        margin-top: 0;
+        margin-bottom: 1rem;
+      }
+      .modal-message {
+        margin-bottom: 1.5rem;
+        color: #34495e;
+        line-height: 1.5;
+      }
+      .modal-buttons {
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+      }
+      .modal-button {
+        padding: 0.8rem 1.8rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.95rem;
+        font-weight: 500;
+      }
+      .modal-confirm {
+        background: #3498db;
+        color: white;
+      }
+      .modal-cancel {
+        background: #95a5a6;
+        color: white;
+      }
+      .modal-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .modal-confirm:hover {
+        background: #2980b9;
+      }
+      .modal-cancel:hover {
+        background: #7f8c8d;
+      }
+      
+      /* 二维码弹窗样式 */
+      #qrModal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      #qrModal.show {
+        display: flex;
+        opacity: 1;
+      }
+      .qr-content {
+        background: white;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        text-align: center;
+        width: 90%;
+        max-width: 350px;
+        transform: scale(0.9);
+        transition: transform 0.3s ease;
+      }
+      #qrModal.show .qr-content {
+        transform: scale(1);
+      }
+      .qr-title {
+        color: #2c3e50;
+        font-size: 1.3rem;
+        margin-top: 0;
+        margin-bottom: 1rem;
+      }
+      #qrcode {
+        margin: 1.5rem auto;
+      }
+      .qr-buttons {
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+        margin-top: 1.5rem;
+      }
+      .qr-copy, .qr-close {
+        padding: 0.8rem 1.8rem;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        font-size: 0.95rem;
+        font-weight: 500;
+      }
+      .qr-copy {
+        background: #3498db;
+        color: white;
+      }
+      .qr-close {
+        background: #95a5a6;
+        color: white;
+      }
+      .qr-copy:hover, .qr-close:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .qr-copy:hover {
+        background: #2980b9;
+      }
+      .qr-close:hover {
+        background: #7f8c8d;
+      }
+      
+      /* 修改后缀弹窗样式 */
+      #editSuffixModal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      }
+      #editSuffixModal.show {
+        display: flex;
+      }
+      #editSuffixModal .modal-content {
+        background: white;
+        padding: 2rem;
+        border-radius: 15px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+        text-align: center;
+        width: 90%;
+        max-width: 400px;
+      }
+      #editSuffixModal input {
+        width: 100%;
+        padding: 0.8rem;
+        margin: 1rem 0;
+        border: 2px solid #dfe6e9;
+        border-radius: 8px;
+        font-size: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h2>文件管理</h2>
+        <div class="right-content">
+          <a href="/upload" class="backup">返回上传</a>
+          <select id="categoryFilter" class="category-filter">
+            <option value="">所有分类</option>
+            ${categoryOptions}
+          </select>
+          <input type="text" class="search" placeholder="搜索文件..." id="searchInput">
+        </div>
+      </div>
+      
+      <div class="action-bar">
+        <div class="action-bar-left">
+          <button class="action-button select-all-btn" id="selectAllBtn">全选</button>
+          <button class="action-button delete-files-btn" id="deleteFilesBtn">删除所选文件</button>
+        </div>
+        <div class="action-bar-right">
+          <h3>分类管理</h3>
+          <select id="categoryDeleteSelect">
+            <option value="">选择要删除的分类</option>
+            ${categoryOptions}
+          </select>
+          <button class="action-button delete-category-btn" id="deleteCategoryBtn">删除分类</button>
+        </div>
+      </div>
+      
+      <div class="grid" id="fileGrid">
+        ${fileCards}
+      </div>
+      
+      <!-- 通用确认弹窗 -->
+      <div id="confirmModal" class="modal">
+        <div class="modal-content">
+          <h3 class="modal-title">确认操作</h3>
+          <p class="modal-message" id="confirmModalMessage"></p>
+          <div class="modal-buttons">
+            <button class="modal-button modal-confirm" id="confirmModalConfirm">确认</button>
+            <button class="modal-button modal-cancel" id="confirmModalCancel">取消</button>
+          </div>
+        </div>
+      </div>
+      
+      <!-- 二维码弹窗 -->
+      <div id="qrModal" class="modal">
+        <div class="qr-content">
+          <h3 class="qr-title">分享文件</h3>
+          <div id="qrcode"></div>
+          <div class="qr-buttons">
+            <button class="qr-copy" id="qrCopyBtn">复制链接</button>
+            <button class="qr-close" id="qrCloseBtn">关闭</button>
+          </div>
+        </div>
+      </div>
+      
+      <!-- 修改后缀弹窗 -->
+      <div id="editSuffixModal" class="modal">
+        <div class="modal-content">
+          <h3 class="modal-title">修改文件后缀</h3>
+          <input type="text" id="editSuffixInput" placeholder="输入新的文件后缀">
+          <div class="modal-buttons">
+            <button class="modal-button modal-confirm" id="editSuffixConfirm">确认</button>
+            <button class="modal-button modal-cancel" id="editSuffixCancel">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs/qrcode.min.js"></script>
+    <script>
+      // 设置背景图片
+      async function setBingBackground() {
+        try {
+          const response = await fetch('/bing', { cache: 'no-store' });
+          const data = await response.json();
+          if (data.status && data.data && data.data.length > 0) {
+            const randomIndex = Math.floor(Math.random() * data.data.length);
+            document.body.style.backgroundImage = \`url(\${data.data[randomIndex].url})\`;
+          }
+        } catch (error) {
+          console.error('获取背景图失败:', error);
+        }
+      }
+      setBingBackground();
+      setInterval(setBingBackground, 3600000);
+
+      // 搜索和筛选功能
+      const searchInput = document.getElementById('searchInput');
+      const categoryFilter = document.getElementById('categoryFilter');
+      const fileGrid = document.getElementById('fileGrid');
+      const fileCards = Array.from(fileGrid.children);
+      const selectAllBtn = document.getElementById('selectAllBtn');
+      const deleteFilesBtn = document.getElementById('deleteFilesBtn');
+      const deleteCategoryBtn = document.getElementById('deleteCategoryBtn');
+      const confirmModal = document.getElementById('confirmModal');
+      const confirmModalMessage = document.getElementById('confirmModalMessage');
+      const confirmModalConfirm = document.getElementById('confirmModalConfirm');
+      const confirmModalCancel = document.getElementById('confirmModalCancel');
+      const qrModal = document.getElementById('qrModal');
+      const qrCopyBtn = document.getElementById('qrCopyBtn');
+      const qrCloseBtn = document.getElementById('qrCloseBtn');
+      const editSuffixModal = document.getElementById('editSuffixModal');
+      const editSuffixInput = document.getElementById('editSuffixInput');
+      const editSuffixConfirm = document.getElementById('editSuffixConfirm');
+      const editSuffixCancel = document.getElementById('editSuffixCancel');
+      
+      let currentShareUrl = '';
+      let currentConfirmCallback = null;
+
+      searchInput.addEventListener('input', filterFiles);
+      categoryFilter.addEventListener('change', filterFiles);
+
+      // 初始化文件点击事件
+      fileCards.forEach(card => {
+        const checkbox = card.querySelector('.file-checkbox');
+        
+        // 点击卡片区域就可以选中/取消选中文件
+        card.addEventListener('click', (e) => {
+          // 如果点击在按钮上则不触发选择
+          if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A' || 
+              e.target.closest('.btn') || e.target.closest('.file-actions')) {
+            return;
+          }
+          
+          // 切换复选框状态
+          checkbox.checked = !checkbox.checked;
+          // 更新卡片选中状态
+          card.classList.toggle('selected', checkbox.checked);
+          e.preventDefault(); // 防止其他点击事件
+        });
+        
+        // 复选框状态变化时更新卡片选中状态
+        checkbox.addEventListener('change', () => {
+          card.classList.toggle('selected', checkbox.checked);
+        });
+      });
+
+      function filterFiles() {
+        const searchTerm = searchInput.value.toLowerCase();
+        const selectedCategory = categoryFilter.value;
+
+        fileCards.forEach(card => {
+          const fileName = card.querySelector('.file-info div:first-child').textContent.toLowerCase();
+          const categoryId = card.getAttribute('data-category-id') || '';
+
+          const matchesSearch = fileName.includes(searchTerm);
+          const matchesCategory = selectedCategory === '' || categoryId === selectedCategory;
+
+          card.style.display = matchesSearch && matchesCategory ? '' : 'none';
+        });
+      }
+
+      // 全选/取消全选功能
+      selectAllBtn.addEventListener('click', () => {
+        const visibleCards = fileCards.filter(card => card.style.display !== 'none');
+        const allSelected = visibleCards.every(card => card.querySelector('.file-checkbox').checked);
+        
+        visibleCards.forEach(card => {
+          const checkbox = card.querySelector('.file-checkbox');
+          checkbox.checked = !allSelected;
+          card.classList.toggle('selected', !allSelected);
+        });
+      });
+
+      // 删除选中的文件
+      deleteFilesBtn.addEventListener('click', () => {
+        const selectedCheckboxes = document.querySelectorAll('.file-checkbox:checked');
+        if (selectedCheckboxes.length === 0) {
+          showConfirmModal('请先选择要删除的文件！', null, true);
+          return;
+        }
+        
+        showConfirmModal(
+          \`确定要删除选中的 \${selectedCheckboxes.length} 个文件吗？\`, 
+          deleteSelectedFiles
+        );
+      });
+
+      // 删除分类
+      deleteCategoryBtn.addEventListener('click', () => {
+        const select = document.getElementById('categoryDeleteSelect');
+        const categoryId = select.value;
+        if (!categoryId) {
+          showConfirmModal('请选择要删除的分类', null, true);
+          return;
+        }
+
+        const categoryName = select.options[select.selectedIndex].text;
+        showConfirmModal(
+          \`确定要删除分类 "\${categoryName}" 吗？这将清空所有关联文件的分类！\`, 
+          deleteCategory
+        );
+      });
+
+      // 显示二维码分享
+      function showQRCode(url) {
+        currentShareUrl = url;
+        const qrcodeDiv = document.getElementById('qrcode');
+        qrcodeDiv.innerHTML = '';
+        new QRCode(qrcodeDiv, {
+          text: url,
+          width: 200,
+          height: 200,
+          colorDark: "#000000",
+          colorLight: "#ffffff",
+          correctLevel: QRCode.CorrectLevel.H
+        });
+        qrModal.classList.add('show');
+      }
+
+      // 复制URL
+      qrCopyBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(currentShareUrl)
+          .then(() => {
+            qrCopyBtn.textContent = '✓ 已复制';
+            setTimeout(() => {
+              qrCopyBtn.textContent = '复制链接';
+            }, 2000);
+          })
+          .catch(err => {
+            console.error('复制失败:', err);
+            showConfirmModal('复制失败，请手动复制', null, true);
+          });
+      });
+
+      // 关闭二维码弹窗
+      qrCloseBtn.addEventListener('click', () => {
+        qrModal.classList.remove('show');
+      });
+
+      // 显示确认弹窗
+      function showConfirmModal(message, callback, alertOnly = false) {
+        confirmModalMessage.textContent = message;
+        currentConfirmCallback = callback;
+        
+        if (alertOnly) {
+          confirmModalConfirm.textContent = '确定';
+          confirmModalCancel.style.display = 'none';
+        } else {
+          confirmModalConfirm.textContent = '确认';
+          confirmModalCancel.style.display = 'inline-block';
+        }
+        
+        confirmModal.classList.add('show');
+      }
+
+      // 关闭确认弹窗
+      function closeConfirmModal() {
+        confirmModal.classList.remove('show');
+      }
+
+      // 确认按钮事件
+      confirmModalConfirm.addEventListener('click', () => {
+        if (currentConfirmCallback) {
+          currentConfirmCallback();
+        }
+        closeConfirmModal();
+      });
+
+      // 取消按钮事件
+      confirmModalCancel.addEventListener('click', closeConfirmModal);
+
+      // 点击弹窗外部关闭弹窗
+      window.addEventListener('click', (event) => {
+        if (event.target === confirmModal) {
+          closeConfirmModal();
+        }
+        if (event.target === qrModal) {
+          qrModal.classList.remove('show');
+        }
+        if (event.target === editSuffixModal) {
+          editSuffixModal.classList.remove('show');
+        }
+      });
+
+      // 删除单个文件
+      async function deleteFile(url, card) {
+        try {
+          const response = await fetch('/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url })
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || '删除失败');
+          }
+          
+          if (card) {
+            card.remove();
+          } else {
+            const card = document.querySelector(\`[data-url="\${url}"]\`);
+            if (card) card.remove();
+          }
+          showConfirmModal('文件删除成功', null, true);
+        } catch (error) {
+          showConfirmModal('文件删除失败: ' + error.message, null, true);
+        }
+      }
+
+      // 删除选中的文件
+      async function deleteSelectedFiles() {
+        const checkboxes = document.querySelectorAll('.file-checkbox:checked');
+        const urls = Array.from(checkboxes).map(cb => cb.value);
+
+        try {
+          const response = await fetch('/delete-multiple', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ urls })
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || '批量删除失败');
+          }
+
+          checkboxes.forEach(cb => {
+            const card = cb.closest('.file-card');
+            if (card) card.remove();
+          });
+          showConfirmModal('批量删除成功', null, true);
+        } catch (error) {
+          showConfirmModal('批量删除失败: ' + error.message, null, true);
+        }
+      }
+
+      // 删除分类
+      async function deleteCategory() {
+        const select = document.getElementById('categoryDeleteSelect');
+        const categoryId = select.value;
+
+        try {
+          const response = await fetch('/delete-category', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: categoryId })
+          });
+
+          const data = await response.json();
+          if (data.status === 1) {
+            select.remove(select.selectedIndex);
+            showConfirmModal(data.msg, () => {
+              window.location.reload();
+            }, true);
+          } else {
+            showConfirmModal(data.msg, null, true);
+          }
+        } catch (error) {
+          showConfirmModal('删除分类失败: ' + error.message, null, true);
+        }
+      }
+
+      // 分享文件
+      function shareFile(url) {
+        showQRCode(url);
+      }
+
+      // 淇敼鍚庣紑
+      let currentEditUrl = '';
+
+      // 修改后缀
+      function showEditSuffixModal(url) {
+        currentEditUrl = url;
+        
+        // 获取当前后缀
+        const urlObj = new URL(url);
+        const pathParts = urlObj.pathname.split('/');
+        const fileName = pathParts[pathParts.length - 1];
+        const fileNameParts = fileName.split('.');
+        const extension = fileNameParts.pop(); // 获取扩展名
+        const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
+        
+        if (editSuffixInput) {
+          editSuffixInput.value = currentSuffix;
+          editSuffixModal.classList.add('show');
+        }
+      }
+
+      if (editSuffixCancel) {
+        editSuffixCancel.addEventListener('click', () => {
+          editSuffixModal.classList.remove('show');
+        });
+      }
+
+      if (editSuffixConfirm) {
+        editSuffixConfirm.addEventListener('click', async () => {
+          const newSuffix = editSuffixInput.value;
+          
+          try {
+            const response = await fetch('/update-suffix', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                url: currentEditUrl,
+                suffix: newSuffix
+              })
+            });
+            
+            const data = await response.json();
+            
+            if (data.status === 1) {
+              // 更新成功，隐藏弹窗
+              editSuffixModal.classList.remove('show');
+              
+              // 更新页面上的URL
+              const card = document.querySelector('[data-url="' + currentEditUrl + '"]');
+              if (card) {
+                // 更新卡片的URL值
+                card.setAttribute('data-url', data.newUrl);
+                
+                // 更新卡片中的按钮URL
+                const copyBtn = card.querySelector('.btn-copy');
+                const downBtn = card.querySelector('.btn-down');
+                const shareBtn = card.querySelector('.btn-share');
+                const editBtn = card.querySelector('.btn-edit');
+                
+                if (copyBtn) copyBtn.setAttribute('data-url', data.newUrl);
+                if (downBtn) downBtn.href = data.newUrl;
+                if (shareBtn) shareBtn.setAttribute('data-url', data.newUrl);
+                if (editBtn) editBtn.setAttribute('data-url', data.newUrl);
+                
+                // 更新描述中的文件名
+                const fileNameElement = card.querySelector('.file-info div:first-child');
+                if (fileNameElement) {
+                  const urlObj = new URL(data.newUrl);
+                  const fileName = urlObj.pathname.split('/').pop();
+                  fileNameElement.textContent = fileName;
+                }
+              }
+              
+              showConfirmModal(data.msg, null, true);
+            } else {
+              showConfirmModal(data.msg || '修改后缀失败', null, true);
+            }
+          } catch (error) {
+            showConfirmModal('修改后缀时出错：' + error.message, null, true);
+          }
+        });
+      }
+
+      // 复制到剪贴板
+      function copyToClipboard(text) {
+        navigator.clipboard.writeText(text)
+          .then(() => {
+            showConfirmModal('已复制到剪贴板', null, true);
+          })
+          .catch(() => {
+            showConfirmModal('复制失败，请手动复制', null, true);
+          });
+      }
+
+      // 点击弹窗外部关闭弹窗
+      window.addEventListener('click', (event) => {
+        if (event.target === confirmModal) {
+          closeConfirmModal();
+        }
+        if (event.target === qrModal) {
+          qrModal.classList.remove('show');
+        }
+        if (event.target === editSuffixModal) {
+          editSuffixModal.classList.remove('show');
+        }
+      });
+    </script>
+  </body>
+  </html>`;
 }
 
 async function handleUpdateSuffixRequest(request, config) {
   try {
     const { url, suffix } = await request.json();
-    
+
     if (!url) {
-      return new Response(JSON.stringify({ 
-        success: false, 
-        message: '缺少URL参数' 
-      }), { 
-        headers: { 'Content-Type': 'application/json' } 
+      return new Response(JSON.stringify({
+        status: 0,
+        msg: '缺少URL参数'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
       });
     }
-    
-    // 从URL中提取文件名
+
+    // 从URL中提取文件名和文件ID
     const fileName = url.split('/').pop();
-    
-    // 获取文件ID，通常是文件名的第一部分(不含扩展名)
-    const fileId = fileName.split('.')[0];
-    
+    const fileId = fileName.split('.')[0]; // 假设文件ID是文件名的第一部分
+
     // 更新数据库中的custom_suffix字段
     await config.database.prepare(`
-      UPDATE files 
-      SET custom_suffix = ? 
+      UPDATE files
+      SET custom_suffix = ?
       WHERE id = ? OR file_id = ?
     `).bind(suffix, fileId, fileId).run();
-    
-    return new Response(JSON.stringify({ 
-      success: true, 
-      message: '后缀修改成功',
-      newUrl: generateNewUrl(url, suffix)
-    }), { 
-      headers: { 'Content-Type': 'application/json' } 
+
+    // 生成新的URL
+    const newUrl = generateNewUrl(url, suffix);
+
+    return new Response(JSON.stringify({
+      status: 1,
+      msg: '后缀修改成功',
+      newUrl: newUrl
+    }), {
+      headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
     console.error('修改后缀出错:', error);
-    return new Response(JSON.stringify({ 
-      success: false, 
-      message: `修改后缀失败: ${error.message}` 
-    }), { 
+    return new Response(JSON.stringify({
+      status: 0,
+      msg: `修改后缀失败: ${error.message}`
+    }), {
       headers: { 'Content-Type': 'application/json' },
       status: 500
     });
   }
 }
 
+// 修改generateNewUrl函数，直接使用域名和文件名生成URL
 function generateNewUrl(url, suffix) {
-  const urlParts = url.split('/');
-  const fileName = urlParts.pop();
-  const fileNameParts = fileName.split('.');
-  const ext = fileNameParts.pop();
-  const baseName = fileNameParts.join('.');
-  const newFileName = `${baseName}${suffix ? `-${suffix}` : ''}.${ext}`;
-  urlParts.push(newFileName);
-  return urlParts.join('/');
-}
+  if (suffix === null || suffix === undefined) return url;
 
-async function sendPanel(chatId, userSetting, config) {
-  const {
-    is_admin,
-    is_premium,
-    is_vip,
-    is_whitelist,
-    is_blacklist,
-    is_banned,
-    is_bot,
-    is_group,
-    is_channel,
-    is_supergroup,
-    is_private,
-    is_public,
-    is_group_chat,
-    is_channel_chat,
-    is_supergroup_chat,
-    is_private_chat,
-    is_public_chat,
-    is_bot_chat,
-    is_group_admin,
-    is_channel_admin,
-    is_supergroup_admin,
-    is_private_admin,
-    is_public_admin,
-    is_bot_admin,
-    is_group_member,
-    is_channel_member,
-    is_supergroup_member,
-    is_private_member,
-    is_public_member,
-    is_bot_member,
-    is_group_creator,
-    is_channel_creator,
-    is_supergroup_creator,
-    is_private_creator,
-    is_public_creator,
-    is_bot_creator,
-    is_group_owner,
-    is_channel_owner,
-    is_supergroup_owner,
-    is_private_owner,
-    is_public_owner,
-    is_bot_owner,
-    is_group_founder,
-    is_channel_founder,
-    is_supergroup_founder,
-    is_private_founder,
-    is_public_founder,
-    is_bot_founder,
-    is_group_manager,
-    is_channel_manager,
-    is_supergroup_manager,
-    is_private_manager,
-    is_public_manager,
-    is_bot_manager,
-    is_group_banned,
-    is_channel_banned,
-    is_supergroup_banned,
-    is_private_banned,
-    is_public_banned,
-    is_bot_banned,
-    is_group_restricted,
-    is_channel_restricted,
-    is_supergroup_restricted,
-    is_private_restricted,
-    is_public_restricted,
-    is_bot_restricted,
-    is_group_left,
-    is_channel_left,
-    is_supergroup_left,
-    is_private_left,
-    is_public_left,
-    is_bot_left,
-    is_group_kicked,
-    is_channel_kicked,
-    is_supergroup_kicked,
-    is_private_kicked,
-    is_public_kicked,
-    is_bot_kicked,
-    is_group_muted,
-    is_channel_muted,
-    is_supergroup_muted,
-    is_private_muted,
-    is_public_muted,
-    is_bot_muted,
-    is_group_unmuted,
-    is_channel_unmuted,
-    is_supergroup_unmuted,
-    is_private_unmuted,
-    is_public_unmuted,
-    is_bot_unmuted,
-    is_group_unbanned,
-    is_channel_unbanned,
-    is_supergroup_unbanned,
-    is_private_unbanned,
-    is_public_unbanned,
-    is_bot_unbanned,
-    is_group_unrestricted,
-    is_channel_unrestricted,
-    is_supergroup_unrestricted,
-    is_private_unrestricted,
-    is_public_unrestricted,
-    is_bot_unrestricted,
-    is_group_unleft,
-    is_channel_unleft,
-    is_supergroup_unleft,
-    is_private_unleft,
-    is_public_unleft,
-    is_bot_unleft,
-    is_group_unkicked,
-    is_channel_unkicked,
-    is_supergroup_unkicked,
-    is_private_unkicked,
-    is_public_unkicked,
-    is_bot_unkicked,
-    is_group_unmuted,
-    is_channel_unmuted,
-    is_supergroup_unmuted,
-    is_private_unmuted,
-    is_public_unmuted,
-    is_bot_unmuted,
-    is_group_unbanned,
-    is_channel_unbanned,
-    is_supergroup_unbanned,
-    is_private_unbanned,
-    is_public_unbanned,
-    is_bot_unbanned,
-    is_group_unrestricted,
-    is_channel_unrestricted,
-    is_supergroup_unrestricted,
-    is_private_unrestricted,
-    is_public_unrestricted,
-    is_bot_unrestricted,
-    is_group_unleft,
-    is_channel_unleft,
-    is_supergroup_unleft,
-    is_private_unleft,
-    is_public_unleft,
-    is_bot_unleft,
-    is_group_unkicked,
-    is_channel_unkicked,
-    is_supergroup_unkicked,
-    is_private_unkicked,
-    is_public_unkicked,
-    is_bot_unkicked,
-    is_group_unmuted,
-    is_channel_unmuted,
-    is_supergroup_unmuted,
-    is_private_unmuted,
-    is_public_unmuted,
-    is_bot_unmuted,
-    is_group_unbanned,
-    is_channel_unbanned,
-    is_supergroup_unbanned,
-    is_private_unbanned,
-    is_public_unbanned,
-    is_bot_unbanned,
-    is_group_unrestricted,
-    is_channel_unrestricted,
-    is_supergroup_unrestricted,
-    is_private_unrestricted,
-    is_public_unrestricted,
-    is_bot_unrestricted,
-    is_group_unleft,
-    is_channel_unleft,
-    is_supergroup_unleft,
-    is_private_unleft,
-    is_public_unleft,
-    is_bot_unleft,
-    is_group_unkicked,
-    is_channel_unkicked,
-    is_supergroup_unkicked,
-    is_private_unkicked,
-    is_public_unkicked,
-    is_bot_unkicked,
-    is_group_unmuted,
-    is_channel_unmuted,
-    is_supergroup_unmuted,
-    is_private_unmuted,
-    is_public_unmuted,
-    is_bot_unmuted,
-    is_group_unbanned,
-    is_channel_unbanned,
-    is_supergroup_unbanned,
-    is_private_unbanned,
-    is_public_unbanned,
-    is_bot_unbanned,
-    is_group_unrestricted,
-    is_channel_unrestricted,
-    is_supergroup_unrestricted,
-    is_private_unrestricted,
-    is_public_unrestricted,
-    is_bot_unrestricted,
-    is_group_unleft,
-    is_channel_unleft,
-    is_supergroup_unleft,
-    is_private_unleft,
-    is_public_unleft,
-    is_bot_unleft,
-    is_group_unkicked,
-    is_channel_unkicked,
-    is_supergroup_unkicked,
-    is_private_unkicked,
-    is_public_unkicked,
-    is_bot_unkicked,
-    is_group_unmuted,
-    is_channel_unmuted,
-    is_supergroup_unmuted,
-    is_private_unmuted,
-    is_public_unmuted,
-    is_bot_unmuted,
-    is_group_unbanned,
-    is_channel_unbanned,
-    is_supergroup_unbanned,
-    is_private_unbanned,
-    is_public_unbanned,
-    is_bot_unbanned,
-    is_group_unrestricted,
-    is_channel_unrestricted,
-    is_supergroup_unrestricted,
-    is_private_unrestricted,
-    is_public_unrestricted,
-    is_bot_unrestricted,
-    is_group_unleft,
-    is_channel_unleft,
-  const extension = fileNameParts.pop(); // 获取扩展名
+  const urlObj = new URL(url);
+  const pathParts = urlObj.pathname.split('/');
+  const fileName = pathParts[pathParts.length - 1];
   
-  // 构建新的文件名：原始名称 + 后缀 + 扩展名
-  const newFileName = fileNameParts.join('.') + suffix + '.' + extension;
+  // 分离文件名和扩展名
+  const lastDotIndex = fileName.lastIndexOf('.');
+  if (lastDotIndex === -1) return url; // 如果没有扩展名，直接返回原URL
+  
+  const baseName = fileName.substring(0, lastDotIndex);
+  const extension = fileName.substring(lastDotIndex);
+  
+  // 构建新的文件名：原基础名称 + 后缀 + 扩展名
+  const newFileName = baseName + (suffix ? suffix : '') + extension;
   
   // 替换URL中的文件名部分
-  return url.replace(fileName, newFileName);
+  pathParts[pathParts.length - 1] = newFileName;
+  urlObj.pathname = pathParts.join('/');
+  
+  return urlObj.toString();
 }
 
 function getFileName(url) {
@@ -2486,27 +3518,14 @@ async function getFile(fileId, config) {
 }
 
 async function deleteFile(fileId, config) {
-  try {
-    // 检查R2存储是否可用
-    if (config.bucket) {
-      try {
-        // 删除R2文件
-        await config.bucket.delete(fileId);
-        console.log(`已从R2删除文件: ${fileId}`);
-      } catch (error) {
-        console.error(`从R2删除文件时出错: ${error.message}`);
-      }
+  if (config.bucket) {
+    try {
+      await config.bucket.delete(fileId);
+      return true;
+    } catch (error) {
+      console.error('R2删除文件失败:', error);
+      return false;
     }
-    
-    // 从数据库中删除文件记录
-    await config.database.prepare('DELETE FROM files WHERE file_id = ? OR url LIKE ?')
-      .bind(fileId, `%${fileId}%`)
-      .run();
-      
-    console.log(`已从数据库删除文件记录: ${fileId}`);
-    return true;
-  } catch (error) {
-    console.error(`删除文件时出错: ${error.message}`);
-    return false;
   }
+  return true; // 如果没有R2桶，假设文件已删除或不需要删除
 }
