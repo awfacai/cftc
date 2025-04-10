@@ -1340,20 +1340,11 @@ async function handleFileRequest(request, config) {
     if (file.storage_type === 'telegram') {
       // 处理Telegram存储的文件
       try {
-        // 确保使用Telegram的原始文件ID (存储在fileId字段)
-        const telegramFileId = file.fileId;
-        
-        if (!telegramFileId) {
-          console.error('文件记录缺少Telegram fileId');
-          return new Response('Missing Telegram file ID', { status: 500 });
-        }
-        
         // 从Telegram获取文件链接
-        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
+        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.fileId}`);
         const data = await response.json();
         
         if (!data.ok) {
-          console.error('Telegram getFile 失败:', data);
           return new Response('Failed to get file from Telegram', { status: 500 });
         }
         
@@ -3263,87 +3254,62 @@ function generateAdminPage(fileCards, categoryOptions) {
 
 async function handleUpdateSuffixRequest(request, config) {
   try {
-    const { url, suffix } = await request.json();
+    const { fileName, suffix } = await request.json();
 
-    if (!url || !suffix) {
+    if (!fileName || !suffix) {
       return new Response(JSON.stringify({
         status: 0,
-        msg: '文件链接和后缀不能为空'
+        message: '文件名和后缀不能为空'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // 从URL提取文件名
-    const originalFileName = getFileName(url);
+    const newFileName = suffix + '.' + fileName.split('.').pop();
     
-    // 从数据库中查找对应的文件记录
-    const fileRecord = await config.database.prepare('SELECT * FROM files WHERE url = ? OR fileId = ?')
-      .bind(url, originalFileName).first();
-      
-    if (!fileRecord) {
-      return new Response(JSON.stringify({
-        status: 0,
-        msg: '未找到对应的文件记录'
-      }), { headers: { 'Content-Type': 'application/json' } });
-    }
+    let fileUrl;
     
-    // 获取文件扩展名
-    const fileExt = originalFileName.split('.').pop();
-    const newFileName = `${suffix}.${fileExt}`;
-    let fileUrl = `https://${config.domain}/${newFileName}`;
-    
-    // 处理存储在Telegram的文件
-    if (fileRecord.storage_type === 'telegram') {
-      // 对于Telegram存储，我们只更新url，保留原始的Telegram fileId
-      // Telegram文件的fileId是Telegram API返回的唯一标识符，不能修改
-      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-        .bind(fileUrl, fileRecord.id).run();
-    } 
-    // 处理存储在R2的文件
-    else if (config.bucket) {
+    // 检查文件是否存在于R2存储
+    if (config.bucket) {
       try {
-        const fileId = fileRecord.fileId || originalFileName;
-        const file = await config.bucket.get(fileId);
-        
+        const file = await config.bucket.get(fileName);
         if (file) {
           // 复制文件到新名称
           const fileData = await file.arrayBuffer();
           await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
-
-          // 删除旧文件
-          await deleteFile(fileId, config);
           
-          // 更新数据库记录
-          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
-            .bind(newFileName, fileUrl, fileRecord.id).run();
-        } else {
-          // 如果R2中没有找到文件，只更新URL
-          await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-            .bind(fileUrl, fileRecord.id).run();
+          // 删除旧文件
+          await deleteFile(fileName, config);
+          
+          // 更新数据库中的文件名
+          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ?')
+            .bind(newFileName, `https://${config.domain}/${newFileName}`, fileName).run();
+            
+          fileUrl = `https://${config.domain}/${newFileName}`;
         }
       } catch (error) {
         console.error('处理R2文件重命名失败:', error);
-        
-        // 即使R2操作失败，仍然更新URL
-        await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-          .bind(fileUrl, fileRecord.id).run();
+        // 如果R2操作失败，继续尝试数据库更新
       }
-    } 
-    // 其他情况，直接更新数据库
-    else {
-      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-        .bind(fileUrl, fileRecord.id).run();
+    }
+    
+    // 如果没有R2或R2操作失败，尝试只更新数据库
+    if (!fileUrl) {
+      const oldUrl = `https://${config.domain}/${fileName}`;
+      fileUrl = `https://${config.domain}/${newFileName}`;
+      
+      // 尝试更新数据库记录
+      await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ? OR url = ?')
+        .bind(newFileName, fileUrl, fileName, oldUrl).run();
     }
 
     return new Response(JSON.stringify({
       status: 1,
-      msg: '后缀修改成功',
-      newUrl: fileUrl
+      url: fileUrl
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
     console.error('更新后缀失败:', error);
     return new Response(JSON.stringify({
       status: 0,
-      msg: '更新后缀失败: ' + error.message
+      message: '更新后缀失败: ' + error.message
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 }
