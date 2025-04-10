@@ -191,16 +191,27 @@ async function recreateCategoriesTable(config) {
 
 // 重建用户设置表
 async function recreateUserSettingsTable(config) {
-  await config.database.prepare(`
-    CREATE TABLE IF NOT EXISTS user_settings (
-      user_id INTEGER PRIMARY KEY,
-      category_id INTEGER,
-      storage_type TEXT DEFAULT 'telegram',
-      state TEXT,
-      suffix TEXT DEFAULT '',
-      FOREIGN KEY (category_id) REFERENCES categories(id)
-    )
-  `).run();
+  try {
+    await config.database.prepare('DROP TABLE IF EXISTS user_settings').run();
+    
+    await config.database.prepare(`
+      CREATE TABLE user_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL UNIQUE,
+        storage_type TEXT DEFAULT 'r2',
+        category_id INTEGER,
+        custom_suffix TEXT,
+        waiting_for TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+    
+    console.log('用户设置表重新创建成功');
+    return true;
+  } catch (error) {
+    console.error('重新创建用户设置表失败:', error);
+    return false;
+  }
 }
 
 // 重建文件表
@@ -291,8 +302,6 @@ async function checkAndAddMissingColumns(config) {
     
     // 检查用户设置表是否有current_category_id列
     await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
-    
-    await ensureColumnExists(config, 'user_settings', 'suffix', 'TEXT DEFAULT ""');
     
     return true;
   } catch (error) {
@@ -534,38 +543,125 @@ async function handleTelegramWebhook(request, config) {
 }
 
 async function sendPanel(chatId, userSetting, config) {
+  // 获取当前分类
+  let categoryName = '默认';
+  if (userSetting && userSetting.category_id) {
+    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(userSetting.category_id).first();
+    if (category) {
+      categoryName = category.name;
+    }
+  }
+
+  const message = `📲 图床助手 3.0
+  
+📡 系统状态 ─────────────
+🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}
+🔹 当前分类: ${categoryName}
+🔹 文件大小: 最大${config.maxSizeMB}MB
+
+➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
+➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作`;
+
   const keyboard = {
     inline_keyboard: [
       [
-        { text: "📁 上传文件", callback_data: "upload_file" },
-        { text: "📄 上传文档", callback_data: "upload_document" }
+        { text: "🔄 切换存储方式", callback_data: "switch_storage" },
+        { text: "📊 统计信息", callback_data: "stats" }
       ],
       [
-        { text: "⚙️ 设置分类", callback_data: "set_category" },
-        { text: "🔧 修改后缀", callback_data: "change_suffix" }
+        { text: "📂 选择分类", callback_data: "list_categories" },
+        { text: "➕ 新建分类", callback_data: "create_category" }
       ]
     ]
   };
 
-  const text = `欢迎使用文件上传机器人！\n当前分类：${userSetting?.category || "默认"}\n当前后缀：${userSetting?.suffix || "无"}\n\n请选择操作：`;
-
-  await sendMessage(chatId, text, config.tgBotToken, null, keyboard);
+  await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: message,
+      reply_markup: keyboard,
+      parse_mode: 'HTML'
+    })
+  });
 }
 
 async function handleCallbackQuery(update, config, userSetting) {
-  const chatId = update.callback_query.from.id;
-  const data = update.callback_query.data;
+  const cbData = update.callback_query.data;
+  const chatId = update.callback_query.from.id.toString();
 
-  if (data === "upload_file" || data === "upload_document") {
-    // ... existing code ...
-  } else if (data === "set_category") {
-    // ... existing code ...
-  } else if (data === "change_suffix") {
-    const text = "请输入新的文件后缀（例如：.webp）\n\n- 不需要后缀请输入：none\n- 取消操作请输入：cancel";
-    await config.database.prepare("UPDATE user_settings SET state = 'waiting_suffix' WHERE user_id = ?").bind(chatId).run();
-    await sendMessage(chatId, text, config.tgBotToken);
+  // 确认消息已收到
+  await fetch(`https://api.telegram.org/bot${config.tgBotToken}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      callback_query_id: update.callback_query.id
+    })
+  });
+
+  if (cbData === 'switch_storage') {
+    // 切换存储类型
+    const newStorageType = userSetting.storage_type === 'r2' ? 'telegram' : 'r2';
+    await config.database.prepare('UPDATE user_settings SET storage_type = ? WHERE chat_id = ?').bind(newStorageType, chatId).run();
+    await sendMessage(chatId, `✅ 已切换到 ${newStorageType === 'r2' ? 'R2对象存储' : 'Telegram存储'}`, config.tgBotToken);
+    await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
+  } else if (cbData === 'list_categories') {
+    // 列出所有分类
+    const categories = await config.database.prepare('SELECT id, name FROM categories').all();
+    if (categories.results.length === 0) {
+      await sendMessage(chatId, "⚠️ 暂无分类，请先创建分类", config.tgBotToken);
+      return;
+    }
+
+    const categoriesText = categories.results.map((cat, i) => `${i + 1}. ${cat.name} (ID: ${cat.id})`).join('\n');
+    const keyboard = {
+      inline_keyboard: categories.results.map(cat => [
+        { text: cat.name, callback_data: `set_category_${cat.id}` }
+      ]).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
+    };
+
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: "📂 请选择要使用的分类：\n\n" + categoriesText,
+        reply_markup: keyboard
+      })
+    });
+  } else if (cbData === 'create_category') {
+    // 添加新建分类功能
+    await sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken);
+    await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?').bind('new_category', chatId).run();
+  } else if (cbData.startsWith('set_category_')) {
+    // 设置当前分类
+    const categoryId = parseInt(cbData.split('_')[2]);
+    await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?').bind(categoryId, chatId).run();
+
+    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(categoryId).first();
+    await sendMessage(chatId, `✅ 已切换到分类: ${category?.name || '未知分类'}`, config.tgBotToken);
+
+    await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
+  } else if (cbData === 'back_to_panel') {
+    await sendPanel(chatId, userSetting, config);
+  } else if (cbData === 'stats') {
+    // 获取用户统计信息
+    const stats = await config.database.prepare(`
+      SELECT COUNT(*) as total_files,
+             SUM(file_size) as total_size,
+             COUNT(DISTINCT category_id) as total_categories
+      FROM files WHERE chat_id = ?
+    `).bind(chatId).first();
+
+    const statsMessage = `📊 您的使用统计
+─────────────
+📁 总文件数: ${stats.total_files || 0}
+📊 总存储量: ${formatSize(stats.total_size || 0)}
+📋 使用分类: ${stats.total_categories || 0}个`;
+
+    await sendMessage(chatId, statsMessage, config.tgBotToken);
   }
-  // ... existing code ...
 }
 
 async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
@@ -1429,7 +1525,7 @@ function formatSize(bytes) {
   return `${size.toFixed(2)} ${units[unitIndex]}`;
 }
 
-async function sendMessage(chatId, text, botToken, replyToMessageId = null, replyMarkup = null) {
+async function sendMessage(chatId, text, botToken, replyToMessageId = null) {
   try {
     await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
@@ -1437,8 +1533,7 @@ async function sendMessage(chatId, text, botToken, replyToMessageId = null, repl
       body: JSON.stringify({
         chat_id: chatId,
         text,
-        reply_to_message_id: replyToMessageId,
-        reply_markup: replyMarkup
+        reply_to_message_id: replyToMessageId
       })
     });
   } catch (error) {
