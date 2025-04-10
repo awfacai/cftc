@@ -472,13 +472,8 @@ async function handleTelegramWebhook(request, config) {
       // 检查用户是否有设置记录，没有则创建
       let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
       if (!userSetting) {
-        // 获取默认分类ID
-        const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-        const defaultCategoryId = defaultCategory ? defaultCategory.id : null;
-        
-        // 创建用户设置记录，使用默认分类
-        await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type, category_id) VALUES (?, ?, ?)').bind(chatId, 'r2', defaultCategoryId).run();
-        userSetting = { chat_id: chatId, storage_type: 'r2', category_id: defaultCategoryId };
+        await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
+        userSetting = { chat_id: chatId, storage_type: 'r2' };
       }
 
       // 检查用户是否在等待输入
@@ -491,13 +486,6 @@ async function handleTelegramWebhook(request, config) {
           const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
           if (existingCategory) {
             await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
-            
-            // 如果分类已存在，可以将它设为当前分类
-            await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(existingCategory.id, chatId).run();
-            userSetting.category_id = existingCategory.id;
-            userSetting.waiting_for = null;
-            
-            await sendMessage(chatId, `✅ 已将"${categoryName}"设为当前分类`, config.tgBotToken);
           } else {
             // 创建新分类
             const time = Date.now();
@@ -506,27 +494,21 @@ async function handleTelegramWebhook(request, config) {
             // 获取新创建的分类ID
             const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
             
-            if (newCategory) {
-              // 设置为当前分类
-              await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
-              userSetting.category_id = newCategory.id;
-              userSetting.waiting_for = null;
-              
-              await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
-            } else {
-              throw new Error('创建分类后无法获取分类ID');
-            }
+            // 设置为当前分类
+            await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
+            
+            await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
           }
         } catch (error) {
           console.error('创建分类失败:', error);
           await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
-          
-          // 清除等待状态
-          await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
-          userSetting.waiting_for = null;
         }
         
+        // 清除等待状态
+        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
+        
         // 更新面板
+        userSetting.waiting_for = null;
         await sendPanel(chatId, userSetting, config);
         return new Response('OK');
       }
@@ -546,11 +528,8 @@ async function handleTelegramWebhook(request, config) {
       const chatId = update.callback_query.from.id.toString();
       let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
       if (!userSetting) {
-        const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-        const defaultCategoryId = defaultCategory ? defaultCategory.id : null;
-        
-        await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type, category_id) VALUES (?, ?, ?)').bind(chatId, 'r2', defaultCategoryId).run();
-        userSetting = { chat_id: chatId, storage_type: 'r2', category_id: defaultCategoryId };
+        await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
+        userSetting = { chat_id: chatId, storage_type: 'r2' };
       }
 
       await handleCallbackQuery(update, config, userSetting);
@@ -573,14 +552,15 @@ async function sendPanel(chatId, userSetting, config) {
     }
   }
 
-  const message = `📲 文件上传助手 3.0
-
+  const message = `📲 图床助手 3.0
+  
 📡 系统状态 ─────────────
 🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}
 🔹 当前分类: ${categoryName}
 🔹 文件大小: 最大${config.maxSizeMB}MB
 
-现在您可以直接发送图片或文件给我，上传完成后会返回文件链接。访问链接即可查看图片，支持作为图床使用。`;
+➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
+➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作`;
 
   const keyboard = {
     inline_keyboard: [
@@ -686,7 +666,7 @@ async function handleCallbackQuery(update, config, userSetting) {
 
 async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
   try {
-    // 直接使用Telegram API链接下载文件
+    // 第一步：获取文件内容
     const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
     const data = await response.json();
     if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
@@ -703,83 +683,100 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       return;
     }
 
-    const arrayBuffer = await fileResponse.arrayBuffer();
-
-    // 确定文件类型和扩展名 - 修复bin格式问题
-    let mimeType = file.mime_type || 'application/octet-stream';
-    let fileExt = '';
+    // 第二步：准备文件数据，与网页上传保持一致的格式
+    // 获取文件扩展名和MIME类型
+    let fileName = '';
+    let ext = '';
     
     if (isDocument && file.file_name) {
-      // 如果有原始文件名，从中提取扩展名
-      fileExt = file.file_name.split('.').pop() || '';
-      // 如果没有扩展名或不是常见扩展名，根据MIME类型推断
-      if (!fileExt || fileExt === file.file_name) {
-        fileExt = getExtensionFromMime(mimeType);
-      }
+      fileName = file.file_name;
+      ext = (fileName.split('.').pop() || '').toLowerCase();
     } else {
-      // 如果是图片等没有文件名的内容
-      fileExt = getExtensionFromMime(mimeType);
+      ext = getExtensionFromMime(file.mime_type);
+      fileName = `image.${ext}`;
     }
     
-    // 保证扩展名不是bin
-    if (fileExt === 'bin' && mimeType.startsWith('image/')) {
-      // 如果是图片但扩展名是bin，使用正确的扩展名
-      fileExt = mimeType.split('/')[1] || 'jpg';
-    }
+    const mimeType = file.mime_type || getContentType(ext);
+    const [mainType] = mimeType.split('/');
     
-    // 使用时间戳作为文件名 - 与网页上传保持一致
-    const timestamp = Date.now();
-    const fileName = `${timestamp}.${fileExt}`;
-    
-    // 获取存储类型 - 使用用户当前设置
+    // 第三步：根据存储类型(r2 或 telegram)处理文件存储
     const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
     
-    // 计算最终URL
-    const url = `https://${config.domain}/${fileName}`;
-    
-    let dbFileId, dbMessageId;
-    
-    // 根据存储类型处理文件 - 模拟网页上传
-    if (storageType === 'r2' && config.bucket) {
-      // 上传到R2
-      await config.bucket.put(fileName, arrayBuffer, {
-        httpMetadata: { contentType: mimeType }
-      });
-      dbFileId = fileName;
-      dbMessageId = -1; // 与网页上传保持一致
-    } else {
-      // Telegram存储
-      // 使用现有的file.file_id作为数据库fileId
-      dbFileId = file.file_id;
-      // 获取或生成消息ID
-      dbMessageId = 0; // Telegram消息ID会在后续更新
-    }
-    
-    // 获取分类ID - 确保无分类使用默认分类
+    // 获取分类ID
     let categoryId = null;
-    
-    // 优先使用用户当前设置的分类
     if (userSetting && userSetting.category_id) {
       categoryId = userSetting.category_id;
     } else {
-      // 如果没有当前分类，查找默认分类
+      // 找默认分类
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
       if (defaultCategory) {
         categoryId = defaultCategory.id;
-        
-        // 更新用户设置，将默认分类设为当前分类
-        if (userSetting && userSetting.chat_id) {
-          await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
-            .bind(categoryId, chatId).run();
-        }
       }
     }
     
-    // 创建日期格式 - 修复日期错乱问题
-    // 使用与网页上传相同的日期格式：直接使用数字时间戳（秒）
-    const timestampSeconds = Math.floor(timestamp / 1000);
+    let finalUrl, dbFileId, dbMessageId;
     
-    // 插入数据库记录 - 与网页上传使用相同的字段和格式
+    // 与网页上传一致，使用时间戳作为文件名
+    const timestamp = Date.now();
+    const key = `${timestamp}.${ext}`;
+    
+    if (storageType === 'r2' && config.bucket) {
+      // 上传到R2存储
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      await config.bucket.put(key, arrayBuffer, { 
+        httpMetadata: { contentType: mimeType } 
+      });
+      finalUrl = `https://${config.domain}/${key}`;
+      dbFileId = key;
+      dbMessageId = 0;
+    } else {
+      // 使用Telegram存储
+      // 根据文件类型选择不同的发送方法
+      const typeMap = {
+        image: { method: 'sendPhoto', field: 'photo' },
+        video: { method: 'sendVideo', field: 'video' },
+        audio: { method: 'sendAudio', field: 'audio' }
+      };
+      let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
+      
+      if (['application', 'text'].includes(mainType)) {
+        method = 'sendDocument';
+        field = 'document';
+      }
+      
+      // 重新发送到存储聊天
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      const tgFormData = new FormData();
+      tgFormData.append('chat_id', config.tgStorageChatId);
+      const blob = new Blob([arrayBuffer], { type: mimeType });
+      tgFormData.append(field, blob, fileName);
+      
+      const tgResponse = await fetch(
+        `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
+        { method: 'POST', body: tgFormData }
+      );
+      
+      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
+      
+      const tgData = await tgResponse.json();
+      const result = tgData.result;
+      const messageId = result.message_id;
+      const fileId = result.document?.file_id ||
+                    result.video?.file_id ||
+                    result.audio?.file_id ||
+                    (result.photo && result.photo[result.photo.length - 1]?.file_id);
+                    
+      if (!fileId) throw new Error('未获取到文件ID');
+      if (!messageId) throw new Error('未获取到tg消息ID');
+      
+      finalUrl = `https://${config.domain}/${key}`;
+      dbFileId = fileId;
+      dbMessageId = messageId;
+    }
+    
+    // 第四步：写入数据库，与网页上传完全一致的格式
+    const time = Math.floor(timestamp / 1000);
+    
     await config.database.prepare(`
       INSERT INTO files (
         url, 
@@ -789,25 +786,25 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
         file_name, 
         file_size, 
         mime_type, 
-        storage_type, 
-        category_id,
-        chat_id
+        chat_id, 
+        category_id, 
+        storage_type
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      url,
+      finalUrl,
       dbFileId,
       dbMessageId,
-      timestampSeconds, // 使用数字时间戳（秒）而不是ISO字符串
-      fileName,
-      arrayBuffer.byteLength,
+      time,
+      key,  // 使用key作为file_name
+      contentLength,
       mimeType,
-      storageType,
+      chatId,
       categoryId,
-      chatId
+      storageType
     ).run();
     
-    // 发送成功消息
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(url)}`;
+    // 第五步：发送成功消息给用户
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
     
     await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
       method: 'POST',
@@ -815,7 +812,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       body: JSON.stringify({
         chat_id: chatId,
         photo: qrCodeUrl,
-        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${url}\n\n🔍 扫描上方二维码快速访问`,
+        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`,
         parse_mode: 'HTML'
       })
     });
@@ -828,18 +825,24 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
 async function getTelegramFileUrl(fileId, botToken, config) {
   const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
   const data = await response.json();
-  if (!data.ok) throw new Error('鑾峰彇鏂囦欢璺緞澶辫触');
+  if (!data.ok) throw new Error('获取文件路径失败');
   
   // 获取文件路径
   const filePath = data.result.file_path;
   
-  // 从路径中提取文件名
+  // 从路径中提取文件名和扩展名
   const fileName = filePath.split('/').pop();
   
-  // 如果环境变量中设置了DOMAIN，就使用自定义域名，否则使用Telegram API链接
+  // 使用时间戳重命名文件，保持与其他上传一致
+  const timestamp = Date.now();
+  const fileExt = fileName.split('.').pop();
+  const newFileName = `${timestamp}.${fileExt}`;
+  
+  // 返回域名格式URL
   if (config && config.domain) {
-    return `https://${config.domain}/${fileName}`;
+    return `https://${config.domain}/${newFileName}`;
   } else {
+    // 仅在没有配置域名时才返回Telegram API链接
     return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
   }
 }
@@ -1265,130 +1268,130 @@ function getPreviewHtml(url) {
 }
 
 async function handleFileRequest(request, config) {
-  const url = new URL(request.url);
-  const path = url.pathname;
-  const fileName = path.replace(/^\//, '');  // 移除开头的斜杠
-  
-  if (!fileName || fileName === '') {
-    return new Response("文件名不能为空", { status: 404 });
-  }
-
   try {
-    // 根据URL从数据库中查找文件信息
-    let fileInfo = await config.database.prepare(`
-      SELECT * FROM files WHERE url LIKE ? OR fileId = ? OR file_name = ?
-    `).bind(
-      `%${fileName}%`,
-      fileName,
-      fileName
-    ).first();
+    const url = new URL(request.url);
+    const path = decodeURIComponent(url.pathname.slice(1));
 
-    // 如果找不到文件信息，尝试查找不带查询参数的URL
-    if (!fileInfo && url.search) {
-      const cleanUrl = `https://${config.domain}/${fileName}`;
-      fileInfo = await config.database.prepare(`
-        SELECT * FROM files WHERE url = ?
-      `).bind(cleanUrl).first();
+    if (!path) {
+      return new Response('Not Found', { status: 404 });
     }
+    
+    // 设置公共头部，确保图片等媒体可以正常显示
+    const getCommonHeaders = (contentType) => {
+      const headers = new Headers();
+      headers.set('Content-Type', contentType);
+      headers.set('Access-Control-Allow-Origin', '*');
+      
+      // 关键：确保媒体文件使用inline展示
+      if (contentType.startsWith('image/') || 
+          contentType.startsWith('video/') || 
+          contentType.startsWith('audio/')) {
+        headers.set('Content-Disposition', 'inline');
+      }
+      
+      // 添加缓存相关头
+      headers.set('Cache-Control', 'public, max-age=31536000');
+      
+      return headers;
+    };
 
-    if (!fileInfo) {
-      return new Response("文件未找到", { status: 404 });
-    }
-
-    // 判断存储类型
-    if (fileInfo.storage_type === 'telegram') {
-      // 从Telegram获取文件
+    // 先尝试直接从R2存储获取文件
+    if (config.bucket) {
       try {
-        const fileUrl = await getTelegramFileUrl(fileInfo.fileId, config.tgBotToken, config);
-        const fileResponse = await fetch(fileUrl);
+        const object = await config.bucket.get(path);
+        
+        if (object) {
+          const contentType = object.httpMetadata.contentType || getContentType(path.split('.').pop());
+          const headers = getCommonHeaders(contentType);
+          object.writeHttpMetadata(headers);
+          headers.set('etag', object.httpEtag);
+          
+          return new Response(object.body, { headers });
+        }
+      } catch (error) {
+        console.error('R2获取文件出错:', error);
+        // 继续尝试其他方式获取文件
+      }
+    }
+
+    // 从数据库查询文件记录
+    let file;
+    
+    // 先通过完整URL查询
+    const urlPattern = `https://${config.domain}/${path}`;
+    file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
+    
+    // 如果上面没找到，再用文件名作为fileId查询
+    if (!file) {
+      file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
+    }
+    
+    // 最后尝试使用路径的最后部分（文件名）查询
+    if (!file) {
+      const fileName = path.split('/').pop();
+      file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
+    }
+
+    if (!file) {
+      return new Response('File not found', { status: 404 });
+    }
+
+    // 根据存储类型处理文件
+    if (file.storage_type === 'telegram') {
+      // 处理Telegram存储的文件
+      try {
+        // 从Telegram获取文件链接
+        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.fileId}`);
+        const data = await response.json();
+        
+        if (!data.ok) {
+          return new Response('Failed to get file from Telegram', { status: 500 });
+        }
+        
+        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+        const fileResponse = await fetch(telegramUrl);
         
         if (!fileResponse.ok) {
-          return new Response("无法从Telegram获取文件", { status: 500 });
+          return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
         }
         
-        const contentType = fileInfo.mime_type || getContentType(fileName.split('.').pop());
-        const arrayBuffer = await fileResponse.arrayBuffer();
+        const contentType = file.mime_type || getContentType(path.split('.').pop());
+        const headers = getCommonHeaders(contentType);
         
-        // 使用serveFile函数统一处理响应
-        return serveFile(arrayBuffer, {
-          contentType,
-          fileName: fileInfo.file_name || fileName,
-          inline: contentType.startsWith('image/') // 图像使用inline显示
-        });
+        // 流式传输文件内容，避免内存占用过大
+        return new Response(fileResponse.body, { headers });
       } catch (error) {
-        console.error("从Telegram获取文件失败:", error);
-        return new Response("从Telegram获取文件失败", { status: 500 });
+        console.error('处理Telegram文件出错:', error);
+        return new Response('Error processing Telegram file', { status: 500 });
       }
-    } else if (fileInfo.storage_type === 'r2' && config.bucket) {
-      // 从R2获取文件
+    } else if (file.storage_type === 'r2' && config.bucket) {
+      // 如果是R2存储但前面直接访问失败，再尝试通过fileId获取
       try {
-        // 确定正确的R2对象键值
-        let objectKey = fileInfo.fileId;
-        // 如果fileId不是有效的R2键，尝试使用file_name
-        if (!objectKey || objectKey.includes('http')) {
-          objectKey = fileInfo.file_name;
+        const object = await config.bucket.get(file.fileId);
+        
+        if (object) {
+          const contentType = object.httpMetadata.contentType || file.mime_type || getContentType(path.split('.').pop());
+          const headers = getCommonHeaders(contentType);
+          object.writeHttpMetadata(headers);
+          headers.set('etag', object.httpEtag);
+          
+          return new Response(object.body, { headers });
         }
-        
-        // 如果objectKey仍然包含完整URL，提取文件名部分
-        if (objectKey && objectKey.includes('/')) {
-          objectKey = objectKey.split('/').pop();
-        }
-        
-        if (!objectKey) {
-          return new Response("无法确定文件存储位置", { status: 500 });
-        }
-        
-        const object = await config.bucket.get(objectKey);
-        
-        if (!object) {
-          return new Response("文件在存储中未找到", { status: 404 });
-        }
-        
-        const contentType = fileInfo.mime_type || getContentType(objectKey.split('.').pop());
-        const arrayBuffer = await object.arrayBuffer();
-        
-        // 使用serveFile函数统一处理响应
-        return serveFile(arrayBuffer, {
-          contentType,
-          fileName: fileInfo.file_name || objectKey,
-          inline: contentType.startsWith('image/') // 图像使用inline显示
-        });
       } catch (error) {
-        console.error("从R2获取文件失败:", error);
-        return new Response("从R2获取文件失败", { status: 500 });
+        console.error('通过fileId从R2获取文件出错:', error);
       }
-    } else {
-      return new Response("不支持的存储类型", { status: 500 });
     }
+    
+    // 如果上述方法都失败，尝试重定向到文件URL
+    if (file.url && file.url !== urlPattern) {
+      return Response.redirect(file.url, 302);
+    }
+    
+    return new Response('File not available', { status: 404 });
   } catch (error) {
-    console.error("文件请求处理失败:", error);
-    return new Response("文件请求处理失败", { status: 500 });
+    console.error('处理文件请求出错:', error);
+    return new Response('Internal Server Error', { status: 500 });
   }
-}
-
-// 统一处理文件响应的辅助函数
-function serveFile(body, options = {}) {
-  const headers = new Headers();
-  
-  // 设置内容类型
-  if (options.contentType) {
-    headers.set('Content-Type', options.contentType);
-  }
-  
-  // 设置文件处理方式：内联(inline)显示或下载(attachment)
-  if (options.fileName) {
-    const disposition = options.inline ? 'inline' : 'attachment';
-    headers.set('Content-Disposition', `${disposition}; filename="${encodeURIComponent(options.fileName)}"`);
-  }
-  
-  // 允许缓存和跨域
-  headers.set('Cache-Control', 'public, max-age=31536000');
-  headers.set('Access-Control-Allow-Origin', '*');
-  
-  return new Response(body, {
-    status: 200,
-    headers
-  });
 }
 
 async function handleDeleteRequest(request, config) {
