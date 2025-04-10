@@ -1928,7 +1928,7 @@ async function handleAdminRequest(request, config) {
           </div>
           <div class="file-actions">
             <button class="btn btn-copy" onclick="copyToClipboard('${url}')">复制链接</button>
-            <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
+            <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
             <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
             <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
           </div>
@@ -3594,41 +3594,61 @@ function generateAdminPage(fileCards, categoryOptions) {
         color: #2c3e50;
         font-size: 1.3rem;
         margin-top: 0;
+        margin-bottom: 0.5rem;
+      }
+      .qr-file-name {
+        color: #7f8c8d;
+        font-size: 0.9rem;
         margin-bottom: 1rem;
+        word-break: break-all;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       #qrcode {
         margin: 1.5rem auto;
       }
       .qr-buttons {
         display: flex;
-        gap: 1rem;
+        gap: 0.5rem;
         justify-content: center;
         margin-top: 1.5rem;
       }
-      .qr-copy, .qr-close {
-        padding: 0.8rem 1.8rem;
+      .qr-copy, .qr-download, .qr-close {
+        padding: 0.8rem 1rem;
         border: none;
         border-radius: 8px;
         cursor: pointer;
         transition: all 0.3s ease;
         box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        font-size: 0.95rem;
+        font-size: 0.9rem;
         font-weight: 500;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
       }
       .qr-copy {
         background: #3498db;
+        color: white;
+      }
+      .qr-download {
+        background: #2ecc71;
         color: white;
       }
       .qr-close {
         background: #95a5a6;
         color: white;
       }
-      .qr-copy:hover, .qr-close:hover {
+      .qr-copy:hover, .qr-download:hover, .qr-close:hover {
         transform: translateY(-2px);
         box-shadow: 0 4px 8px rgba(0,0,0,0.15);
       }
       .qr-copy:hover {
         background: #2980b9;
+      }
+      .qr-download:hover {
+        background: #27ae60;
       }
       .qr-close:hover {
         background: #7f8c8d;
@@ -3718,9 +3738,11 @@ function generateAdminPage(fileCards, categoryOptions) {
       <div id="qrModal" class="modal">
         <div class="qr-content">
           <h3 class="qr-title">分享文件</h3>
+          <div class="qr-file-name" id="qrFileName"></div>
           <div id="qrcode"></div>
           <div class="qr-buttons">
             <button class="qr-copy" id="qrCopyBtn">复制链接</button>
+            <a class="qr-download" id="qrDownloadBtn" download>下载文件</a>
             <button class="qr-close" id="qrCloseBtn">关闭</button>
           </div>
         </div>
@@ -3878,6 +3900,39 @@ function generateAdminPage(fileCards, categoryOptions) {
           colorLight: "#ffffff",
           correctLevel: QRCode.CorrectLevel.H
         });
+        qrModal.classList.add('show');
+      }
+
+      // 分享文件
+      function shareFile(url, fileName) {
+        currentShareUrl = url;
+        
+        // 设置文件名
+        const qrFileName = document.getElementById('qrFileName');
+        if (qrFileName) {
+          qrFileName.textContent = fileName || getFileName(url);
+        }
+        
+        // 生成二维码
+        const qrcodeDiv = document.getElementById('qrcode');
+        qrcodeDiv.innerHTML = '';
+        new QRCode(qrcodeDiv, {
+          text: url,
+          width: 200,
+          height: 200,
+          colorDark: "#000000",
+          colorLight: "#ffffff",
+          correctLevel: QRCode.CorrectLevel.H
+        });
+        
+        // 设置下载链接
+        const downloadBtn = document.getElementById('qrDownloadBtn');
+        if (downloadBtn) {
+          downloadBtn.href = url;
+          downloadBtn.setAttribute('download', fileName || getFileName(url));
+        }
+        
+        // 显示弹窗
         qrModal.classList.add('show');
       }
 
@@ -4093,7 +4148,6 @@ function generateAdminPage(fileCards, categoryOptions) {
                 
                 // 更新卡片中的按钮URL
                 const copyBtn = card.querySelector('.btn-copy');
-                const downBtn = card.querySelector('.btn-down');
                 const shareBtn = card.querySelector('.btn-share');
                 const deleteBtn = card.querySelector('.btn-delete');
                 const editBtn = card.querySelector('.btn-edit');
@@ -4101,11 +4155,9 @@ function generateAdminPage(fileCards, categoryOptions) {
                 if (copyBtn) {
                   copyBtn.setAttribute('onclick', 'copyToClipboard("' + data.newUrl + '")');
                 }
-                if (downBtn) {
-                  downBtn.href = data.newUrl;
-                }
                 if (shareBtn) {
-                  shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '")');
+                  const fileName = getFileName(data.newUrl);
+                  shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
                 }
                 if (deleteBtn) {
                   const newOnclick = deleteBtn.getAttribute('onclick').replace(currentEditUrl, data.newUrl);
