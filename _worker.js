@@ -1,160 +1,198 @@
 // 数据库初始化函数
 async function initDatabase(config) {
-  console.log("开始数据库初始化..."); // Added log
-  try {
-    // 测试数据库连接
-    console.log("正在测试数据库连接..."); // Added log
-    await config.database.prepare("SELECT 1").run();
-    console.log("数据库连接成功");
-  } catch (error) {
-    console.error(`数据库连接测试失败: ${error.message}`, error); // Log full error
-    throw new Error(`数据库连接测试失败: ${error.message}`); // Rethrow with more context
+  console.log("开始数据库初始化...");
+  
+  // 检查数据库配置
+  if (!config || !config.database) {
+    console.error("数据库配置缺失");
+    throw new Error("数据库配置无效，请检查D1数据库是否正确绑定");
   }
 
-  // 创建必要的表结构
+  // 最大重试次数
+  const maxRetries = 3;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // 测试数据库连接
+      console.log(`正在测试数据库连接... (尝试 ${attempt}/${maxRetries})`);
+      await config.database.prepare("SELECT 1").run();
+      console.log("数据库连接成功");
+
+      // 验证数据库结构
+      console.log("正在验证数据库结构...");
+      const structureValid = await validateDatabaseStructure(config);
+      
+      if (!structureValid) {
+        throw new Error("数据库结构验证失败");
+      }
+
+      console.log("数据库初始化成功");
+      return true;
+    } catch (error) {
+      lastError = error;
+      console.error(`数据库初始化尝试 ${attempt} 失败:`, error);
+      
+      if (error.message.includes('no such table')) {
+        console.log("检测到数据表不存在，尝试创建...");
+        try {
+          await recreateAllTables(config);
+          console.log("数据表创建成功");
+          return true;
+        } catch (tableError) {
+          console.error("创建数据表失败:", tableError);
+        }
+      }
+      
+      // 如果还有重试机会，等待后继续
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+        console.log(`等待 ${delay}ms 后重试...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  // 所有重试都失败了
+  throw new Error(`数据库初始化失败 (${maxRetries} 次尝试): ${lastError?.message || '未知错误'}`);
+}
+
+// 重新创建所有表
+async function recreateAllTables(config) {
   try {
-    console.log("正在创建/检查分类表..."); // Added log
     // 创建分类表
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
-    console.log("分类表检查完成");
 
-    console.log("正在创建/检查用户设置表..."); // Added log
     // 创建用户设置表
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS user_settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT NOT NULL UNIQUE,
-        storage_type TEXT DEFAULT 'r2',
-        category_id INTEGER,
-        custom_suffix TEXT,
-        waiting_for TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        storage_type TEXT DEFAULT 'telegram',
+        current_category_id INTEGER,
+        FOREIGN KEY (current_category_id) REFERENCES categories(id)
       )
     `).run();
-    console.log("用户设置表检查完成");
 
-    console.log("正在创建/检查文件表..."); // Added log
     // 创建文件表
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         url TEXT NOT NULL,
-        fileId TEXT NOT NULL,
-        message_id INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
+        fileId TEXT,
+        message_id INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         file_name TEXT,
         file_size INTEGER,
         mime_type TEXT,
-        chat_id TEXT,
-        storage_type TEXT NOT NULL DEFAULT 'telegram',
+        storage_type TEXT DEFAULT 'telegram',
         category_id INTEGER,
-        custom_suffix TEXT,
         FOREIGN KEY (category_id) REFERENCES categories(id)
       )
     `).run();
-    console.log("文件表检查完成");
 
-    // 检查并添加缺失的列
-    console.log("正在检查并添加缺失的列..."); // Added log
-    const columnsAdded = await checkAndAddMissingColumns(config);
-    if (!columnsAdded) {
-       console.warn("检查或添加缺失列时遇到问题，但继续执行。"); // Added log
-       // Decide if we should throw here or allow continuation
-    } else {
-        console.log("缺失列检查/添加完成。"); // Added log
-    }
+    // 创建默认分类
+    await config.database.prepare(`
+      INSERT OR IGNORE INTO categories (name) VALUES ('默认分类')
+    `).run();
 
-    // 初始化默认分类
-    console.log("正在检查/创建默认分类..."); // Added log
-    const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
-    if (!defaultCategory) {
-      const time = Date.now();
-      await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
-        .bind('默认分类', time).run();
-      console.log("默认分类已创建");
-    } else {
-      console.log("默认分类已存在");
-    }
-    
-    // 验证数据库结构完整性
-    console.log("准备开始验证数据库结构..."); // Added log
-    await validateDatabaseStructure(config);
-    console.log("数据库结构验证调用完成。"); // Added log
-    
-    console.log("数据库初始化成功完成"); // Changed log message for clarity
+    return true;
   } catch (error) {
-    console.error(`数据库初始化过程中发生严重错误: ${error.message}`, error); // Log full error
-    // It's crucial to log the specific error here before the generic message is returned
-    throw new Error(`数据库初始化过程中发生错误: ${error.message}`); // Rethrow
+    console.error("重新创建表失败:", error);
+    throw error;
   }
 }
 
 // 验证数据库结构完整性
 async function validateDatabaseStructure(config) {
-  console.log("开始验证数据库结构..."); // Changed log
   try {
-    // 检查categories表结构
-    console.log("验证 categories 表..."); // Added log
-    const categoriesColumns = await config.database.prepare(`PRAGMA table_info(categories)`).all();
-    const hasCategoriesRequiredColumns = categoriesColumns.results.some(col => col.name === 'id') && 
-                                         categoriesColumns.results.some(col => col.name === 'name') &&
-                                         categoriesColumns.results.some(col => col.name === 'created_at');
-    
-    if (!hasCategoriesRequiredColumns) {
-      console.warn("分类表结构不完整，尝试重建...");
-      await recreateCategoriesTable(config);
-    } else {
-       console.log("categories 表结构完整。"); // Added log
+    // 验证必要的表是否存在
+    const tables = ['categories', 'user_settings', 'files'];
+    for (const table of tables) {
+      try {
+        await config.database.prepare(`SELECT 1 FROM ${table} LIMIT 1`).run();
+      } catch (error) {
+        if (error.message.includes('no such table')) {
+          console.log(`表 ${table} 不存在，尝试重新创建所有表...`);
+          await recreateAllTables(config);
+          return true;
+        }
+        throw error;
+      }
     }
-    
-    // 检查user_settings表结构
-    console.log("验证 user_settings 表..."); // Added log
-    const userSettingsColumns = await config.database.prepare(`PRAGMA table_info(user_settings)`).all();
-    const hasUserSettingsRequiredColumns = userSettingsColumns.results.some(col => col.name === 'chat_id') && 
-                                           userSettingsColumns.results.some(col => col.name === 'storage_type') &&
-                                           userSettingsColumns.results.some(col => col.name === 'category_id') &&
-                                           userSettingsColumns.results.some(col => col.name === 'custom_suffix') &&
-                                           userSettingsColumns.results.some(col => col.name === 'waiting_for');
-    
-    if (!hasUserSettingsRequiredColumns) {
-      console.warn("用户设置表结构不完整，尝试重建...");
-      await recreateUserSettingsTable(config);
-    } else {
-       console.log("user_settings 表结构完整。"); // Added log
-    }
-    
-    // 检查files表结构
-    console.log("验证 files 表..."); // Added log
-    const filesColumns = await config.database.prepare(`PRAGMA table_info(files)`).all();
-    // Re-checking the required columns based on the CREATE statement and recent changes
-    const hasFilesRequiredColumns = filesColumns.results.some(col => col.name === 'id') && // Assuming PK is required
-                                    filesColumns.results.some(col => col.name === 'url') &&
-                                    filesColumns.results.some(col => col.name === 'fileId') &&
-                                    filesColumns.results.some(col => col.name === 'message_id') &&
-                                    filesColumns.results.some(col => col.name === 'created_at') &&
-                                    filesColumns.results.some(col => col.name === 'storage_type') &&
-                                    filesColumns.results.some(col => col.name === 'category_id') &&
-                                    filesColumns.results.some(col => col.name === 'chat_id') && // Added check
-                                    filesColumns.results.some(col => col.name === 'custom_suffix'); // Added check
 
-    if (!hasFilesRequiredColumns) {
-      console.warn("文件表结构不完整，尝试重建...");
-      await recreateFilesTable(config);
-    } else {
-       console.log("files 表结构完整。"); // Added log
+    // 验证表结构
+    const tableStructures = {
+      categories: [
+        { name: 'id', type: 'INTEGER' },
+        { name: 'name', type: 'TEXT' },
+        { name: 'created_at', type: 'DATETIME' }
+      ],
+      user_settings: [
+        { name: 'id', type: 'INTEGER' },
+        { name: 'chat_id', type: 'TEXT' },
+        { name: 'storage_type', type: 'TEXT' },
+        { name: 'current_category_id', type: 'INTEGER' }
+      ],
+      files: [
+        { name: 'id', type: 'INTEGER' },
+        { name: 'url', type: 'TEXT' },
+        { name: 'fileId', type: 'TEXT' },
+        { name: 'message_id', type: 'INTEGER' },
+        { name: 'created_at', type: 'DATETIME' },
+        { name: 'file_name', type: 'TEXT' },
+        { name: 'file_size', type: 'INTEGER' },
+        { name: 'mime_type', type: 'TEXT' },
+        { name: 'storage_type', type: 'TEXT' },
+        { name: 'category_id', type: 'INTEGER' }
+      ]
+    };
+
+    // 检查每个表的结构
+    for (const [table, expectedColumns] of Object.entries(tableStructures)) {
+      const tableInfo = await config.database.prepare(`PRAGMA table_info(${table})`).all();
+      const actualColumns = tableInfo.results;
+      
+      // 检查是否缺少必要的列
+      for (const expectedColumn of expectedColumns) {
+        const found = actualColumns.some(col => 
+          col.name.toLowerCase() === expectedColumn.name.toLowerCase() &&
+          col.type.toUpperCase().includes(expectedColumn.type)
+        );
+        
+        if (!found) {
+          console.log(`表 ${table} 缺少列 ${expectedColumn.name}，尝试添加...`);
+          try {
+            await config.database.prepare(`ALTER TABLE ${table} ADD COLUMN ${expectedColumn.name} ${expectedColumn.type}`).run();
+          } catch (error) {
+            if (!error.message.includes('duplicate column name')) {
+              throw error;
+            }
+          }
+        }
+      }
     }
+
+    // 检查默认分类是否存在
+    const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
+      .bind('默认分类').first();
     
-    console.log("数据库结构验证成功完成"); // Changed log
+    if (!defaultCategory) {
+      console.log('创建默认分类...');
+      await config.database.prepare('INSERT INTO categories (name) VALUES (?)')
+        .bind('默认分类').run();
+    }
+
+    return true;
   } catch (error) {
-    console.error(`数据库结构验证过程中发生错误: ${error.message}`, error); // Log full error
-    // Let's re-throw the error during validation for now to make failures explicit
-    throw new Error(`数据库结构验证失败: ${error.message}`);
+    console.error('验证数据库结构时出错:', error);
+    return false;
   }
 }
 
@@ -375,8 +413,8 @@ async function setWebhook(webhookUrl, botToken) {
       }
       
       console.log(`Webhook set successfully: ${webhookUrl}`);
-      return true;
-    } catch (error) {
+    return true;
+  } catch (error) {
       console.error(`Error setting webhook: ${error.message}`);
       retryCount++;
       if (retryCount < maxRetries) {
@@ -386,8 +424,8 @@ async function setWebhook(webhookUrl, botToken) {
   }
   
   console.error('Failed to set webhook after maximum retries');
-  return false;
-}
+    return false;
+  }
 
 export default {
   async fetch(request, env) {
@@ -777,7 +815,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     // 第四步：写入数据库，与网页上传完全一致的格式
     const time = Math.floor(timestamp / 1000);
     
-    await config.database.prepare(`
+      await config.database.prepare(`
       INSERT INTO files (
         url, 
         fileId, 
@@ -859,10 +897,10 @@ function authenticate(request, config) {
         return false;
       }
       return tokenData.username === config.username;
-    } catch (error) {
+  } catch (error) {
       console.error("Token的用户名不匹配", error);
-      return false;
-    }
+    return false;
+  }
   }
   return false;
 }
@@ -1317,46 +1355,67 @@ async function handleFileRequest(request, config) {
     // 从数据库查询文件记录
     let file;
     
-    // 先通过完整URL查询
+    // 尝试多种方式查找文件记录
     const urlPattern = `https://${config.domain}/${path}`;
+    
+    // 1. 通过完整URL查询
     file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
     
-    // 如果上面没找到，再用文件名作为fileId查询
+    // 2. 通过文件名作为fileId查询
     if (!file) {
       file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
     }
     
-    // 最后尝试使用路径的最后部分（文件名）查询
+    // 3. 通过文件名查询
     if (!file) {
       const fileName = path.split('/').pop();
       file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
     }
 
     if (!file) {
+      console.log(`文件未找到: path=${path}, url=${urlPattern}`);
       return new Response('File not found', { status: 404 });
     }
+
+    console.log(`找到文件: id=${file.id}, storage_type=${file.storage_type}, fileId=${file.fileId}`);
 
     // 根据存储类型处理文件
     if (file.storage_type === 'telegram') {
       // 处理Telegram存储的文件
       try {
+        // 确保使用Telegram的原始文件ID (存储在fileId字段)
+        const telegramFileId = file.fileId;
+        
+        if (!telegramFileId) {
+          console.error('文件记录缺少Telegram fileId:', file);
+          return new Response('Missing Telegram file ID', { status: 500 });
+        }
+        
+        console.log(`尝试从Telegram获取文件: fileId=${telegramFileId}`);
+        
         // 从Telegram获取文件链接
-        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.fileId}`);
+        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
         const data = await response.json();
         
         if (!data.ok) {
+          console.error('Telegram getFile 失败:', data);
           return new Response('Failed to get file from Telegram', { status: 500 });
         }
         
         const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+        console.log(`获取到Telegram文件URL: ${telegramUrl}`);
+        
         const fileResponse = await fetch(telegramUrl);
         
         if (!fileResponse.ok) {
+          console.error(`从Telegram获取文件内容失败: ${fileResponse.status}`);
           return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
         }
         
         const contentType = file.mime_type || getContentType(path.split('.').pop());
         const headers = getCommonHeaders(contentType);
+        
+        console.log(`准备返回Telegram文件: contentType=${contentType}`);
         
         // 流式传输文件内容，避免内存占用过大
         return new Response(fileResponse.body, { headers });
@@ -1367,6 +1426,7 @@ async function handleFileRequest(request, config) {
     } else if (file.storage_type === 'r2' && config.bucket) {
       // 如果是R2存储但前面直接访问失败，再尝试通过fileId获取
       try {
+        console.log(`尝试通过fileId从R2获取文件: fileId=${file.fileId}`);
         const object = await config.bucket.get(file.fileId);
         
         if (object) {
@@ -1375,7 +1435,10 @@ async function handleFileRequest(request, config) {
           object.writeHttpMetadata(headers);
           headers.set('etag', object.httpEtag);
           
+          console.log(`准备返回R2文件: contentType=${contentType}`);
           return new Response(object.body, { headers });
+        } else {
+          console.log(`在R2中未找到文件: fileId=${file.fileId}`);
         }
       } catch (error) {
         console.error('通过fileId从R2获取文件出错:', error);
@@ -1384,9 +1447,11 @@ async function handleFileRequest(request, config) {
     
     // 如果上述方法都失败，尝试重定向到文件URL
     if (file.url && file.url !== urlPattern) {
+      console.log(`重定向到文件URL: ${file.url}`);
       return Response.redirect(file.url, 302);
     }
     
+    console.log('无法获取文件内容');
     return new Response('File not available', { status: 404 });
   } catch (error) {
     console.error('处理文件请求出错:', error);
@@ -3189,7 +3254,7 @@ function generateAdminPage(fileCards, categoryOptions) {
               editSuffixModal.classList.remove('show');
               
               // 更新页面上的URL
-              const card = document.querySelector('[data-url="' + currentEditUrl + '"]');
+              const card = document.querySelector('.file-card[data-url="' + currentEditUrl + '"]');
               if (card) {
                 // 更新卡片的URL值
                 card.setAttribute('data-url', data.newUrl);
@@ -3198,12 +3263,25 @@ function generateAdminPage(fileCards, categoryOptions) {
                 const copyBtn = card.querySelector('.btn-copy');
                 const downBtn = card.querySelector('.btn-down');
                 const shareBtn = card.querySelector('.btn-share');
+                const deleteBtn = card.querySelector('.btn-delete');
                 const editBtn = card.querySelector('.btn-edit');
                 
-                if (copyBtn) copyBtn.setAttribute('data-url', data.newUrl);
-                if (downBtn) downBtn.href = data.newUrl;
-                if (shareBtn) shareBtn.setAttribute('data-url', data.newUrl);
-                if (editBtn) editBtn.setAttribute('data-url', data.newUrl);
+                if (copyBtn) {
+                  copyBtn.setAttribute('onclick', 'copyToClipboard("' + data.newUrl + '")');
+                }
+                if (downBtn) {
+                  downBtn.href = data.newUrl;
+                }
+                if (shareBtn) {
+                  shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '")');
+                }
+                if (deleteBtn) {
+                  const newOnclick = deleteBtn.getAttribute('onclick').replace(currentEditUrl, data.newUrl);
+                  deleteBtn.setAttribute('onclick', newOnclick);
+                }
+                if (editBtn) {
+                  editBtn.setAttribute('onclick', 'showEditSuffixModal("' + data.newUrl + '")');
+                }
                 
                 // 更新描述中的文件名
                 const fileNameElement = card.querySelector('.file-info div:first-child');
@@ -3212,7 +3290,16 @@ function generateAdminPage(fileCards, categoryOptions) {
                   const fileName = urlObj.pathname.split('/').pop();
                   fileNameElement.textContent = fileName;
                 }
+                
+                // 更新复选框值
+                const checkbox = card.querySelector('.file-checkbox');
+                if (checkbox) {
+                  checkbox.value = data.newUrl;
+                }
               }
+              
+              // 更新当前编辑的URL
+              currentEditUrl = data.newUrl;
               
               showConfirmModal(data.msg, null, true);
             } else {
@@ -3254,68 +3341,123 @@ function generateAdminPage(fileCards, categoryOptions) {
 
 async function handleUpdateSuffixRequest(request, config) {
   try {
-    const { fileName, suffix } = await request.json();
+    const { url, suffix } = await request.json();
 
-    if (!fileName || !suffix) {
+    if (!url || !suffix) {
       return new Response(JSON.stringify({
         status: 0,
-        message: '文件名和后缀不能为空'
+        msg: '文件链接和后缀不能为空'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    const newFileName = suffix + '.' + fileName.split('.').pop();
+    // 从URL提取文件名
+    const originalFileName = getFileName(url);
     
-    let fileUrl;
-    
-    // 检查文件是否存在于R2存储
-    if (config.bucket) {
-      try {
-        const file = await config.bucket.get(fileName);
-        if (file) {
-          // 复制文件到新名称
-          const fileData = await file.arrayBuffer();
-          await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
-          
-          // 删除旧文件
-          await deleteFile(fileName, config);
-          
-          // 更新数据库中的文件名
-          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ?')
-            .bind(newFileName, `https://${config.domain}/${newFileName}`, fileName).run();
-            
-          fileUrl = `https://${config.domain}/${newFileName}`;
-        }
-      } catch (error) {
-        console.error('处理R2文件重命名失败:', error);
-        // 如果R2操作失败，继续尝试数据库更新
+    // 从数据库中查找对应的文件记录
+    let fileRecord = await config.database.prepare('SELECT * FROM files WHERE url = ?')
+      .bind(url).first();
+      
+    if (!fileRecord) {
+      // 如果按URL找不到，尝试用文件名查找
+      fileRecord = await config.database.prepare('SELECT * FROM files WHERE fileId = ?')
+        .bind(originalFileName).first();
+        
+      if (!fileRecord) {
+        return new Response(JSON.stringify({
+          status: 0,
+          msg: '未找到对应的文件记录'
+        }), { headers: { 'Content-Type': 'application/json' } });
       }
     }
     
-    // 如果没有R2或R2操作失败，尝试只更新数据库
-    if (!fileUrl) {
-      const oldUrl = `https://${config.domain}/${fileName}`;
-      fileUrl = `https://${config.domain}/${newFileName}`;
-      
-      // 尝试更新数据库记录
-      await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ? OR url = ?')
-        .bind(newFileName, fileUrl, fileName, oldUrl).run();
+    // 获取文件扩展名
+    const fileExt = originalFileName.split('.').pop();
+    const newFileName = `${suffix}.${fileExt}`;
+    let fileUrl = `https://${config.domain}/${newFileName}`;
+    
+    console.log('准备更新文件:', {
+      记录ID: fileRecord.id,
+      原URL: fileRecord.url,
+      原fileId: fileRecord.fileId,
+      存储类型: fileRecord.storage_type,
+      新文件名: newFileName,
+      新URL: fileUrl
+    });
+    
+    // 处理存储在Telegram的文件
+    if (fileRecord.storage_type === 'telegram') {
+      // 对于Telegram存储，我们只更新url，保留原始的Telegram fileId
+      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+        .bind(fileUrl, fileRecord.id).run();
+        
+      console.log('Telegram文件更新完成:', {
+        id: fileRecord.id,
+        新URL: fileUrl
+      });
+    } 
+    // 处理存储在R2的文件
+    else if (config.bucket) {
+      try {
+        const fileId = fileRecord.fileId || originalFileName;
+        console.log('尝试从R2获取文件:', fileId);
+        
+        const file = await config.bucket.get(fileId);
+        
+        if (file) {
+          console.log('R2文件存在，正在复制到新名称:', newFileName);
+          // 复制文件到新名称
+          const fileData = await file.arrayBuffer();
+          await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
+
+          // 删除旧文件
+          await deleteFile(fileId, config);
+          
+          // 更新数据库记录
+          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
+            .bind(newFileName, fileUrl, fileRecord.id).run();
+            
+          console.log('R2文件更新完成:', {
+            id: fileRecord.id,
+            新fileId: newFileName,
+            新URL: fileUrl
+          });
+        } else {
+          console.log('R2中未找到文件，只更新URL:', fileId);
+          // 如果R2中没有找到文件，只更新URL
+          await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+            .bind(fileUrl, fileRecord.id).run();
+        }
+      } catch (error) {
+        console.error('处理R2文件重命名失败:', error);
+        
+        // 即使R2操作失败，仍然更新URL
+        await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+          .bind(fileUrl, fileRecord.id).run();
+      }
+    } 
+    // 其他情况，直接更新数据库
+    else {
+      console.log('未知存储类型，只更新URL');
+      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
+        .bind(fileUrl, fileRecord.id).run();
     }
 
     return new Response(JSON.stringify({
       status: 1,
-      url: fileUrl
+      msg: '后缀修改成功',
+      newUrl: fileUrl
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
     console.error('更新后缀失败:', error);
     return new Response(JSON.stringify({
       status: 0,
-      message: '更新后缀失败: ' + error.message
+      msg: '更新后缀失败: ' + error.message
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 }
 
 // 修改generateNewUrl函数，直接使用域名和文件名生成URL
-function generateNewUrl(url, suffix) {
+function generateNewUrl(url, suffix, config) {
   const fileName = getFileName(url);
   const newFileName = suffix + '.' + fileName.split('.').pop();
   return `https://${config.domain}/${newFileName}`;
@@ -3449,4 +3591,4 @@ async function deleteFile(fileId, config) {
     }
   }
   return true; // 如果没有R2桶，假设文件已删除或不需要删除
-}
+} 
