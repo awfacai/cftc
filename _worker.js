@@ -465,166 +465,135 @@ async function handleTelegramWebhook(request, config) {
   try {
     const update = await request.json();
     
-    // 优化：立即发送HTTP 200响应，防止Telegram重发消息，加速用户体验
-    const responsePromise = new Response(JSON.stringify({ ok: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-
-    // 以下处理逻辑不会阻塞响应，将在后台异步处理
+    // 先返回响应，防止Telegram重试
+    const responsePromise = new Response('OK');
+    
+    // 异步处理后续逻辑
     (async () => {
       try {
-        if (update.message && update.message.chat) {
-          const chatId = update.message.chat.id;
+        if (update.message) {
+          const chatId = update.message.chat.id.toString();
           
-          // 检查用户设置，如果不存在则创建
-          let userSetting = await config.database
-            .prepare('SELECT * FROM user_settings WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-            
+          // 检查用户是否有设置记录，没有则创建
+          let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
           if (!userSetting) {
-            await config.database
-              .prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)')
-              .bind(chatId, 'r2')
-              .run();
-              
-            userSetting = {
-              chat_id: chatId,
-              storage_type: 'r2',
-              category_id: null
-            };
+            await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
+            userSetting = { chat_id: chatId, storage_type: 'r2' };
           }
           
-          // 回复键盘命令
-          if (update.message.text === '/start') {
+          // 检查用户是否在等待输入
+          if (userSetting.waiting_for === 'new_category' && update.message.text) {
+            // 用户正在创建新分类
+            const categoryName = update.message.text.trim();
+            
+            try {
+              // 检查分类名是否已存在
+              const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
+              if (existingCategory) {
+                await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
+              } else {
+                // 创建新分类
+                const time = Date.now();
+                await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)').bind(categoryName, time).run();
+                
+                // 获取新创建的分类ID
+                const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
+                
+                // 设置为当前分类
+                await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
+                
+                await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
+              }
+            } catch (error) {
+              console.error('创建分类失败:', error);
+              await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
+            }
+            
+            // 清除等待状态
+            await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
+            
+            // 更新面板
+            userSetting.waiting_for = null;
             await sendPanel(chatId, userSetting, config);
             return;
           }
-
-          // 处理媒体上传 - 针对不同类型媒体进行快速处理
-          const msg = update.message;
-          const mediaTypes = [
-            { check: msg.photo, file: msg.photo ? msg.photo[msg.photo.length - 1] : null, isDoc: false },
-            { check: msg.document, file: msg.document, isDoc: true },
-            { check: msg.video, file: msg.video, isDoc: false },
-            { check: msg.audio, file: msg.audio, isDoc: false }
-          ];
           
-          const mediaType = mediaTypes.find(type => type.check);
-          if (mediaType) {
-            // 向用户发送处理中消息，提升用户体验
-            const processingMsg = await sendMessage(chatId, "⏳ 正在处理您的媒体文件，请稍候...", config.tgBotToken);
-            
-            await handleMediaUpload(chatId, mediaType.file, mediaType.isDoc, config, userSetting);
-            
-            // 如有需要，可以删除处理中的消息
-            // await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${chatId}&message_id=${processingMsg.message_id}`);
-            return;
+          // 处理命令
+          if (update.message.text === '/start') {
+            await sendPanel(chatId, userSetting, config);
+          }
+          // 处理文件上传
+          else if (update.message.photo || update.message.document) {
+            const file = update.message.document || update.message.photo?.slice(-1)[0];
+            await handleMediaUpload(chatId, file, !!update.message.document, config, userSetting);
+          }
+        }
+        // 处理回调查询（按钮点击）
+        else if (update.callback_query) {
+          const chatId = update.callback_query.from.id.toString();
+          let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
+          if (!userSetting) {
+            await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
+            userSetting = { chat_id: chatId, storage_type: 'r2' };
           }
           
-          // 对于其他类型的消息，发送帮助面板
-          await sendPanel(chatId, userSetting, config);
-        } else if (update.callback_query) {
-          // 处理回调查询
-          const userSetting = await config.database
-            .prepare('SELECT * FROM user_settings WHERE chat_id = ?')
-            .bind(update.callback_query.from.id)
-            .first();
-            
-          await handleCallbackQuery(update, config, userSetting || {
-            chat_id: update.callback_query.from.id,
-            storage_type: 'r2',
-            category_id: null
-          });
+          await handleCallbackQuery(update, config, userSetting);
         }
       } catch (error) {
-        console.error('Telegram webhook处理错误:', error);
-        // 尝试向用户发送错误信息
-        if (update.message && update.message.chat) {
-          await sendMessage(update.message.chat.id, `❌ 操作出错: ${error.message}`, config.tgBotToken);
-        }
+        console.error('处理Telegram Webhook时出错:', error);
       }
     })();
     
     return responsePromise;
   } catch (error) {
     console.error('Webhook解析错误:', error);
-    return new Response(JSON.stringify({ error: 'Invalid webhook data' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return new Response('Error', { status: 500 });
   }
 }
 
 async function sendPanel(chatId, userSetting, config) {
-  try {
-    // 提前准备数据，并行获取
-    const [categoriesPromise, mediaStatsPromise] = await Promise.all([
-      // 获取所有分类
-      config.database.prepare('SELECT * FROM categories ORDER BY name').all(),
-      // 获取用户媒体统计
-      config.database.prepare(`
-        SELECT COUNT(*) as count, SUM(file_size) as total_size 
-        FROM media 
-        WHERE chat_id = ?
-      `).bind(chatId).first()
-    ]);
-
-    const categories = await categoriesPromise;
-    const mediaStats = await mediaStatsPromise;
-    
-    // 构建按钮
-    let keyboard = [
-      [
-        { text: '🗂 选择分类', callback_data: 'select_category' },
-        { text: '📝 创建分类', callback_data: 'new_category' }
-      ]
-    ];
-    
-    // 显示当前选择的分类名称
-    let currentCategory = '未选择';
-    if (userSetting.category_id) {
-      const category = categories.results.find(c => c.id === userSetting.category_id);
-      if (category) {
-        currentCategory = category.name;
-      }
+  // 获取当前分类
+  let categoryName = '默认';
+  if (userSetting && userSetting.category_id) {
+    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(userSetting.category_id).first();
+    if (category) {
+      categoryName = category.name;
     }
-    
-    // 构建消息文本
-    const fileCount = mediaStats?.count || 0;
-    const totalSize = mediaStats?.total_size || 0;
-    const readableSize = formatBytes(totalSize);
-    
-    const messageText = `
-🤖 *媒体管家机器人*
----------------------
-👤 用户ID: \`${chatId}\`
-🗂 当前分类: *${currentCategory}*
-📊 统计信息:
-  📁 文件数量: ${fileCount}
-  💾 总大小: ${readableSize}
----------------------
-发送图片或文件即可上传并分享
-    `;
-    
-    // 发送带有内联键盘的消息
-    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: messageText,
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: keyboard }
-      })
-    });
-    
-    return await response.json();
-  } catch (error) {
-    console.error('发送面板失败:', error);
-    // 发送简化版面板以确保用户收到响应
-    await sendMessage(chatId, '❌ 加载面板时出错。请发送图片或文件进行上传。', config.tgBotToken);
   }
+
+  const message = `📲 图床助手 3.0
+  
+📡 系统状态 ─────────────
+🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}
+🔹 当前分类: ${categoryName}
+🔹 文件大小: 最大${config.maxSizeMB}MB
+
+➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
+➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: "🔄 切换存储方式", callback_data: "switch_storage" },
+        { text: "📊 统计信息", callback_data: "stats" }
+      ],
+      [
+        { text: "📂 选择分类", callback_data: "list_categories" },
+        { text: "➕ 新建分类", callback_data: "create_category" }
+      ]
+    ]
+  };
+
+  await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: message,
+      reply_markup: keyboard,
+      parse_mode: 'HTML'
+    })
+  });
 }
 
 // 格式化字节大小为可读格式
@@ -717,58 +686,137 @@ async function handleCallbackQuery(update, config, userSetting) {
   }
 }
 
-async function handleMediaUpload(message, chatId, userSetting, config) {
+async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
   try {
-    // 发送处理中消息
-    const processingMessage = await sendMessage(chatId, '⏳ 正在处理您的媒体文件...', config.tgBotToken);
+    // 第一步：获取文件信息并验证大小
+    // 注意：我们暂不下载文件内容，提升响应速度
+    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
+    const data = await response.json();
+    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
     
-    // 获取文件信息
-    const file = getFileFromMessage(message);
-    if (!file) {
-      await sendMessage(chatId, '❌ 无法识别的文件类型', config.tgBotToken);
+    // 获取文件大小信息
+    const fileSize = data.result.file_size || 0;
+    
+    // 检查文件大小
+    if (fileSize > config.maxSizeMB * 1024 * 1024) {
+      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
       return;
     }
-    
-    // 获取文件详情
-    const fileInfo = await getFileInfo(file.file_id, config.tgBotToken);
-    if (!fileInfo || !fileInfo.result || !fileInfo.result.file_path) {
-      await sendMessage(chatId, '❌ 无法获取文件信息', config.tgBotToken);
-      return;
-    }
-    
-    // 下载文件
-    const downloadUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${fileInfo.result.file_path}`;
-    const fileResponse = await fetch(downloadUrl);
-    const fileData = await fileResponse.arrayBuffer();
-    
-    // 生成唯一文件名
-    const timestamp = Math.floor(Date.now() / 1000); // 使用秒级时间戳
-    const fileExt = getFileExtension(file.file_name || fileInfo.result.file_path);
-    const uniqueFileName = `${timestamp}_${Math.random().toString(36).substring(2, 8)}.${fileExt}`;
-    
-    // 保存文件到数据库
-    const categoryId = userSetting.category_id || 1; // 默认分类ID为1
-    const mediaId = await saveMediaRecord(chatId, uniqueFileName, fileData.byteLength, categoryId, timestamp, config);
-    
-    // 构建文件访问链接
-    const fileUrl = `${config.domain}/media/${mediaId}`;
-    
-    // 发送成功消息
-    const dateStr = new Date(timestamp * 1000).toLocaleString(); // 将秒级时间戳转换为日期
-    await deleteMessage(chatId, processingMessage.result.message_id, config.tgBotToken);
-    await sendMessage(chatId, `✅ 媒体上传成功!
-    
-📋 文件信息:
-- 📝 文件名: ${uniqueFileName}
-- 📅 上传时间: ${dateStr}
-- 📦 文件大小: ${formatBytes(fileData.byteLength)}
-- 🔗 访问链接: ${fileUrl}`, config.tgBotToken);
 
-    return { success: true, fileUrl };
+    // 第二步：准备文件数据，与网页上传保持一致的格式
+    let fileName = '';
+    let ext = '';
+    
+    if (isDocument && file.file_name) {
+      fileName = file.file_name;
+      ext = (fileName.split('.').pop() || '').toLowerCase();
+    } else {
+      ext = getExtensionFromMime(file.mime_type);
+      fileName = `image.${ext}`;
+    }
+    
+    const mimeType = file.mime_type || getContentType(ext);
+    const [mainType] = mimeType.split('/');
+    
+    // 第三步：根据存储类型(r2 或 telegram)处理文件
+    const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
+    
+    // 获取分类ID
+    let categoryId = null;
+    if (userSetting && userSetting.category_id) {
+      categoryId = userSetting.category_id;
+    } else {
+      // 找默认分类
+      const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      if (defaultCategory) {
+        categoryId = defaultCategory.id;
+      }
+    }
+    
+    let finalUrl, dbFileId, dbMessageId;
+    
+    // 与网页上传一致，使用时间戳作为文件名
+    const timestamp = Date.now();
+    const key = `${timestamp}.${ext}`;
+    
+    // 并行处理文件上传和数据库操作，提高响应速度
+    const uploadPromise = (async () => {
+      if (storageType === 'r2' && config.bucket) {
+        // 上传到R2存储
+        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+        const fileResponse = await fetch(telegramUrl);
+        if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
+        
+        const arrayBuffer = await fileResponse.arrayBuffer();
+        await config.bucket.put(key, arrayBuffer, { 
+          httpMetadata: { contentType: mimeType } 
+        });
+        
+        return {
+          url: `https://${config.domain}/${key}`,
+          fileId: key,
+          messageId: 0
+        };
+      } else {
+        // 使用Telegram存储 - 实际上我们可以直接使用原始文件ID
+        return {
+          url: `https://${config.domain}/${key}`,
+          fileId: file.file_id,
+          messageId: 0
+        };
+      }
+    })();
+    
+    // 第四步：写入数据库
+    // 修复：使用正确的时间格式
+    const currentDate = new Date(); // 获取当前日期
+    const formattedDate = currentDate.toISOString(); // 将日期转换为ISO格式
+    
+    // 等待上传完成
+    const uploadResult = await uploadPromise;
+    
+    await config.database.prepare(`
+      INSERT INTO files (
+        url, 
+        fileId, 
+        message_id, 
+        created_at, 
+        file_name, 
+        file_size, 
+        mime_type, 
+        chat_id, 
+        category_id, 
+        storage_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      uploadResult.url,
+      uploadResult.fileId,
+      uploadResult.messageId,
+      formattedDate,  // 使用标准ISO日期格式
+      key,      // 使用key作为file_name
+      fileSize,
+      mimeType,
+      chatId,
+      categoryId,
+      storageType
+    ).run();
+    
+    // 第五步：快速返回上传成功消息给用户
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(uploadResult.url)}`;
+    
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: qrCodeUrl,
+        caption: `✅ 文件上传成功!\n\n📅 上传时间: ${currentDate.toLocaleString()}\n📝 图床直链:\n${uploadResult.url}\n\n🔍 扫描上方二维码快速访问`,
+        parse_mode: 'HTML'
+      })
+    });
   } catch (error) {
-    console.error('媒体上传失败:', error);
-    await sendMessage(chatId, `❌ 媒体上传失败: ${error.message}`, config.tgBotToken);
-    return { success: false, error: error.message };
+    console.error("Error handling media upload:", error);
+    await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
   }
 }
 
