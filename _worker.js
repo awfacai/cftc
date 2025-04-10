@@ -705,14 +705,26 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
 
     const arrayBuffer = await fileResponse.arrayBuffer();
 
-    // 确定文件类型和扩展名
-    const mimeType = file.mime_type || 'application/octet-stream';
+    // 确定文件类型和扩展名 - 修复bin格式问题
+    let mimeType = file.mime_type || 'application/octet-stream';
     let fileExt = '';
     
     if (isDocument && file.file_name) {
+      // 如果有原始文件名，从中提取扩展名
       fileExt = file.file_name.split('.').pop() || '';
+      // 如果没有扩展名或不是常见扩展名，根据MIME类型推断
+      if (!fileExt || fileExt === file.file_name) {
+        fileExt = getExtensionFromMime(mimeType);
+      }
     } else {
+      // 如果是图片等没有文件名的内容
       fileExt = getExtensionFromMime(mimeType);
+    }
+    
+    // 保证扩展名不是bin
+    if (fileExt === 'bin' && mimeType.startsWith('image/')) {
+      // 如果是图片但扩展名是bin，使用正确的扩展名
+      fileExt = mimeType.split('/')[1] || 'jpg';
     }
     
     // 使用时间戳作为文件名 - 与网页上传保持一致
@@ -743,20 +755,29 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       dbMessageId = 0; // Telegram消息ID会在后续更新
     }
     
-    // 获取分类ID
+    // 获取分类ID - 确保无分类使用默认分类
     let categoryId = null;
+    
+    // 优先使用用户当前设置的分类
     if (userSetting && userSetting.category_id) {
       categoryId = userSetting.category_id;
     } else {
-      // 如果没有当前分类，使用默认分类
+      // 如果没有当前分类，查找默认分类
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
       if (defaultCategory) {
         categoryId = defaultCategory.id;
+        
+        // 更新用户设置，将默认分类设为当前分类
+        if (userSetting && userSetting.chat_id) {
+          await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
+            .bind(categoryId, chatId).run();
+        }
       }
     }
     
-    // 创建时间戳 ISO 格式 - 与网页上传保持一致
-    const isoTimestamp = new Date(timestamp).toISOString();
+    // 创建日期格式 - 修复日期错乱问题
+    // 使用与网页上传相同的日期格式：直接使用数字时间戳（秒）
+    const timestampSeconds = Math.floor(timestamp / 1000);
     
     // 插入数据库记录 - 与网页上传使用相同的字段和格式
     await config.database.prepare(`
@@ -776,7 +797,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       url,
       dbFileId,
       dbMessageId,
-      isoTimestamp,
+      timestampSeconds, // 使用数字时间戳（秒）而不是ISO字符串
       fileName,
       arrayBuffer.byteLength,
       mimeType,
@@ -1244,131 +1265,130 @@ function getPreviewHtml(url) {
 }
 
 async function handleFileRequest(request, config) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const fileName = path.replace(/^\//, '');  // 移除开头的斜杠
+  
+  if (!fileName || fileName === '') {
+    return new Response("文件名不能为空", { status: 404 });
+  }
+
   try {
-    const url = new URL(request.url);
-    const path = decodeURIComponent(url.pathname.slice(1));
+    // 根据URL从数据库中查找文件信息
+    let fileInfo = await config.database.prepare(`
+      SELECT * FROM files WHERE url LIKE ? OR fileId = ? OR file_name = ?
+    `).bind(
+      `%${fileName}%`,
+      fileName,
+      fileName
+    ).first();
 
-    if (!path) {
-      return new Response('Not Found', { status: 404 });
+    // 如果找不到文件信息，尝试查找不带查询参数的URL
+    if (!fileInfo && url.search) {
+      const cleanUrl = `https://${config.domain}/${fileName}`;
+      fileInfo = await config.database.prepare(`
+        SELECT * FROM files WHERE url = ?
+      `).bind(cleanUrl).first();
     }
 
-    // 检查下载参数
-    const params = new URLSearchParams(url.search);
-    const forceDownload = params.get('download') === 'true';
+    if (!fileInfo) {
+      return new Response("文件未找到", { status: 404 });
+    }
 
-    // 构建文件的完整URL，用于数据库查询
-    const fileUrl = `https://${config.domain}/${path}`;
-
-    // 1. 尝试从R2存储直接获取文件
-    if (config.bucket) {
+    // 判断存储类型
+    if (fileInfo.storage_type === 'telegram') {
+      // 从Telegram获取文件
       try {
-        const object = await config.bucket.get(path);
-        
-        if (object) {
-          return serveFile(object.body, {
-            contentType: object.httpMetadata.contentType || getContentType(path.split('.').pop()),
-            size: object.size,
-            fileName: path.split('/').pop(),
-            forceDownload: forceDownload
-          });
-        }
-      } catch (error) {
-        console.error('R2获取文件出错:', error);
-        // 继续尝试其他方式获取文件
-      }
-    }
-
-    // 2. 从数据库查询文件记录
-    const file = await config.database.prepare(`
-      SELECT * FROM files WHERE url = ? OR fileId = ? OR file_name = ?
-    `).bind(fileUrl, path, path.split('/').pop()).first();
-
-    if (!file) {
-      return new Response('File not found', { status: 404 });
-    }
-
-    // 3. 根据存储类型处理文件
-    if (file.storage_type === 'telegram') {
-      try {
-        // 获取Telegram文件URL
-        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.fileId}`);
-        const data = await response.json();
-        
-        if (!data.ok) {
-          return new Response('Failed to get file from Telegram', { status: 500 });
-        }
-        
-        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-        const fileResponse = await fetch(telegramUrl);
+        const fileUrl = await getTelegramFileUrl(fileInfo.fileId, config.tgBotToken, config);
+        const fileResponse = await fetch(fileUrl);
         
         if (!fileResponse.ok) {
-          return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
+          return new Response("无法从Telegram获取文件", { status: 500 });
         }
         
-        return serveFile(fileResponse.body, {
-          contentType: file.mime_type || getContentType(file.file_name?.split('.').pop() || ''),
-          size: file.file_size,
-          fileName: file.file_name,
-          forceDownload: forceDownload
+        const contentType = fileInfo.mime_type || getContentType(fileName.split('.').pop());
+        const arrayBuffer = await fileResponse.arrayBuffer();
+        
+        // 使用serveFile函数统一处理响应
+        return serveFile(arrayBuffer, {
+          contentType,
+          fileName: fileInfo.file_name || fileName,
+          inline: contentType.startsWith('image/') // 图像使用inline显示
         });
       } catch (error) {
-        console.error('处理Telegram文件出错:', error);
-        return new Response('Error processing Telegram file', { status: 500 });
+        console.error("从Telegram获取文件失败:", error);
+        return new Response("从Telegram获取文件失败", { status: 500 });
       }
-    } else if (file.storage_type === 'r2' && config.bucket) {
-      // 如果是R2存储但前面直接访问失败，再尝试通过fileId获取
+    } else if (fileInfo.storage_type === 'r2' && config.bucket) {
+      // 从R2获取文件
       try {
-        const object = await config.bucket.get(file.fileId);
-        
-        if (object) {
-          return serveFile(object.body, {
-            contentType: object.httpMetadata.contentType || file.mime_type || getContentType(file.file_name?.split('.').pop() || ''),
-            size: object.size || file.file_size,
-            fileName: file.file_name,
-            forceDownload: forceDownload
-          });
+        // 确定正确的R2对象键值
+        let objectKey = fileInfo.fileId;
+        // 如果fileId不是有效的R2键，尝试使用file_name
+        if (!objectKey || objectKey.includes('http')) {
+          objectKey = fileInfo.file_name;
         }
+        
+        // 如果objectKey仍然包含完整URL，提取文件名部分
+        if (objectKey && objectKey.includes('/')) {
+          objectKey = objectKey.split('/').pop();
+        }
+        
+        if (!objectKey) {
+          return new Response("无法确定文件存储位置", { status: 500 });
+        }
+        
+        const object = await config.bucket.get(objectKey);
+        
+        if (!object) {
+          return new Response("文件在存储中未找到", { status: 404 });
+        }
+        
+        const contentType = fileInfo.mime_type || getContentType(objectKey.split('.').pop());
+        const arrayBuffer = await object.arrayBuffer();
+        
+        // 使用serveFile函数统一处理响应
+        return serveFile(arrayBuffer, {
+          contentType,
+          fileName: fileInfo.file_name || objectKey,
+          inline: contentType.startsWith('image/') // 图像使用inline显示
+        });
       } catch (error) {
-        console.error('通过fileId从R2获取文件出错:', error);
+        console.error("从R2获取文件失败:", error);
+        return new Response("从R2获取文件失败", { status: 500 });
       }
+    } else {
+      return new Response("不支持的存储类型", { status: 500 });
     }
-    
-    // 4. 如果上述方法都失败，尝试重定向到文件URL
-    if (file.url && file.url !== fileUrl) {
-      return Response.redirect(file.url, 302);
-    }
-    
-    return new Response('File not available', { status: 404 });
   } catch (error) {
-    console.error('处理文件请求出错:', error);
-    return new Response('Internal Server Error', { status: 500 });
+    console.error("文件请求处理失败:", error);
+    return new Response("文件请求处理失败", { status: 500 });
   }
 }
 
-// 辅助函数：统一处理文件响应
-function serveFile(body, options) {
-  const { contentType, size, fileName, forceDownload } = options;
-  
+// 统一处理文件响应的辅助函数
+function serveFile(body, options = {}) {
   const headers = new Headers();
-  headers.set('Content-Type', contentType);
   
-  if (size) {
-    headers.set('Content-Length', size.toString());
+  // 设置内容类型
+  if (options.contentType) {
+    headers.set('Content-Type', options.contentType);
   }
   
-  // 根据文件类型和下载标志决定如何显示
-  if (forceDownload) {
-    headers.set('Content-Disposition', `attachment; filename="${fileName}"`);
-  } else if (contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/')) {
-    // 默认媒体文件使用内联显示（图床直链）
-    headers.set('Content-Disposition', 'inline');
+  // 设置文件处理方式：内联(inline)显示或下载(attachment)
+  if (options.fileName) {
+    const disposition = options.inline ? 'inline' : 'attachment';
+    headers.set('Content-Disposition', `${disposition}; filename="${encodeURIComponent(options.fileName)}"`);
   }
   
-  // 设置缓存和跨域
+  // 允许缓存和跨域
   headers.set('Cache-Control', 'public, max-age=31536000');
   headers.set('Access-Control-Allow-Origin', '*');
   
-  return new Response(body, { headers });
+  return new Response(body, {
+    status: 200,
+    headers
+  });
 }
 
 async function handleDeleteRequest(request, config) {
