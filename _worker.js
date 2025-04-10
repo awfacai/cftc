@@ -464,65 +464,81 @@ export default {
 async function handleTelegramWebhook(request, config) {
   try {
     const update = await request.json();
-    
-    // 先返回响应，防止Telegram重试
+
+    // 简单返回响应，防止Telegram重发
     const responsePromise = new Response('OK');
-    
-    // 异步处理后续逻辑
-    (async () => {
+
+    setTimeout(async () => {
       try {
+        console.log('处理Telegram消息:', JSON.stringify(update).substring(0, 200) + '...');
+
         if (update.message) {
           const chatId = update.message.chat.id.toString();
           
-          // 检查用户是否有设置记录，没有则创建
-          let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
-          if (!userSetting) {
-            await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
-            userSetting = { chat_id: chatId, storage_type: 'r2' };
-          }
+          // 获取或创建用户设置
+          let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?')
+            .bind(chatId).first();
           
-          // 检查用户是否在等待输入
+          if (!userSetting) {
+            console.log(`为用户 ${chatId} 创建新设置`);
+            await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)')
+              .bind(chatId, 'r2').run();
+            userSetting = {
+              chat_id: chatId,
+              storage_type: 'r2',
+              category_id: null,
+              custom_suffix: null,
+              waiting_for: null
+            };
+          }
+
+          // 处理等待用户输入的情况
           if (userSetting.waiting_for === 'new_category' && update.message.text) {
-            // 用户正在创建新分类
+            console.log(`用户 ${chatId} 正在创建新分类: ${update.message.text}`);
             const categoryName = update.message.text.trim();
             
-            try {
-              // 检查分类名是否已存在
-              const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-              if (existingCategory) {
-                await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
-              } else {
-                // 创建新分类
-                const time = Date.now();
-                await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)').bind(categoryName, time).run();
-                
-                // 获取新创建的分类ID
-                const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-                
-                // 设置为当前分类
-                await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
-                
+            // 检查分类名是否已存在
+            const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
+              .bind(categoryName).first();
+              
+            if (existingCategory) {
+              await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
+            } else {
+              // 创建新分类
+              const time = Math.floor(Date.now() / 1000);
+              await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+                .bind(categoryName, time).run();
+              
+              // 获取新创建的分类ID
+              const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
+                .bind(categoryName).first();
+              
+              // 设置为当前分类
+              if (newCategory) {
+                await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?')
+                  .bind(newCategory.id, chatId).run();
+                userSetting.category_id = newCategory.id;
                 await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
+              } else {
+                await sendMessage(chatId, `❌ 创建分类失败: 无法获取新分类ID`, config.tgBotToken);
               }
-            } catch (error) {
-              console.error('创建分类失败:', error);
-              await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
             }
             
             // 清除等待状态
-            await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
+            await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?')
+              .bind(chatId).run();
+            userSetting.waiting_for = null;
             
             // 更新面板
-            userSetting.waiting_for = null;
             await sendPanel(chatId, userSetting, config);
-            return;
-          }
-          // 处理自定义后缀设置
-          else if (userSetting.waiting_for === 'custom_suffix' && update.message.text) {
+            
+          } else if (userSetting.waiting_for === 'custom_suffix' && update.message.text) {
+            console.log(`用户 ${chatId} 正在设置自定义后缀: ${update.message.text}`);
             const suffix = update.message.text.trim();
             
-            // 更新数据库中的后缀设置
-            await config.database.prepare('UPDATE user_settings SET custom_suffix = ?, waiting_for = NULL WHERE chat_id = ?').bind(suffix, chatId).run();
+            // 更新用户的自定义后缀设置
+            await config.database.prepare('UPDATE user_settings SET custom_suffix = ?, waiting_for = NULL WHERE chat_id = ?')
+              .bind(suffix, chatId).run();
             
             // 发送确认消息
             await sendMessage(chatId, `✅ 自定义后缀已设置为: ${suffix}\n\n今后上传的文件将命名为: ${suffix}.jpg(或其他扩展名)`, config.tgBotToken);
@@ -531,59 +547,74 @@ async function handleTelegramWebhook(request, config) {
             userSetting.custom_suffix = suffix;
             userSetting.waiting_for = null;
             await sendPanel(chatId, userSetting, config);
-            return;
-          }
-          
-          // 处理命令
-          if (update.message.text === '/start') {
+            
+          } else if (update.message.text === '/start') {
+            // 显示初始面板
+            await sendPanel(chatId, userSetting, config);
+            
+          } else if (update.message.photo || update.message.document) {
+            // 处理文件上传
+            console.log(`用户 ${chatId} 正在上传文件`);
+            const file = update.message.document || update.message.photo[update.message.photo.length - 1];
+            await handleMediaUpload(chatId, file, !!update.message.document, config, userSetting);
+          } else {
+            // 对于其他类型的消息，显示帮助面板
             await sendPanel(chatId, userSetting, config);
           }
-          // 处理文件上传
-          else if (update.message.photo || update.message.document) {
-            const file = update.message.document || update.message.photo?.slice(-1)[0];
-            await handleMediaUpload(chatId, file, !!update.message.document, config, userSetting);
-          }
-        }
-        // 处理回调查询（按钮点击）
-        else if (update.callback_query) {
+        } else if (update.callback_query) {
+          // 处理按钮点击
+          console.log(`处理回调查询: ${update.callback_query.data}`);
           const chatId = update.callback_query.from.id.toString();
-          let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
+          
+          // 获取或创建用户设置
+          let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?')
+            .bind(chatId).first();
+          
           if (!userSetting) {
-            await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
-            userSetting = { chat_id: chatId, storage_type: 'r2' };
+            await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)')
+              .bind(chatId, 'r2').run();
+            userSetting = {
+              chat_id: chatId,
+              storage_type: 'r2',
+              category_id: null,
+              custom_suffix: null,
+              waiting_for: null
+            };
           }
           
           await handleCallbackQuery(update, config, userSetting);
         }
       } catch (error) {
-        console.error('处理Telegram Webhook时出错:', error);
+        console.error('处理Telegram webhook时出错:', error);
       }
-    })();
-    
+    }, 0);
+
     return responsePromise;
   } catch (error) {
-    console.error('Webhook解析错误:', error);
+    console.error('解析webhook请求时出错:', error);
     return new Response('Error', { status: 500 });
   }
 }
 
 async function sendPanel(chatId, userSetting, config) {
-  // 获取当前分类
-  let categoryName = '默认';
-  if (userSetting && userSetting.category_id) {
-    const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(userSetting.category_id).first();
-    if (category) {
-      categoryName = category.name;
+  console.log(`为用户 ${chatId} 发送面板, 设置:`, userSetting);
+  try {
+    // 获取当前分类
+    let categoryName = '默认';
+    if (userSetting && userSetting.category_id) {
+      const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(userSetting.category_id).first();
+      if (category) {
+        categoryName = category.name;
+      }
     }
-  }
 
-  // 获取当前后缀
-  let currentSuffix = '自动生成';
-  if (userSetting && userSetting.custom_suffix) {
-    currentSuffix = userSetting.custom_suffix;
-  }
+    // 获取当前后缀
+    let currentSuffix = '自动生成时间戳';
+    if (userSetting && userSetting.custom_suffix) {
+      currentSuffix = userSetting.custom_suffix;
+    }
 
-  const message = `📲 图床助手 3.0
+    const message = `📲 图床助手 3.0
   
 📡 系统状态 ─────────────
 🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}
@@ -594,32 +625,42 @@ async function sendPanel(chatId, userSetting, config) {
 ➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
 ➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作`;
 
-  const keyboard = {
-    inline_keyboard: [
-      [
-        { text: "🔄 切换存储方式", callback_data: "switch_storage" },
-        { text: "📊 统计信息", callback_data: "stats" }
-      ],
-      [
-        { text: "📂 选择分类", callback_data: "list_categories" },
-        { text: "➕ 新建分类", callback_data: "create_category" }
-      ],
-      [
-        { text: "🏷 设置后缀", callback_data: "set_suffix" }
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: "🔄 切换存储方式", callback_data: "switch_storage" },
+          { text: "📊 统计信息", callback_data: "stats" }
+        ],
+        [
+          { text: "📁 选择分类", callback_data: "list_categories" },
+          { text: "➕ 新建分类", callback_data: "create_category" }
+        ],
+        [
+          { text: "🏷 设置后缀", callback_data: "set_suffix" },
+          { text: "🔄 恢复默认后缀", callback_data: "reset_suffix" }
+        ]
       ]
-    ]
-  };
+    };
 
-  await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: message,
-      reply_markup: keyboard,
-      parse_mode: 'HTML'
-    })
-  });
+    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        reply_markup: keyboard,
+        parse_mode: 'HTML'
+      })
+    });
+    
+    const result = await response.json();
+    console.log(`发送面板结果:`, result.ok ? '成功' : '失败');
+    return result;
+  } catch (error) {
+    console.error(`发送面板失败:`, error);
+    // 发送简单消息作为后备
+    await sendMessage(chatId, `很抱歉，加载面板时遇到问题。您可以直接发送图片或文件进行上传。`, config.tgBotToken);
+  }
 }
 
 // 格式化字节大小为可读格式
@@ -640,6 +681,8 @@ async function handleCallbackQuery(update, config, userSetting) {
   const chatId = update.callback_query.from.id.toString();
 
   try {
+    console.log(`处理回调: ${cbData}, 用户ID: ${chatId}`);
+    
     // 确认消息已收到
     await fetch(`https://api.telegram.org/bot${config.tgBotToken}/answerCallbackQuery`, {
       method: 'POST',
@@ -658,7 +701,7 @@ async function handleCallbackQuery(update, config, userSetting) {
     } else if (cbData === 'list_categories') {
       // 列出所有分类
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
-      if (categories.results.length === 0) {
+      if (!categories || !categories.results || categories.results.length === 0) {
         await sendMessage(chatId, "⚠️ 暂无分类，请先创建分类", config.tgBotToken);
         return;
       }
@@ -687,6 +730,14 @@ async function handleCallbackQuery(update, config, userSetting) {
       // 添加设置后缀功能
       await sendMessage(chatId, "🏷 请回复此消息，输入文件后缀\n\n示例：my_file\n上传的文件将被命名为：my_file.jpg", config.tgBotToken);
       await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?').bind('custom_suffix', chatId).run();
+    } else if (cbData === 'reset_suffix') {
+      // 重置后缀，恢复默认
+      await config.database.prepare('UPDATE user_settings SET custom_suffix = NULL WHERE chat_id = ?').bind(chatId).run();
+      await sendMessage(chatId, "✅ 已恢复默认后缀设置，将使用时间戳作为文件名", config.tgBotToken);
+      
+      // 更新用户设置对象并重新发送面板
+      const updatedUserSetting = { ...userSetting, custom_suffix: null };
+      await sendPanel(chatId, updatedUserSetting, config);
     } else if (cbData.startsWith('set_category_')) {
       // 设置当前分类
       const categoryId = parseInt(cbData.split('_')[2]);
@@ -695,6 +746,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(categoryId).first();
       await sendMessage(chatId, `✅ 已切换到分类: ${category?.name || '未知分类'}`, config.tgBotToken);
 
+      // 更新用户设置对象并重新发送面板
       await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
     } else if (cbData === 'back_to_panel') {
       await sendPanel(chatId, userSetting, config);
@@ -709,11 +761,13 @@ async function handleCallbackQuery(update, config, userSetting) {
 
       const statsMessage = `📊 您的使用统计
 ─────────────
-📁 总文件数: ${stats.total_files || 0}
-📊 总存储量: ${formatSize(stats.total_size || 0)}
-📋 使用分类: ${stats.total_categories || 0}个`;
+📁 总文件数: ${stats?.total_files || 0}
+📊 总存储量: ${formatSize(stats?.total_size || 0)}
+📋 使用分类: ${stats?.total_categories || 0}个`;
 
       await sendMessage(chatId, statsMessage, config.tgBotToken);
+    } else {
+      console.log(`未知的回调数据: ${cbData}`);
     }
   } catch (error) {
     console.error('处理回调查询时出错:', error);
@@ -723,11 +777,16 @@ async function handleCallbackQuery(update, config, userSetting) {
 
 async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
   try {
-    // 第一步：获取文件信息并验证大小
-    // 注意：我们暂不下载文件内容，提升响应速度
+    console.log(`开始处理媒体上传: chatId=${chatId}, isDocument=${isDocument}, fileId=${file.file_id}`);
+    
+    // 第一步：获取文件信息
+    await sendMessage(chatId, `⏳ 正在处理您的文件，请稍候...`, config.tgBotToken);
+    
     const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
     const data = await response.json();
-    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
+    if (!data.ok) {
+      throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
+    }
     
     // 获取文件大小信息
     const fileSize = data.result.file_size || 0;
@@ -738,7 +797,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       return;
     }
 
-    // 第二步：准备文件数据，与网页上传保持一致的格式
+    // 第二步：准备文件数据
     let fileName = '';
     let ext = '';
     
@@ -751,97 +810,118 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     }
     
     const mimeType = file.mime_type || getContentType(ext);
-    const [mainType] = mimeType.split('/');
     
-    // 第三步：根据存储类型(r2 或 telegram)处理文件
+    // 第三步：处理自定义后缀
+    // 检查用户是否有自定义后缀设置，如果有则使用，否则使用时间戳
+    let finalFileName;
+    const timestamp = Date.now();
+    
+    if (userSetting && userSetting.custom_suffix) {
+      finalFileName = `${userSetting.custom_suffix}.${ext}`;
+      console.log(`使用自定义后缀: ${finalFileName}`);
+    } else {
+      finalFileName = `${timestamp}.${ext}`;
+      console.log(`使用时间戳后缀: ${finalFileName}`);
+    }
+    
+    // 第四步：处理存储
     const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
+    console.log(`存储类型: ${storageType}`);
     
     // 获取分类ID
     let categoryId = null;
     if (userSetting && userSetting.category_id) {
       categoryId = userSetting.category_id;
+      console.log(`使用分类ID: ${categoryId}`);
     } else {
-      // 找默认分类
+      // 尝试获取默认分类
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
       if (defaultCategory) {
         categoryId = defaultCategory.id;
+        console.log(`使用默认分类ID: ${categoryId}`);
+      } else {
+        console.log('没有找到分类ID');
       }
     }
     
-    // 处理自定义后缀
-    let baseFileName = `${Date.now()}`;
-    if (userSetting && userSetting.custom_suffix) {
-      baseFileName = userSetting.custom_suffix;
-    }
+    let finalUrl, dbFileId, dbMessageId;
     
-    const key = `${baseFileName}.${ext}`;
-    
-    // 并行处理文件上传和数据库操作，提高响应速度
-    const uploadPromise = (async () => {
-      if (storageType === 'r2' && config.bucket) {
-        // 上传到R2存储
-        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
-        const fileResponse = await fetch(telegramUrl);
-        if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
-        
-        const arrayBuffer = await fileResponse.arrayBuffer();
-        await config.bucket.put(key, arrayBuffer, { 
+    if (storageType === 'r2' && config.bucket) {
+      // 上传到R2存储
+      console.log('上传到R2存储');
+      const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+      const fileResponse = await fetch(telegramUrl);
+      
+      if (!fileResponse.ok) {
+        throw new Error(`下载文件失败: ${fileResponse.status} ${fileResponse.statusText}`);
+      }
+      
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      console.log(`文件大小: ${arrayBuffer.byteLength} 字节`);
+      
+      try {
+        await config.bucket.put(finalFileName, arrayBuffer, { 
           httpMetadata: { contentType: mimeType } 
         });
-        
-        return {
-          url: `https://${config.domain}/${key}`,
-          fileId: key,
-          messageId: 0
-        };
-      } else {
-        // 使用Telegram存储 - 实际上我们可以直接使用原始文件ID
-        return {
-          url: `https://${config.domain}/${key}`,
-          fileId: file.file_id,
-          messageId: 0
-        };
+        console.log('R2上传成功');
+      } catch (err) {
+        console.error('R2上传失败:', err);
+        throw new Error(`R2上传失败: ${err.message}`);
       }
-    })();
+      
+      finalUrl = `https://${config.domain}/${finalFileName}`;
+      dbFileId = finalFileName;
+      dbMessageId = 0;
+    } else {
+      // 使用Telegram存储
+      console.log('使用Telegram存储');
+      finalUrl = `https://${config.domain}/${finalFileName}`;
+      dbFileId = file.file_id;
+      dbMessageId = 0;
+    }
     
-    // 第四步：写入数据库
-    // 修复：使用正确的时间格式
-    const currentDate = new Date(); // 获取当前日期
-    const formattedDate = currentDate.toISOString(); // 将日期转换为ISO格式
+    // 第五步：写入数据库
+    const currentDate = new Date();
+    const isoDate = currentDate.toISOString();
+    console.log(`ISO日期: ${isoDate}`);
     
-    // 等待上传完成
-    const uploadResult = await uploadPromise;
+    try {
+      await config.database.prepare(`
+        INSERT INTO files (
+          url, 
+          fileId, 
+          message_id, 
+          created_at, 
+          file_name, 
+          file_size, 
+          mime_type, 
+          chat_id, 
+          category_id, 
+          storage_type,
+          custom_suffix
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        finalUrl,
+        dbFileId,
+        dbMessageId,
+        isoDate,
+        finalFileName,
+        fileSize,
+        mimeType,
+        chatId,
+        categoryId,
+        storageType,
+        userSetting && userSetting.custom_suffix ? userSetting.custom_suffix : null
+      ).run();
+      
+      console.log('数据库记录已创建');
+    } catch (err) {
+      console.error('数据库插入失败:', err);
+      throw new Error(`数据库插入失败: ${err.message}`);
+    }
     
-    await config.database.prepare(`
-      INSERT INTO files (
-        url, 
-        fileId, 
-        message_id, 
-        created_at, 
-        file_name, 
-        file_size, 
-        mime_type, 
-        chat_id, 
-        category_id, 
-        storage_type,
-        custom_suffix
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      uploadResult.url,
-      uploadResult.fileId,
-      uploadResult.messageId,
-      formattedDate,  // 使用标准ISO日期格式
-      key,      // 使用key作为file_name
-      fileSize,
-      mimeType,
-      chatId,
-      categoryId,
-      storageType,
-      userSetting && userSetting.custom_suffix ? userSetting.custom_suffix : null
-    ).run();
-    
-    // 第五步：快速返回上传成功消息给用户
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(uploadResult.url)}`;
+    // 第六步：发送成功消息
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
     
     await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
       method: 'POST',
@@ -849,12 +929,14 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       body: JSON.stringify({
         chat_id: chatId,
         photo: qrCodeUrl,
-        caption: `✅ 文件上传成功!\n\n📅 上传时间: ${currentDate.toLocaleString()}\n📝 图床直链:\n${uploadResult.url}\n\n🔍 扫描上方二维码快速访问`,
+        caption: `✅ 文件上传成功!\n\n📅 上传时间: ${currentDate.toLocaleString()}\n📝 图床直链:\n${finalUrl}\n\n🔍 扫描二维码快速访问`,
         parse_mode: 'HTML'
       })
     });
+    
+    console.log('上传处理完成');
   } catch (error) {
-    console.error("Error handling media upload:", error);
+    console.error("文件上传失败:", error);
     await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
   }
 }
