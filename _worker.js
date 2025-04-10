@@ -1,16 +1,19 @@
 // 数据库初始化函数
 async function initDatabase(config) {
+  console.log("开始数据库初始化..."); // Added log
   try {
     // 测试数据库连接
+    console.log("正在测试数据库连接..."); // Added log
     await config.database.prepare("SELECT 1").run();
     console.log("数据库连接成功");
   } catch (error) {
-    console.error(`数据库连接失败: ${error.message}`);
-    throw error;
+    console.error(`数据库连接测试失败: ${error.message}`, error); // Log full error
+    throw new Error(`数据库连接测试失败: ${error.message}`); // Rethrow with more context
   }
 
   // 创建必要的表结构
   try {
+    console.log("正在创建/检查分类表..."); // Added log
     // 创建分类表
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS categories (
@@ -21,6 +24,7 @@ async function initDatabase(config) {
     `).run();
     console.log("分类表检查完成");
 
+    console.log("正在创建/检查用户设置表..."); // Added log
     // 创建用户设置表
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS user_settings (
@@ -35,6 +39,7 @@ async function initDatabase(config) {
     `).run();
     console.log("用户设置表检查完成");
 
+    console.log("正在创建/检查文件表..."); // Added log
     // 创建文件表
     await config.database.prepare(`
       CREATE TABLE IF NOT EXISTS files (
@@ -56,9 +61,17 @@ async function initDatabase(config) {
     console.log("文件表检查完成");
 
     // 检查并添加缺失的列
-    await checkAndAddMissingColumns(config);
+    console.log("正在检查并添加缺失的列..."); // Added log
+    const columnsAdded = await checkAndAddMissingColumns(config);
+    if (!columnsAdded) {
+       console.warn("检查或添加缺失列时遇到问题，但继续执行。"); // Added log
+       // Decide if we should throw here or allow continuation
+    } else {
+        console.log("缺失列检查/添加完成。"); // Added log
+    }
 
     // 初始化默认分类
+    console.log("正在检查/创建默认分类..."); // Added log
     const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
     if (!defaultCategory) {
       const time = Date.now();
@@ -70,21 +83,24 @@ async function initDatabase(config) {
     }
     
     // 验证数据库结构完整性
+    console.log("准备开始验证数据库结构..."); // Added log
     await validateDatabaseStructure(config);
+    console.log("数据库结构验证调用完成。"); // Added log
     
-    console.log("数据库初始化完成");
+    console.log("数据库初始化成功完成"); // Changed log message for clarity
   } catch (error) {
-    console.error(`数据库初始化过程中发生错误: ${error.message}`);
-    throw error;
+    console.error(`数据库初始化过程中发生严重错误: ${error.message}`, error); // Log full error
+    // It's crucial to log the specific error here before the generic message is returned
+    throw new Error(`数据库初始化过程中发生错误: ${error.message}`); // Rethrow
   }
 }
 
 // 验证数据库结构完整性
 async function validateDatabaseStructure(config) {
-  console.log("正在验证数据库结构...");
-  
+  console.log("开始验证数据库结构..."); // Changed log
   try {
     // 检查categories表结构
+    console.log("验证 categories 表..."); // Added log
     const categoriesColumns = await config.database.prepare(`PRAGMA table_info(categories)`).all();
     const hasCategoriesRequiredColumns = categoriesColumns.results.some(col => col.name === 'id') && 
                                          categoriesColumns.results.some(col => col.name === 'name') &&
@@ -93,9 +109,12 @@ async function validateDatabaseStructure(config) {
     if (!hasCategoriesRequiredColumns) {
       console.warn("分类表结构不完整，尝试重建...");
       await recreateCategoriesTable(config);
+    } else {
+       console.log("categories 表结构完整。"); // Added log
     }
     
     // 检查user_settings表结构
+    console.log("验证 user_settings 表..."); // Added log
     const userSettingsColumns = await config.database.prepare(`PRAGMA table_info(user_settings)`).all();
     const hasUserSettingsRequiredColumns = userSettingsColumns.results.some(col => col.name === 'chat_id') && 
                                            userSettingsColumns.results.some(col => col.name === 'storage_type') &&
@@ -106,26 +125,36 @@ async function validateDatabaseStructure(config) {
     if (!hasUserSettingsRequiredColumns) {
       console.warn("用户设置表结构不完整，尝试重建...");
       await recreateUserSettingsTable(config);
+    } else {
+       console.log("user_settings 表结构完整。"); // Added log
     }
     
     // 检查files表结构
+    console.log("验证 files 表..."); // Added log
     const filesColumns = await config.database.prepare(`PRAGMA table_info(files)`).all();
-    const hasFilesRequiredColumns = filesColumns.results.some(col => col.name === 'url') && 
+    // Re-checking the required columns based on the CREATE statement and recent changes
+    const hasFilesRequiredColumns = filesColumns.results.some(col => col.name === 'id') && // Assuming PK is required
+                                    filesColumns.results.some(col => col.name === 'url') &&
                                     filesColumns.results.some(col => col.name === 'fileId') &&
                                     filesColumns.results.some(col => col.name === 'message_id') &&
                                     filesColumns.results.some(col => col.name === 'created_at') &&
                                     filesColumns.results.some(col => col.name === 'storage_type') &&
-                                    filesColumns.results.some(col => col.name === 'category_id');
-    
+                                    filesColumns.results.some(col => col.name === 'category_id') &&
+                                    filesColumns.results.some(col => col.name === 'chat_id') && // Added check
+                                    filesColumns.results.some(col => col.name === 'custom_suffix'); // Added check
+
     if (!hasFilesRequiredColumns) {
       console.warn("文件表结构不完整，尝试重建...");
       await recreateFilesTable(config);
+    } else {
+       console.log("files 表结构完整。"); // Added log
     }
     
-    console.log("数据库结构验证完成");
+    console.log("数据库结构验证成功完成"); // Changed log
   } catch (error) {
-    console.error(`数据库结构验证失败: ${error.message}`);
-    // 即使验证失败，我们也不抛出错误，让应用继续运行
+    console.error(`数据库结构验证过程中发生错误: ${error.message}`, error); // Log full error
+    // Let's re-throw the error during validation for now to make failures explicit
+    throw new Error(`数据库结构验证失败: ${error.message}`);
   }
 }
 
@@ -282,29 +311,42 @@ async function checkAndAddMissingColumns(config) {
 }
 
 async function ensureColumnExists(config, tableName, columnName, columnType) {
+  console.log(`确保列 ${columnName} 存在于表 ${tableName} 中...`); // Added log
   try {
     // 先检查列是否存在
+    console.log(`检查列 ${columnName} 是否存在于 ${tableName}...`); // Added log
     const tableInfo = await config.database.prepare(`PRAGMA table_info(${tableName})`).all();
     const columnExists = tableInfo.results.some(col => col.name === columnName);
     
     if (columnExists) {
       console.log(`列 ${columnName} 已存在于表 ${tableName} 中`);
-      return;
+      return true; // Indicate success (column exists)
     }
     
     // 列不存在，添加它
-    console.log(`向表 ${tableName} 添加列 ${columnName}...`);
-    await config.database.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`).run();
-    console.log(`列 ${columnName} 已成功添加到表 ${tableName}`);
-  } catch (error) {
-    // 特殊处理"列已存在"的错误
-    if (error.message.includes('duplicate column name') || error.message.includes('already exists')) {
-      console.log(`列 ${columnName} 已存在于表 ${tableName} 中(通过错误处理确认)`);
-      return;
+    console.log(`列 ${columnName} 不存在于表 ${tableName}，尝试添加...`); // Added log
+    try {
+      await config.database.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`).run();
+      console.log(`列 ${columnName} 已成功添加到表 ${tableName}`);
+      return true; // Indicate success (column added)
+    } catch (alterError) {
+      console.warn(`添加列 ${columnName} 到 ${tableName} 时发生错误: ${alterError.message}. 尝试再次检查列是否存在...`, alterError); // Log the specific ALTER error
+      // Re-check if the column exists after the error, perhaps due to a race condition or specific D1 behavior
+      const tableInfoAfterAttempt = await config.database.prepare(`PRAGMA table_info(${tableName})`).all();
+      if (tableInfoAfterAttempt.results.some(col => col.name === columnName)) {
+         console.log(`列 ${columnName} 在添加尝试失败后被发现存在于表 ${tableName} 中。`);
+         return true; // Column now exists, treat as success
+      } else {
+         console.error(`添加列 ${columnName} 到 ${tableName} 失败，并且再次检查后列仍不存在。`);
+         // Decide if we should throw or return false
+         // Returning false allows checkAndAddMissingColumns to report overall status
+         return false; 
+      }
     }
-    
-    console.error(`检查表 ${tableName} 中的列 ${columnName} 时发生错误: ${error.message}`);
-    throw error;
+  } catch (error) {
+    // This top-level catch handles errors from PRAGMA or re-checking logic
+    console.error(`检查或添加表 ${tableName} 中的列 ${columnName} 时发生严重错误: ${error.message}`, error);
+    return false; // Indicate failure
   }
 }
 
