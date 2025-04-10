@@ -652,10 +652,68 @@ async function handleTelegramWebhook(request, config) {
       if (update.message.text === '/start') {
         await sendPanel(chatId, userSetting, config);
       }
-      // 处理文件上传
-      else if (update.message.photo || update.message.document) {
-        const file = update.message.document || update.message.photo?.slice(-1)[0];
-        await handleMediaUpload(chatId, file, !!update.message.document, config, userSetting);
+      // 处理文件上传 - 增强检测所有类型的媒体文件
+      else if (update.message.photo || update.message.document || update.message.video || update.message.audio || update.message.voice || update.message.video_note) {
+        console.log('收到文件上传:', JSON.stringify({
+          hasPhoto: !!update.message.photo,
+          hasDocument: !!update.message.document,
+          hasVideo: !!update.message.video,
+          hasAudio: !!update.message.audio,
+          hasVoice: !!update.message.voice,
+          hasVideoNote: !!update.message.video_note
+        }));
+        
+        let file;
+        let isDocument = false;
+        
+        // 按优先级选择文件
+        if (update.message.document) {
+          file = update.message.document;
+          isDocument = true;
+        } else if (update.message.video) {
+          file = update.message.video;
+          isDocument = true;
+        } else if (update.message.audio) {
+          file = update.message.audio;
+          isDocument = true;
+        } else if (update.message.voice) {
+          file = update.message.voice;
+          isDocument = true;
+        } else if (update.message.video_note) {
+          file = update.message.video_note;
+          isDocument = true;
+        } else if (update.message.photo) {
+          file = update.message.photo?.slice(-1)[0]; // 获取最大尺寸的照片
+          isDocument = false;
+        }
+        
+        if (file) {
+          await handleMediaUpload(chatId, file, isDocument, config, userSetting);
+        } else {
+          await sendMessage(chatId, "❌ 无法识别的文件类型", config.tgBotToken);
+        }
+      }
+      // 通用媒体文件处理 - 捕获其他任何含有file_id的字段
+      else {
+        // 检查消息中是否有任何含有file_id的对象
+        const message = update.message;
+        let fileField = null;
+        
+        // 遍历消息中的所有字段，寻找含有file_id的对象
+        for (const field in message) {
+          if (message[field] && typeof message[field] === 'object' && message[field].file_id) {
+            fileField = field;
+            break;
+          }
+        }
+        
+        if (fileField) {
+          console.log(`找到未明确处理的文件类型: ${fileField}`, JSON.stringify(message[fileField]));
+          await handleMediaUpload(chatId, message[fileField], true, config, userSetting);
+        } else if (message.text && message.text !== '/start') {
+          // 不是命令也不是文件，回复默认消息
+          await sendMessage(chatId, "请发送图片或文件进行上传，或使用 /start 查看主菜单", config.tgBotToken);
+        }
       }
     }
     // 处理回调查询（按钮点击）
@@ -943,15 +1001,20 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
   const processingMessageId = processingMessage?.result?.message_id;
   
   try {
+    // 记录原始文件信息，用于诊断
+    console.log('原始文件信息:', JSON.stringify(file));
+    
     // 第一步：获取文件内容
     const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
     const data = await response.json();
     if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
 
+    console.log('获取到文件路径:', data.result.file_path);
+    
     const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
     const fileResponse = await fetch(telegramUrl);
 
-    if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
+    if (!fileResponse.ok) throw new Error(`获取文件内容失败: ${fileResponse.status} ${fileResponse.statusText}`);
     const contentLength = fileResponse.headers.get('content-length');
   
     // 检查文件大小
@@ -976,25 +1039,47 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     // 获取文件扩展名和MIME类型
     let fileName = '';
     let ext = '';
+    let mimeType = file.mime_type || 'application/octet-stream';
+    
+    // 从文件路径提取扩展名
+    const filePathExt = data.result.file_path.split('.').pop().toLowerCase();
     
     // 首先从文件名中识别扩展名
-    if (isDocument && file.file_name) {
+    if (file.file_name) {
       fileName = file.file_name;
       ext = (fileName.split('.').pop() || '').toLowerCase();
+    } 
+    // 对于没有file_name的特殊类型(如语音消息)，从文件路径获取扩展名
+    else if (filePathExt && filePathExt !== data.result.file_path.toLowerCase()) {
+      ext = filePathExt;
+    } 
+    // 最后从MIME类型获取扩展名
+    else {
+      ext = getExtensionFromMime(mimeType);
     }
-    // 如果没有扩展名或不是文档，则从MIME类型获取扩展名
-    if (!ext || ext === fileName.toLowerCase()) {
-      ext = getExtensionFromMime(file.mime_type || 'application/octet-stream');
-      fileName = isDocument && file.file_name ? file.file_name : `file.${ext}`;
-      
-      // 如果文件名中没有扩展名，添加上
-      if (!fileName.includes('.')) {
-        fileName = `${fileName}.${ext}`;
+    
+    // 确保有有效的文件名
+    if (!fileName) {
+      // 为不同类型的文件生成适当的文件名
+      if (file.video_note) {
+        fileName = `video_note_${Date.now()}.${ext}`;
+      } else if (file.voice) {
+        fileName = `voice_message_${Date.now()}.${ext}`;
+      } else if (file.audio) {
+        // 使用音频的标题作为文件名，如果有的话
+        fileName = (file.audio.title || `audio_${Date.now()}`) + `.${ext}`;
+      } else if (file.video) {
+        fileName = `video_${Date.now()}.${ext}`;
+      } else {
+        fileName = `file_${Date.now()}.${ext}`;
       }
     }
     
     // 确保MIME类型正确
-    const mimeType = file.mime_type || getContentType(ext);
+    if (!mimeType || mimeType === 'application/octet-stream') {
+      mimeType = getContentType(ext);
+    }
+    
     const [mainType, subType] = mimeType.split('/');
     
     console.log('处理文件:', { 
@@ -1003,7 +1088,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       mimeType, 
       mainType, 
       subType, 
-      size: contentLength 
+      size: contentLength,
+      filePath: data.result.file_path
     });
     
     // 更新处理状态消息
@@ -1052,6 +1138,8 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       // 使用Telegram存储
       // 根据文件类型选择不同的发送方法
       let method, field;
+      let messageId = null;
+      let fileId = null;
       
       // 根据主类型和子类型确定使用哪种Telegram API方法
       if (mainType === 'image' && !['svg+xml', 'x-icon'].includes(subType)) {
@@ -1089,25 +1177,55 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       );
       
       if (!tgResponse.ok) {
-        console.error('Telegram API错误:', await tgResponse.text());
-        throw new Error('Telegram参数配置错误');
-      }
-      
-      const tgData = await tgResponse.json();
-      const result = tgData.result;
-      const messageId = result.message_id;
-      let fileId;
-      
-      // 根据不同类型提取file_id
-      if (field === 'photo') {
-        const photos = result.photo;
-        fileId = photos[photos.length - 1]?.file_id; // 获取最大尺寸的图片ID
-      } else if (field === 'video') {
-        fileId = result.video?.file_id;
-      } else if (field === 'audio') {
-        fileId = result.audio?.file_id;
+        const errorText = await tgResponse.text();
+        console.error('Telegram API错误:', errorText);
+        
+        // 如果发送失败，尝试用document方法重试一次
+        if (method !== 'sendDocument') {
+          console.log('尝试使用sendDocument方法重新上传');
+          
+          const retryFormData = new FormData();
+          retryFormData.append('chat_id', config.tgStorageChatId);
+          retryFormData.append('document', blob, fileName);
+          retryFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
+          
+          const retryResponse = await fetch(
+            `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
+            { method: 'POST', body: retryFormData }
+          );
+          
+          if (!retryResponse.ok) {
+            console.error('Telegram文档上传也失败:', await retryResponse.text());
+            throw new Error('Telegram文件上传失败');
+          }
+          
+          const retryData = await retryResponse.json();
+          const retryResult = retryData.result;
+          messageId = retryResult.message_id;
+          fileId = retryResult.document?.file_id;
+          
+          if (!fileId || !messageId) {
+            throw new Error('重试上传后仍未获取到有效的文件ID');
+          }
+        } else {
+          throw new Error('Telegram参数配置错误: ' + errorText);
+        }
       } else {
-        fileId = result.document?.file_id;
+        const tgData = await tgResponse.json();
+        const result = tgData.result;
+        messageId = result.message_id;
+        
+        // 根据不同类型提取file_id
+        if (field === 'photo') {
+          const photos = result.photo;
+          fileId = photos[photos.length - 1]?.file_id; // 获取最大尺寸的图片ID
+        } else if (field === 'video') {
+          fileId = result.video?.file_id;
+        } else if (field === 'audio') {
+          fileId = result.audio?.file_id;
+        } else {
+          fileId = result.document?.file_id;
+        }
       }
                     
       if (!fileId) throw new Error('未获取到文件ID');
