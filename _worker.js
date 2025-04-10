@@ -513,7 +513,7 @@ async function handleTelegramWebhook(request, config) {
         return new Response('OK');
       }
       // 处理后缀设置
-      else if (update.message.text && userSetting.status === 'waiting_suffix') {
+      else if (update.message.text && userSetting.waiting_for === 'waiting_suffix') {
         // 用户正在设置后缀
         let newSuffix = update.message.text.trim();
         
@@ -525,19 +525,20 @@ async function handleTelegramWebhook(request, config) {
         // 更新用户设置
         await config.database.prepare(`
           UPDATE user_settings 
-          SET custom_suffix = ?, status = NULL 
+          SET custom_suffix = ?, waiting_for = NULL 
           WHERE chat_id = ?
-        `).bind(newSuffix, chatId.toString()).run();
+        `).bind(newSuffix, chatId).run();
         
         // 发送确认消息
         await sendMessage(
           chatId, 
           newSuffix ? `✅ 后缀已设置为: ${newSuffix}` : '✅ 后缀已清除', 
-          config.botToken
+          config.tgBotToken
         );
         
         // 重新发送设置面板
-        await sendPanel(chatId, { ...userSetting, custom_suffix: newSuffix, status: null }, config);
+        userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
+        await sendPanel(chatId, userSetting, config);
         return new Response('OK');
       }
 
