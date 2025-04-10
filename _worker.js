@@ -666,63 +666,184 @@ async function handleCallbackQuery(update, config, userSetting) {
 
 async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
   try {
-    // 获取文件URL
-    const fileUrl = await getTelegramFileUrl(file.file_id, config.bot_token, config);
-    if (!fileUrl) {
-      await sendMessage(chatId, '获取文件URL失败，请重试', config.bot_token);
-      return false;
+    // 第一步：获取文件内容
+    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
+    const data = await response.json();
+    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
+
+    const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+    const fileResponse = await fetch(telegramUrl);
+
+    if (!fileResponse.ok) throw new Error(`Failed to fetch file: ${fileResponse.status} ${fileResponse.statusText}`);
+    const contentLength = fileResponse.headers.get('content-length');
+  
+    // 检查文件大小
+    if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
+      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
+      return;
     }
 
-    // 存储文件信息
-    const result = await config.database.prepare(`
-      INSERT INTO files (filename, url, size, mime_type, created_at, file_id, chat_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      file.file_name,
-      fileUrl,
-      file.file_size,
-      file.mime_type,
-      Date.now(),
-      file.file_id,
-      chatId
-    );
-
-    // 生成预览链接（考虑用户设置的后缀）
-    const suffix = userSetting?.url_suffix || '';
-    const previewUrl = suffix ? generateNewUrl(fileUrl, suffix) : fileUrl;
-
-    // 发送预览消息
-    const message = `文件上传成功！
-文件名：${file.file_name}${suffix || ''}
-大小：${formatSize(file.file_size)}
-类型：${file.mime_type}
-预览链接：${previewUrl}`;
-
-    await sendMessage(chatId, message, config.bot_token);
-    return true;
+    // 第二步：准备文件数据，与网页上传保持一致的格式
+    // 获取文件扩展名和MIME类型
+    let fileName = '';
+    let ext = '';
+    
+    if (isDocument && file.file_name) {
+      fileName = file.file_name;
+      ext = (fileName.split('.').pop() || '').toLowerCase();
+    } else {
+      ext = getExtensionFromMime(file.mime_type);
+      fileName = `image.${ext}`;
+    }
+    
+    const mimeType = file.mime_type || getContentType(ext);
+    const [mainType] = mimeType.split('/');
+    
+    // 第三步：根据存储类型(r2 或 telegram)处理文件存储
+    const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
+    
+    // 获取分类ID
+    let categoryId = null;
+    if (userSetting && userSetting.category_id) {
+      categoryId = userSetting.category_id;
+    } else {
+      // 找默认分类
+      const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      if (defaultCategory) {
+        categoryId = defaultCategory.id;
+      }
+    }
+    
+    let finalUrl, dbFileId, dbMessageId;
+    
+    // 与网页上传一致，使用时间戳作为文件名
+    const timestamp = Date.now();
+    const key = `${timestamp}.${ext}`;
+    
+    if (storageType === 'r2' && config.bucket) {
+      // 上传到R2存储
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      await config.bucket.put(key, arrayBuffer, { 
+        httpMetadata: { contentType: mimeType } 
+      });
+      finalUrl = `https://${config.domain}/${key}`;
+      dbFileId = key;
+      dbMessageId = 0;
+    } else {
+      // 使用Telegram存储
+      // 根据文件类型选择不同的发送方法
+      const typeMap = {
+        image: { method: 'sendPhoto', field: 'photo' },
+        video: { method: 'sendVideo', field: 'video' },
+        audio: { method: 'sendAudio', field: 'audio' }
+      };
+      let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
+      
+      if (['application', 'text'].includes(mainType)) {
+        method = 'sendDocument';
+        field = 'document';
+      }
+      
+      // 重新发送到存储聊天
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      const tgFormData = new FormData();
+      tgFormData.append('chat_id', config.tgStorageChatId);
+      const blob = new Blob([arrayBuffer], { type: mimeType });
+      tgFormData.append(field, blob, fileName);
+      
+      const tgResponse = await fetch(
+        `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
+        { method: 'POST', body: tgFormData }
+      );
+      
+      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
+      
+      const tgData = await tgResponse.json();
+      const result = tgData.result;
+      const messageId = result.message_id;
+      const fileId = result.document?.file_id ||
+                    result.video?.file_id ||
+                    result.audio?.file_id ||
+                    (result.photo && result.photo[result.photo.length - 1]?.file_id);
+                    
+      if (!fileId) throw new Error('未获取到文件ID');
+      if (!messageId) throw new Error('未获取到tg消息ID');
+      
+      finalUrl = `https://${config.domain}/${key}`;
+      dbFileId = fileId;
+      dbMessageId = messageId;
+    }
+    
+    // 第四步：写入数据库，与网页上传完全一致的格式
+    const time = Math.floor(timestamp / 1000);
+    
+    await config.database.prepare(`
+      INSERT INTO files (
+        url, 
+        fileId, 
+        message_id, 
+        created_at, 
+        file_name, 
+        file_size, 
+        mime_type, 
+        chat_id, 
+        category_id, 
+        storage_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      finalUrl,
+      dbFileId,
+      dbMessageId,
+      time,
+      key,  // 使用key作为file_name
+      contentLength,
+      mimeType,
+      chatId,
+      categoryId,
+      storageType
+    ).run();
+    
+    // 第五步：发送成功消息给用户
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
+    
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: qrCodeUrl,
+        caption: `✅ 文件上传成功\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`,
+        parse_mode: 'HTML'
+      })
+    });
   } catch (error) {
-    console.error('处理媒体上传时出错:', error);
-    await sendMessage(chatId, '文件上传失败，请重试', config.bot_token);
-    return false;
+    console.error("Error handling media upload:", error);
+    await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
   }
 }
 
 async function getTelegramFileUrl(fileId, botToken, config) {
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`
-    );
-    const data = await response.json();
-    
-    if (!data.ok) {
-      console.error('获取Telegram文件信息失败:', data);
-      return null;
-    }
-    
-    return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
-  } catch (error) {
-    console.error('获取Telegram文件URL时出错:', error);
-    return null;
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+  const data = await response.json();
+  if (!data.ok) throw new Error('获取文件路径失败');
+  
+  // 获取文件路径
+  const filePath = data.result.file_path;
+  
+  // 从路径中提取文件名和扩展名
+  const fileName = filePath.split('/').pop();
+  
+  // 使用时间戳重命名文件，保持与其他上传一致
+  const timestamp = Date.now();
+  const fileExt = fileName.split('.').pop();
+  const newFileName = `${timestamp}.${fileExt}`;
+  
+  // 返回域名格式URL
+  if (config && config.domain) {
+    return `https://${config.domain}/${newFileName}`;
+  } else {
+    // 仅在没有配置域名时才返回Telegram API链接
+    return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
   }
 }
 
@@ -1147,34 +1268,130 @@ function getPreviewHtml(url) {
 }
 
 async function handleFileRequest(request, config) {
-  const url = new URL(request.url);
-  const fileId = url.pathname.split('/').pop();
-  
-  const file = await getFile(fileId, config);
-  if (!file) {
-    return new Response('文件不存在', { status: 404 });
+  try {
+    const url = new URL(request.url);
+    const path = decodeURIComponent(url.pathname.slice(1));
+
+    if (!path) {
+      return new Response('Not Found', { status: 404 });
+    }
+    
+    // 设置公共头部，确保图片等媒体可以正常显示
+    const getCommonHeaders = (contentType) => {
+      const headers = new Headers();
+      headers.set('Content-Type', contentType);
+      headers.set('Access-Control-Allow-Origin', '*');
+      
+      // 关键：确保媒体文件使用inline展示
+      if (contentType.startsWith('image/') || 
+          contentType.startsWith('video/') || 
+          contentType.startsWith('audio/')) {
+        headers.set('Content-Disposition', 'inline');
+      }
+      
+      // 添加缓存相关头
+      headers.set('Cache-Control', 'public, max-age=31536000');
+      
+      return headers;
+    };
+
+    // 先尝试直接从R2存储获取文件
+    if (config.bucket) {
+      try {
+        const object = await config.bucket.get(path);
+        
+        if (object) {
+          const contentType = object.httpMetadata.contentType || getContentType(path.split('.').pop());
+          const headers = getCommonHeaders(contentType);
+          object.writeHttpMetadata(headers);
+          headers.set('etag', object.httpEtag);
+          
+          return new Response(object.body, { headers });
+        }
+      } catch (error) {
+        console.error('R2获取文件出错:', error);
+        // 继续尝试其他方式获取文件
+      }
+    }
+
+    // 从数据库查询文件记录
+    let file;
+    
+    // 先通过完整URL查询
+    const urlPattern = `https://${config.domain}/${path}`;
+    file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
+    
+    // 如果上面没找到，再用文件名作为fileId查询
+    if (!file) {
+      file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
+    }
+    
+    // 最后尝试使用路径的最后部分（文件名）查询
+    if (!file) {
+      const fileName = path.split('/').pop();
+      file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
+    }
+
+    if (!file) {
+      return new Response('File not found', { status: 404 });
+    }
+
+    // 根据存储类型处理文件
+    if (file.storage_type === 'telegram') {
+      // 处理Telegram存储的文件
+      try {
+        // 从Telegram获取文件链接
+        const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.fileId}`);
+        const data = await response.json();
+        
+        if (!data.ok) {
+          return new Response('Failed to get file from Telegram', { status: 500 });
+        }
+        
+        const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+        const fileResponse = await fetch(telegramUrl);
+        
+        if (!fileResponse.ok) {
+          return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
+        }
+        
+        const contentType = file.mime_type || getContentType(path.split('.').pop());
+        const headers = getCommonHeaders(contentType);
+        
+        // 流式传输文件内容，避免内存占用过大
+        return new Response(fileResponse.body, { headers });
+      } catch (error) {
+        console.error('处理Telegram文件出错:', error);
+        return new Response('Error processing Telegram file', { status: 500 });
+      }
+    } else if (file.storage_type === 'r2' && config.bucket) {
+      // 如果是R2存储但前面直接访问失败，再尝试通过fileId获取
+      try {
+        const object = await config.bucket.get(file.fileId);
+        
+        if (object) {
+          const contentType = object.httpMetadata.contentType || file.mime_type || getContentType(path.split('.').pop());
+          const headers = getCommonHeaders(contentType);
+          object.writeHttpMetadata(headers);
+          headers.set('etag', object.httpEtag);
+          
+          return new Response(object.body, { headers });
+        }
+      } catch (error) {
+        console.error('通过fileId从R2获取文件出错:', error);
+      }
+    }
+    
+    // 如果上述方法都失败，尝试重定向到文件URL
+    if (file.url && file.url !== urlPattern) {
+      return Response.redirect(file.url, 302);
+    }
+    
+    return new Response('File not available', { status: 404 });
+  } catch (error) {
+    console.error('处理文件请求出错:', error);
+    return new Response('Internal Server Error', { status: 500 });
   }
-
-  // 获取用户设置中的后缀
-  const userSetting = await config.database.prepare(
-    "SELECT * FROM user_settings WHERE chat_id = ?"
-  ).get(file.chat_id);
-
-  const suffix = userSetting?.url_suffix || '';
-  
-  // 根据后缀修改文件名
-  let filename = file.filename;
-  if (suffix && !filename.endsWith(suffix)) {
-    filename = filename + suffix;
-  }
-
-  const headers = getCommonHeaders(file.mime_type);
-  headers['Content-Disposition'] = `inline; filename*=UTF-8''${encodeURIComponent(filename)}`;
-  
-  return new Response(file.url, {
-    headers,
-    status: 302
-  });
 }
 
 async function handleDeleteRequest(request, config) {
@@ -3099,18 +3316,9 @@ async function handleUpdateSuffixRequest(request, config) {
 
 // 修改generateNewUrl函数，直接使用域名和文件名生成URL
 function generateNewUrl(url, suffix) {
-  if (!suffix) return url;
-  const urlObj = new URL(url);
-  const pathParts = urlObj.pathname.split('.');
-  if (pathParts.length > 1) {
-    // 如果URL已经有扩展名，替换它
-    pathParts[pathParts.length - 1] = suffix.startsWith('.') ? suffix.slice(1) : suffix;
-    urlObj.pathname = pathParts.join('.');
-  } else {
-    // 如果URL没有扩展名，直接添加
-    urlObj.pathname += suffix;
-  }
-  return urlObj.toString();
+  const fileName = getFileName(url);
+  const newFileName = suffix + '.' + fileName.split('.').pop();
+  return `https://${config.domain}/${newFileName}`;
 }
 
 function getFileName(url) {
@@ -3241,12 +3449,4 @@ async function deleteFile(fileId, config) {
     }
   }
   return true; // 如果没有R2桶，假设文件已删除或不需要删除
-}
-
-function getCommonHeaders(contentType) {
-  return {
-    'Content-Type': contentType || 'application/octet-stream',
-    'Access-Control-Allow-Origin': '*',
-    'Cache-Control': 'public, max-age=31536000'
-  };
 }
