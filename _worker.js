@@ -32,8 +32,6 @@ async function initDatabase(config) {
         chat_id TEXT NOT NULL UNIQUE,
         storage_type TEXT DEFAULT 'r2',
         category_id INTEGER,
-        custom_suffix TEXT,
-        waiting_for TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -54,7 +52,6 @@ async function initDatabase(config) {
         chat_id TEXT,
         storage_type TEXT NOT NULL DEFAULT 'telegram',
         category_id INTEGER,
-        custom_suffix TEXT,
         FOREIGN KEY (category_id) REFERENCES categories(id)
       )
     `).run();
@@ -118,9 +115,7 @@ async function validateDatabaseStructure(config) {
     const userSettingsColumns = await config.database.prepare(`PRAGMA table_info(user_settings)`).all();
     const hasUserSettingsRequiredColumns = userSettingsColumns.results.some(col => col.name === 'chat_id') && 
                                            userSettingsColumns.results.some(col => col.name === 'storage_type') &&
-                                           userSettingsColumns.results.some(col => col.name === 'category_id') &&
-                                           userSettingsColumns.results.some(col => col.name === 'custom_suffix') &&
-                                           userSettingsColumns.results.some(col => col.name === 'waiting_for');
+                                           userSettingsColumns.results.some(col => col.name === 'category_id');
     
     if (!hasUserSettingsRequiredColumns) {
       console.warn("用户设置表结构不完整，尝试重建...");
@@ -140,8 +135,7 @@ async function validateDatabaseStructure(config) {
                                     filesColumns.results.some(col => col.name === 'created_at') &&
                                     filesColumns.results.some(col => col.name === 'storage_type') &&
                                     filesColumns.results.some(col => col.name === 'category_id') &&
-                                    filesColumns.results.some(col => col.name === 'chat_id') && // Added check
-                                    filesColumns.results.some(col => col.name === 'custom_suffix'); // Added check
+                                    filesColumns.results.some(col => col.name === 'chat_id');
 
     if (!hasFilesRequiredColumns) {
       console.warn("文件表结构不完整，尝试重建...");
@@ -200,8 +194,6 @@ async function recreateUserSettingsTable(config) {
         chat_id TEXT NOT NULL UNIQUE,
         storage_type TEXT DEFAULT 'r2',
         category_id INTEGER,
-        custom_suffix TEXT,
-        waiting_for TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -241,7 +233,6 @@ async function recreateFilesTable(config) {
         chat_id TEXT,
         storage_type TEXT NOT NULL DEFAULT 'telegram',
         category_id INTEGER,
-        custom_suffix TEXT,
         FOREIGN KEY (category_id) REFERENCES categories(id)
       )
     `).run();
@@ -258,8 +249,8 @@ async function recreateFilesTable(config) {
           await config.database.prepare(`
             INSERT INTO files (
               url, fileId, message_id, created_at, file_name, file_size, 
-              mime_type, chat_id, storage_type, category_id, custom_suffix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              mime_type, chat_id, storage_type, category_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).bind(
             row.url, 
             row.fileId || row.url, 
@@ -270,8 +261,7 @@ async function recreateFilesTable(config) {
             row.mime_type, 
             row.chat_id, 
             row.storage_type || 'telegram', 
-            row.category_id,
-            row.custom_suffix
+            row.category_id
           ).run();
         } catch (e) {
           console.error(`恢复记录失败: ${e.message}`, row);
@@ -289,16 +279,8 @@ async function recreateFilesTable(config) {
 
 async function checkAndAddMissingColumns(config) {
   try {
-    // 检查文件表是否有custom_suffix字段
-    await ensureColumnExists(config, 'files', 'custom_suffix', 'TEXT');
     // 检查文件表是否有chat_id字段
     await ensureColumnExists(config, 'files', 'chat_id', 'TEXT');
-    
-    // 检查用户设置表是否有custom_suffix字段
-    await ensureColumnExists(config, 'user_settings', 'custom_suffix', 'TEXT');
-    
-    // 检查用户设置表是否有waiting_for字段
-    await ensureColumnExists(config, 'user_settings', 'waiting_for', 'TEXT');
     
     // 检查用户设置表是否有current_category_id列
     await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
@@ -439,10 +421,6 @@ export default {
       return handleDeleteCategoryRequest(request, config);
     }
 
-    if (pathname === '/update-suffix' && request.method === 'POST') {
-      return handleUpdateSuffixRequest(request, config);
-    }
-
     const routes = {
       '/': () => handleAuthRequest(request, config),
       '/login': () => handleLoginRequest(request, config),
@@ -474,43 +452,6 @@ async function handleTelegramWebhook(request, config) {
       if (!userSetting) {
         await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
         userSetting = { chat_id: chatId, storage_type: 'r2' };
-      }
-
-      // 检查用户是否在等待输入
-      if (userSetting.waiting_for === 'new_category' && update.message.text) {
-        // 用户正在创建新分类
-        const categoryName = update.message.text.trim();
-        
-        try {
-          // 检查分类名是否已存在
-          const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-          if (existingCategory) {
-            await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
-          } else {
-            // 创建新分类
-            const time = Date.now();
-            await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)').bind(categoryName, time).run();
-            
-            // 获取新创建的分类ID
-            const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
-            
-            // 设置为当前分类
-            await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
-            
-            await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
-          }
-        } catch (error) {
-          console.error('创建分类失败:', error);
-          await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
-        }
-        
-        // 清除等待状态
-        await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
-        
-        // 更新面板
-        userSetting.waiting_for = null;
-        await sendPanel(chatId, userSetting, config);
-        return new Response('OK');
       }
 
       // 处理命令
@@ -775,7 +716,9 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     }
     
     // 第四步：写入数据库，与网页上传完全一致的格式
-    const time = Math.floor(timestamp / 1000);
+    // 修复时间格式问题：使用ISO标准日期时间
+    const currentDate = new Date();
+    const formattedDate = currentDate.toISOString(); // 使用ISO格式的日期时间
     
     await config.database.prepare(`
       INSERT INTO files (
@@ -794,7 +737,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       finalUrl,
       dbFileId,
       dbMessageId,
-      time,
+      formattedDate, // 使用标准日期时间格式，而不是时间戳
       key,  // 使用key作为file_name
       contentLength,
       mimeType,
@@ -1205,7 +1148,6 @@ async function handleAdminRequest(request, config) {
             <a class="btn btn-down" href="${url}" target="_blank">查看</a>
             <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
             <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-            <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
           </div>
         </div>
       `;
@@ -2836,18 +2778,6 @@ function generateAdminPage(fileCards, categoryOptions) {
           </div>
         </div>
       </div>
-      
-      <!-- 修改后缀弹窗 -->
-      <div id="editSuffixModal" class="modal">
-        <div class="modal-content">
-          <h3 class="modal-title">修改文件后缀</h3>
-          <input type="text" id="editSuffixInput" placeholder="输入新的文件后缀">
-          <div class="modal-buttons">
-            <button class="modal-button modal-confirm" id="editSuffixConfirm">确认</button>
-            <button class="modal-button modal-cancel" id="editSuffixCancel">取消</button>
-          </div>
-        </div>
-      </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs/qrcode.min.js"></script>
@@ -2883,10 +2813,6 @@ function generateAdminPage(fileCards, categoryOptions) {
       const qrModal = document.getElementById('qrModal');
       const qrCopyBtn = document.getElementById('qrCopyBtn');
       const qrCloseBtn = document.getElementById('qrCloseBtn');
-      const editSuffixModal = document.getElementById('editSuffixModal');
-      const editSuffixInput = document.getElementById('editSuffixInput');
-      const editSuffixConfirm = document.getElementById('editSuffixConfirm');
-      const editSuffixCancel = document.getElementById('editSuffixCancel');
       
       let currentShareUrl = '';
       let currentConfirmCallback = null;
@@ -3052,9 +2978,6 @@ function generateAdminPage(fileCards, categoryOptions) {
         if (event.target === qrModal) {
           qrModal.classList.remove('show');
         }
-        if (event.target === editSuffixModal) {
-          editSuffixModal.classList.remove('show');
-        }
       });
 
       // 删除单个文件
@@ -3141,89 +3064,6 @@ function generateAdminPage(fileCards, categoryOptions) {
         showQRCode(url);
       }
 
-      // 淇敼鍚庣紑
-      let currentEditUrl = '';
-
-      // 修改后缀
-      function showEditSuffixModal(url) {
-        currentEditUrl = url;
-        
-        // 获取当前后缀
-        const urlObj = new URL(url);
-        const pathParts = urlObj.pathname.split('/');
-        const fileName = pathParts[pathParts.length - 1];
-        const fileNameParts = fileName.split('.');
-        const extension = fileNameParts.pop(); // 获取扩展名
-        const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
-        
-        if (editSuffixInput) {
-          editSuffixInput.value = currentSuffix;
-          editSuffixModal.classList.add('show');
-        }
-      }
-
-      if (editSuffixCancel) {
-        editSuffixCancel.addEventListener('click', () => {
-          editSuffixModal.classList.remove('show');
-        });
-      }
-
-      if (editSuffixConfirm) {
-        editSuffixConfirm.addEventListener('click', async () => {
-          const newSuffix = editSuffixInput.value;
-          
-          try {
-            const response = await fetch('/update-suffix', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ 
-                url: currentEditUrl,
-                suffix: newSuffix
-              })
-            });
-            
-            const data = await response.json();
-            
-            if (data.status === 1) {
-              // 更新成功，隐藏弹窗
-              editSuffixModal.classList.remove('show');
-              
-              // 更新页面上的URL
-              const card = document.querySelector('[data-url="' + currentEditUrl + '"]');
-              if (card) {
-                // 更新卡片的URL值
-                card.setAttribute('data-url', data.newUrl);
-                
-                // 更新卡片中的按钮URL
-                const copyBtn = card.querySelector('.btn-copy');
-                const downBtn = card.querySelector('.btn-down');
-                const shareBtn = card.querySelector('.btn-share');
-                const editBtn = card.querySelector('.btn-edit');
-                
-                if (copyBtn) copyBtn.setAttribute('data-url', data.newUrl);
-                if (downBtn) downBtn.href = data.newUrl;
-                if (shareBtn) shareBtn.setAttribute('data-url', data.newUrl);
-                if (editBtn) editBtn.setAttribute('data-url', data.newUrl);
-                
-                // 更新描述中的文件名
-                const fileNameElement = card.querySelector('.file-info div:first-child');
-                if (fileNameElement) {
-                  const urlObj = new URL(data.newUrl);
-                  const fileName = urlObj.pathname.split('/').pop();
-                  fileNameElement.textContent = fileName;
-                }
-              }
-              
-              showConfirmModal(data.msg, null, true);
-            } else {
-              showConfirmModal(data.msg || '修改后缀失败', null, true);
-            }
-          } catch (error) {
-            showConfirmModal('修改后缀时出错：' + error.message, null, true);
-          }
-        });
-      }
-
       // 复制到剪贴板
       function copyToClipboard(text) {
         navigator.clipboard.writeText(text)
@@ -3243,98 +3083,10 @@ function generateAdminPage(fileCards, categoryOptions) {
         if (event.target === qrModal) {
           qrModal.classList.remove('show');
         }
-        if (event.target === editSuffixModal) {
-          editSuffixModal.classList.remove('show');
-        }
       });
     </script>
   </body>
   </html>`;
-}
-
-async function handleUpdateSuffixRequest(request, config) {
-  try {
-    const { fileName, suffix } = await request.json();
-
-    if (!fileName || !suffix) {
-      return new Response(JSON.stringify({
-        status: 0,
-        message: '文件名和后缀不能为空'
-      }), { headers: { 'Content-Type': 'application/json' } });
-    }
-
-    const newFileName = suffix + '.' + fileName.split('.').pop();
-    
-    let fileUrl;
-    
-    // 检查文件是否存在于R2存储
-    if (config.bucket) {
-      try {
-        const file = await config.bucket.get(fileName);
-        if (file) {
-          // 复制文件到新名称
-          const fileData = await file.arrayBuffer();
-          await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
-          
-          // 删除旧文件
-          await deleteFile(fileName, config);
-          
-          // 更新数据库中的文件名
-          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ?')
-            .bind(newFileName, `https://${config.domain}/${newFileName}`, fileName).run();
-            
-          fileUrl = `https://${config.domain}/${newFileName}`;
-        }
-      } catch (error) {
-        console.error('处理R2文件重命名失败:', error);
-        // 如果R2操作失败，继续尝试数据库更新
-      }
-    }
-    
-    // 如果没有R2或R2操作失败，尝试只更新数据库
-    if (!fileUrl) {
-      const oldUrl = `https://${config.domain}/${fileName}`;
-      fileUrl = `https://${config.domain}/${newFileName}`;
-      
-      // 尝试更新数据库记录
-      await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ? OR url = ?')
-        .bind(newFileName, fileUrl, fileName, oldUrl).run();
-    }
-
-    return new Response(JSON.stringify({
-      status: 1,
-      url: fileUrl
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    console.error('更新后缀失败:', error);
-    return new Response(JSON.stringify({
-      status: 0,
-      message: '更新后缀失败: ' + error.message
-    }), { headers: { 'Content-Type': 'application/json' } });
-  }
-}
-
-// 修改generateNewUrl函数，直接使用域名和文件名生成URL
-function generateNewUrl(url, suffix) {
-  const fileName = getFileName(url);
-  const newFileName = suffix + '.' + fileName.split('.').pop();
-  return `https://${config.domain}/${newFileName}`;
-}
-
-function getFileName(url) {
-  const urlObj = new URL(url);
-  const pathParts = urlObj.pathname.split('/');
-  return pathParts[pathParts.length - 1];
-}
-
-function copyToClipboard(text) {
-  navigator.clipboard.writeText(text)
-    .then(() => {
-      showConfirmModal('已复制到剪贴板', null, true);
-    })
-    .catch(() => {
-      showConfirmModal('复制失败，请手动复制', null, true);
-    });
 }
 
 // 从MIME类型获取文件扩展名
