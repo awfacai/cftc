@@ -1928,7 +1928,7 @@ function generateLoginPage() {
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
-    <link rel="shortcut icon" href="https://pan.811520.xyz/2025-02/1739241502-tgfile-favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
     <meta name="description" content="Telegram文件存储与分享平台">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2099,7 +2099,7 @@ function generateUploadPage(categoryOptions, storageType) {
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
-    <link rel="shortcut icon" href="https://pan.811520.xyz/2025-02/1739241502-tgfile-favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
     <meta name="description" content="Telegram文件存储与分享平台">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2444,7 +2444,7 @@ function generateUploadPage(categoryOptions, storageType) {
             <button onclick="copyUrls('html')">复制HTML</button>
           </div>
           <div class="copyright">
-            <span>© 2025 Copyright by <a href="https://github.com/yutian81/CF-tgfile" target="_blank">yutian81's GitHub</a> | <a href="https://blog.811520.xyz/" target="_blank">青云志</a></span>
+            <span>© 2025 Copyright by <a href="https://github.com/iawooo/cftc" target="_blank">AWEI's GitHub</a> | <a href="https://awbk.pp.ua/" target="_blank">阿伟</a></span>
           </div>
         </div>
       </div>
@@ -2746,7 +2746,7 @@ function generateAdminPage(fileCards, categoryOptions) {
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
-    <link rel="shortcut icon" href="https://pan.811520.xyz/2025-02/1739241502-tgfile-favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
     <meta name="description" content="Telegram文件存储与分享平台">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3914,7 +3914,7 @@ async function deleteFile(fileId, config) {
 // 从GitHub获取通知内容
 async function fetchNotification() {
   try {
-    const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+    const response = await fetch('https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/cftc.md?token=GHSAT0AAAAAADAQE7XCIJR632MKTZ2CXN6YZ7X5JXQ');
     
     if (response.ok) {
       return await response.text();
