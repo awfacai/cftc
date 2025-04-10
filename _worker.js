@@ -1464,40 +1464,93 @@ async function handleDeleteMultipleRequest(request, config) {
   try {
     const { urls } = await request.json();
     if (!Array.isArray(urls) || urls.length === 0) {
-      return new Response(JSON.stringify({ error: '无效的URL列表' }), {
+      return new Response(JSON.stringify({ 
+        status: 0, 
+        error: '无效的URL列表' 
+      }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
+    const results = {
+      success: [],
+      failed: []
+    };
+
     for (const url of urls) {
-      const file = await config.database.prepare(
-        'SELECT fileId, message_id, storage_type FROM files WHERE url = ?'
-      ).bind(url).first();
-      if (file) {
-        if (file.storage_type === 'telegram') {
-          try {
-            await fetch(
-              `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
-            );
-          } catch (error) {
-            console.error(`Failed to delete Telegram message for ${url}: ${error.message}`);
-          }
-        } else if (file.storage_type === 'r2') {
-          await config.bucket.delete(file.fileId);
+      try {
+        // 从URL获取文件名以便双重查询
+        const fileName = url.split('/').pop();
+        
+        // 尝试通过URL查找文件
+        let file = await config.database.prepare(
+          'SELECT id, fileId, message_id, storage_type FROM files WHERE url = ?'
+        ).bind(url).first();
+        
+        // 如果找不到，尝试通过文件名查找
+        if (!file && fileName) {
+          file = await config.database.prepare(
+            'SELECT id, fileId, message_id, storage_type FROM files WHERE fileId = ?'
+          ).bind(fileName).first();
         }
-        await config.database.prepare('DELETE FROM files WHERE url = ?').bind(url).run();
+        
+        if (file) {
+          console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
+          
+          // 从存储中删除文件
+          if (file.storage_type === 'telegram' && file.message_id) {
+            try {
+              await fetch(
+                `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
+              );
+              console.log(`已从Telegram删除消息: ${file.message_id}`);
+            } catch (error) {
+              console.error(`从Telegram删除消息失败: ${error.message}`);
+            }
+          } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
+            try {
+              await config.bucket.delete(file.fileId);
+              console.log(`已从R2删除文件: ${file.fileId}`);
+            } catch (error) {
+              console.error(`从R2删除文件失败: ${error.message}`);
+            }
+          }
+          
+          // 从数据库删除记录
+          await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
+          console.log(`已从数据库删除记录: ID=${file.id}`);
+          
+          results.success.push(url);
+        } else {
+          console.log(`未找到文件记录: ${url}`);
+          results.failed.push({url, reason: '未找到文件记录'});
+        }
+      } catch (error) {
+        console.error(`删除文件失败 ${url}: ${error.message}`);
+        results.failed.push({url, reason: error.message});
       }
     }
 
     return new Response(
-      JSON.stringify({ success: true, message: '批量删除成功' }),
+      JSON.stringify({ 
+        status: 1, 
+        message: '批量删除处理完成',
+        results: {
+          success: results.success.length,
+          failed: results.failed.length,
+          details: results
+        }
+      }),
       { headers: { 'Content-Type': 'application/json' } }
     );
   } catch (error) {
     console.error(`[Delete Multiple Error] ${error.message}`);
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        status: 0, 
+        error: error.message 
+      }),
       { status: 500, headers: { 'Content-Type': 'application/json' } }
     );
   }
@@ -1753,18 +1806,31 @@ async function handleDeleteRequest(request, config) {
   }
 
   try {
-    const { id } = await request.json();
-    if (!id) {
+    const { id, fileId } = await request.json();
+    if (!id && !fileId) {
       return new Response(JSON.stringify({
         status: 0,
-        message: '缺少文件ID'
+        message: '缺少文件标识信息'
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 查询文件信息
-    const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(id).first();
+    // 查询文件信息，支持通过URL或文件ID查询
+    let file;
+    if (id && id.startsWith('http')) {
+      // 如果是URL格式，通过URL查询
+      file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(id).first();
+    } else if (id) {
+      // 否则按ID查询
+      file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(id).first();
+    }
+    
+    // 如果上面的查询没找到且提供了fileId，尝试通过fileId查询
+    if (!file && fileId) {
+      file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(fileId).first();
+    }
+
     if (!file) {
       return new Response(JSON.stringify({
         status: 0,
@@ -1774,11 +1840,21 @@ async function handleDeleteRequest(request, config) {
       });
     }
 
+    console.log('准备删除文件:', {
+      fileId: file.fileId,
+      url: file.url,
+      存储类型: file.storage_type
+    });
+
     // 尝试从存储中删除文件
-    await deleteFile(file.fileId, config);
+    if (file.storage_type === 'r2' && config.bucket) {
+      await deleteFile(file.fileId, config);
+      console.log('已从R2存储中删除文件:', file.fileId);
+    }
 
     // 从数据库中删除文件记录
-    await config.database.prepare('DELETE FROM files WHERE id = ?').bind(id).run();
+    await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
+    console.log('已从数据库中删除文件记录');
 
     return new Response(JSON.stringify({
       status: 1,
@@ -2518,6 +2594,9 @@ function generateUploadPage(categoryOptions, storageType) {
 
       // 显示确认弹窗
       function showConfirmModal(message, callback, alertOnly = false) {
+        // 如果已有弹窗显示，先关闭它
+        closeConfirmModal();
+        
         confirmModalMessage.textContent = message;
         currentConfirmCallback = callback;
         
@@ -3382,6 +3461,9 @@ function generateAdminPage(fileCards, categoryOptions) {
 
       // 显示确认弹窗
       function showConfirmModal(message, callback, alertOnly = false) {
+        // 如果已有弹窗显示，先关闭它
+        closeConfirmModal();
+        
         confirmModalMessage.textContent = message;
         currentConfirmCallback = callback;
         
@@ -3428,15 +3510,20 @@ function generateAdminPage(fileCards, categoryOptions) {
       // 删除单个文件
       async function deleteFile(url, card) {
         try {
+          // 从URL提取文件名用于查询
+          const urlObj = new URL(url);
+          const pathParts = urlObj.pathname.split('/');
+          const fileName = pathParts[pathParts.length - 1];
+          
           const response = await fetch('/delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: url })
+            body: JSON.stringify({ id: url, fileId: fileName }) // 同时发送url和文件名
           });
 
           if (!response.ok) {
             const errorData = await response.json();
-            throw new Error(errorData.error || '删除失败');
+            throw new Error(errorData.error || errorData.message || '删除失败');
           }
           
           if (card) {
@@ -3935,3 +4022,4 @@ async function fetchNotification() {
     return null;
   }
 }
+  
