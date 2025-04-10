@@ -535,6 +535,67 @@ async function handleTelegramWebhook(request, config) {
       await handleCallbackQuery(update, config, userSetting);
     }
 
+    // 处理用户等待修改后缀的状态
+    if (update.message?.text && userSetting.current_action === 'waiting_suffix') {
+      const parts = update.message.text.trim().split(' ');
+      if (parts.length < 2) {
+        await sendMessage(
+          chatId,
+          "格式错误，请按照以下格式发送：\n文件URL 新后缀",
+          config.telegram_bot_token
+        );
+        return { success: true };
+      }
+      
+      const fileUrl = parts[0];
+      const newSuffix = parts[1];
+      
+      try {
+        // 检查URL是否存在于数据库中
+        const file = await config.database.prepare(`
+          SELECT * FROM files WHERE url = ?
+        `).bind(fileUrl).first();
+        
+        if (!file) {
+          await sendMessage(
+            chatId,
+            "未找到该文件，请检查URL是否正确",
+            config.telegram_bot_token
+          );
+          return { success: true };
+        }
+        
+        // 生成新的URL
+        const newUrl = generateNewUrl(fileUrl, newSuffix);
+        
+        // 更新数据库
+        await config.database.prepare(`
+          UPDATE files SET url = ? WHERE url = ?
+        `).bind(newUrl, fileUrl).run();
+        
+        // 重置用户状态
+        await config.database.prepare(`
+          UPDATE user_settings SET current_action = NULL WHERE chat_id = ?
+        `).bind(chatId).run();
+        
+        await sendMessage(
+          chatId,
+          `修改成功！\n新链接：${newUrl}`,
+          config.telegram_bot_token
+        );
+        
+        return { success: true };
+      } catch (error) {
+        console.error('修改后缀失败:', error);
+        await sendMessage(
+          chatId,
+          `修改后缀失败: ${error.message}`,
+          config.telegram_bot_token
+        );
+        return { success: true };
+      }
+    }
+
     return new Response('OK');
   } catch (error) {
     console.error('Error handling webhook:', error);
@@ -571,6 +632,9 @@ async function sendPanel(chatId, userSetting, config) {
       [
         { text: "📂 选择分类", callback_data: "list_categories" },
         { text: "➕ 新建分类", callback_data: "create_category" }
+      ],
+      [
+        { text: "📝 修改后缀", callback_data: "suffix" }
       ]
     ]
   };
@@ -661,6 +725,21 @@ async function handleCallbackQuery(update, config, userSetting) {
 📋 使用分类: ${stats.total_categories || 0}个`;
 
     await sendMessage(chatId, statsMessage, config.tgBotToken);
+  } else if (cbData === "suffix") {
+    // 进入修改后缀模式
+    await config.database.prepare(`
+      UPDATE user_settings 
+      SET current_action = 'waiting_suffix' 
+      WHERE chat_id = ?
+    `).bind(chatId).run();
+    
+    await sendMessage(
+      chatId,
+      "请发送要修改的文件URL和新后缀，格式：\n文件URL 新后缀\n例如：\nhttps://example.com/file.jpg png",
+      config.telegram_bot_token
+    );
+    
+    return { success: true };
   }
 }
 
@@ -2840,11 +2919,13 @@ function generateAdminPage(fileCards, categoryOptions) {
       <!-- 修改后缀弹窗 -->
       <div id="editSuffixModal" class="modal">
         <div class="modal-content">
+          <span class="close" onclick="document.getElementById('editSuffixModal').style.display='none'">&times;</span>
           <h3 class="modal-title">修改文件后缀</h3>
+          <input type="hidden" id="editSuffixUrl">
           <input type="text" id="editSuffixInput" placeholder="输入新的文件后缀">
           <div class="modal-buttons">
-            <button class="modal-button modal-confirm" id="editSuffixConfirm">确认</button>
-            <button class="modal-button modal-cancel" id="editSuffixCancel">取消</button>
+            <button id="submitEditSuffix" class="btn btn-primary">确认修改</button>
+            <button class="btn btn-secondary" onclick="document.getElementById('editSuffixModal').style.display='none'">取消</button>
           </div>
         </div>
       </div>
@@ -3254,71 +3335,93 @@ function generateAdminPage(fileCards, categoryOptions) {
 
 async function handleUpdateSuffixRequest(request, config) {
   try {
-    const { fileName, suffix } = await request.json();
-
-    if (!fileName || !suffix) {
+    // 确保请求方法是POST
+    if (request.method !== 'POST') {
       return new Response(JSON.stringify({
-        status: 0,
-        message: '文件名和后缀不能为空'
-      }), { headers: { 'Content-Type': 'application/json' } });
+        success: false,
+        message: '请求方法必须是POST'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
-    const newFileName = suffix + '.' + fileName.split('.').pop();
-    
-    let fileUrl;
-    
-    // 检查文件是否存在于R2存储
-    if (config.bucket) {
-      try {
-        const file = await config.bucket.get(fileName);
-        if (file) {
-          // 复制文件到新名称
-          const fileData = await file.arrayBuffer();
-          await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
-          
-          // 删除旧文件
-          await deleteFile(fileName, config);
-          
-          // 更新数据库中的文件名
-          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ?')
-            .bind(newFileName, `https://${config.domain}/${newFileName}`, fileName).run();
-            
-          fileUrl = `https://${config.domain}/${newFileName}`;
-        }
-      } catch (error) {
-        console.error('处理R2文件重命名失败:', error);
-        // 如果R2操作失败，继续尝试数据库更新
-      }
+    // 解析请求体
+    const { url, suffix } = await request.json();
+
+    // 验证参数
+    if (!url || !suffix) {
+      return new Response(JSON.stringify({
+        success: false,
+        message: '文件URL和后缀不能为空'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
-    
-    // 如果没有R2或R2操作失败，尝试只更新数据库
-    if (!fileUrl) {
-      const oldUrl = `https://${config.domain}/${fileName}`;
-      fileUrl = `https://${config.domain}/${newFileName}`;
-      
-      // 尝试更新数据库记录
-      await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE fileId = ? OR url = ?')
-        .bind(newFileName, fileUrl, fileName, oldUrl).run();
+
+    // 检查文件是否存在于数据库中
+    const file = await config.database.prepare(`
+      SELECT * FROM files WHERE url = ?
+    `).bind(url).first();
+
+    if (!file) {
+      return new Response(JSON.stringify({
+        success: false,
+        message: '找不到该文件'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
+
+    // 生成新的URL
+    const newUrl = generateNewUrl(url, suffix);
+
+    // 更新数据库
+    await config.database.prepare(`
+      UPDATE files SET url = ? WHERE url = ?
+    `).bind(newUrl, url).run();
 
     return new Response(JSON.stringify({
-      status: 1,
-      url: fileUrl
-    }), { headers: { 'Content-Type': 'application/json' } });
+      success: true,
+      message: '后缀修改成功',
+      newUrl: newUrl
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   } catch (error) {
     console.error('更新后缀失败:', error);
     return new Response(JSON.stringify({
-      status: 0,
+      success: false,
       message: '更新后缀失败: ' + error.message
-    }), { headers: { 'Content-Type': 'application/json' } });
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
 // 修改generateNewUrl函数，直接使用域名和文件名生成URL
 function generateNewUrl(url, suffix) {
-  const fileName = getFileName(url);
-  const newFileName = suffix + '.' + fileName.split('.').pop();
-  return `https://${config.domain}/${newFileName}`;
+  // 获取URL的基本部分和文件名
+  const urlObj = new URL(url);
+  const path = urlObj.pathname;
+  const lastSlashIndex = path.lastIndexOf('/');
+  const basePath = path.substring(0, lastSlashIndex + 1);
+  const fileName = path.substring(lastSlashIndex + 1);
+  
+  // 分割文件名得到文件名主体和后缀
+  const fileNameParts = fileName.split('.');
+  
+  // 如果文件名包含多个点，保留第一部分作为基本文件名
+  let baseName = fileNameParts[0];
+  
+  // 构建新的文件名与URL
+  const newFileName = `${baseName}.${suffix}`;
+  const newPathname = `${basePath}${newFileName}`;
+  
+  // 创建并返回新URL
+  const newUrl = new URL(urlObj);
+  newUrl.pathname = newPathname;
+  
+  return newUrl.toString();
 }
 
 function getFileName(url) {
@@ -3450,3 +3553,51 @@ async function deleteFile(fileId, config) {
   }
   return true; // 如果没有R2桶，假设文件已删除或不需要删除
 }
+
+function showEditSuffixModal(url) {
+  document.getElementById('editSuffixUrl').value = url;
+  document.getElementById('editSuffixModal').style.display = 'block';
+  
+  // 从URL提取当前后缀并显示
+  const fileName = getFileName(url);
+  const fileNameParts = fileName.split('.');
+  if (fileNameParts.length > 1) {
+    document.getElementById('editSuffixInput').value = fileNameParts.pop();
+  }
+}
+
+// 提交修改后缀
+document.getElementById('submitEditSuffix').addEventListener('click', async () => {
+  const url = document.getElementById('editSuffixUrl').value;
+  const suffix = document.getElementById('editSuffixInput').value.trim();
+  
+  if (!url || !suffix) {
+    showConfirmModal('请输入有效的后缀', null, true);
+    return;
+  }
+  
+  try {
+    const response = await fetch('/api/update-suffix', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ url, suffix })
+    });
+    
+    const data = await response.json();
+    
+    if (data.success) {
+      showConfirmModal('修改成功', () => {
+        document.getElementById('editSuffixModal').style.display = 'none';
+        // 刷新页面以显示更新后的内容
+        location.reload();
+      });
+    } else {
+      showConfirmModal(data.message || '修改后缀失败', null, true);
+    }
+  } catch (error) {
+    console.error('修改后缀时出错:', error);
+    showConfirmModal('修改后缀时出错：' + error.message, null, true);
+  }
+});
