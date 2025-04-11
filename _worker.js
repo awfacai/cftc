@@ -1,27 +1,38 @@
 // 数据库初始化函数
 async function initDatabase(config) {
     console.log("开始数据库初始化...");
+    
+    // 检查数据库配置
     if (!config || !config.database) {
       console.error("数据库配置缺失");
       throw new Error("数据库配置无效，请检查D1数据库是否正确绑定");
     }
+  
+    // 最大重试次数
     const maxRetries = 3;
     let lastError = null;
+  
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
+        // 测试数据库连接
         console.log(`正在测试数据库连接... (尝试 ${attempt}/${maxRetries})`);
         await config.database.prepare("SELECT 1").run();
         console.log("数据库连接成功");
+  
+        // 验证数据库结构
         console.log("正在验证数据库结构...");
         const structureValid = await validateDatabaseStructure(config);
+        
         if (!structureValid) {
           throw new Error("数据库结构验证失败");
         }
+  
         console.log("数据库初始化成功");
         return true;
       } catch (error) {
         lastError = error;
         console.error(`数据库初始化尝试 ${attempt} 失败:`, error);
+        
         if (error.message.includes('no such table')) {
           console.log("检测到数据表不存在，尝试创建...");
           try {
@@ -32,6 +43,8 @@ async function initDatabase(config) {
             console.error("创建数据表失败:", tableError);
           }
         }
+        
+        // 如果还有重试机会，等待后继续
         if (attempt < maxRetries) {
           const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
           console.log(`等待 ${delay}ms 后重试...`);
@@ -39,10 +52,15 @@ async function initDatabase(config) {
         }
       }
     }
+  
+    // 所有重试都失败了
     throw new Error(`数据库初始化失败 (${maxRetries} 次尝试): ${lastError?.message || '未知错误'}`);
   }
+  
+  // 重新创建所有表
   async function recreateAllTables(config) {
     try {
+      // 创建分类表
       await config.database.prepare(`
         CREATE TABLE IF NOT EXISTS categories (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,6 +68,8 @@ async function initDatabase(config) {
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `).run();
+  
+      // 创建用户设置表
       await config.database.prepare(`
         CREATE TABLE IF NOT EXISTS user_settings (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +81,8 @@ async function initDatabase(config) {
           FOREIGN KEY (current_category_id) REFERENCES categories(id)
         )
       `).run();
+  
+      // 创建文件表
       await config.database.prepare(`
         CREATE TABLE IF NOT EXISTS files (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,17 +99,23 @@ async function initDatabase(config) {
           FOREIGN KEY (category_id) REFERENCES categories(id)
         )
       `).run();
+  
+      // 创建默认分类
       await config.database.prepare(`
         INSERT OR IGNORE INTO categories (name) VALUES ('默认分类')
       `).run();
+  
       return true;
     } catch (error) {
       console.error("重新创建表失败:", error);
       throw error;
     }
   }
+  
+  // 验证数据库结构完整性
   async function validateDatabaseStructure(config) {
     try {
+      // 验证必要的表是否存在
       const tables = ['categories', 'user_settings', 'files'];
       for (const table of tables) {
         try {
@@ -101,6 +129,8 @@ async function initDatabase(config) {
           throw error;
         }
       }
+  
+      // 验证表结构
       const tableStructures = {
         categories: [
           { name: 'id', type: 'INTEGER' },
@@ -129,14 +159,19 @@ async function initDatabase(config) {
           { name: 'chat_id', type: 'TEXT' }
         ]
       };
+  
+      // 检查每个表的结构
       for (const [table, expectedColumns] of Object.entries(tableStructures)) {
         const tableInfo = await config.database.prepare(`PRAGMA table_info(${table})`).all();
         const actualColumns = tableInfo.results;
+        
+        // 检查是否缺少必要的列
         for (const expectedColumn of expectedColumns) {
           const found = actualColumns.some(col => 
             col.name.toLowerCase() === expectedColumn.name.toLowerCase() &&
             col.type.toUpperCase().includes(expectedColumn.type)
           );
+          
           if (!found) {
             console.log(`表 ${table} 缺少列 ${expectedColumn.name}，尝试添加...`);
             try {
@@ -149,23 +184,33 @@ async function initDatabase(config) {
           }
         }
       }
+  
+      // 强化检查默认分类是否存在
       console.log('检查默认分类...');
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
         .bind('默认分类').first();
+      
       if (!defaultCategory) {
         console.log('默认分类不存在，正在创建...');
         try {
+          // 尝试创建默认分类
           const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
             .bind('默认分类', Date.now()).run();
+          
           const newDefaultId = result.meta && result.meta.last_row_id;
           console.log(`默认分类创建成功，ID: ${newDefaultId}`);
+          
+          // 检查是否有文件或用户设置需要更新到新的默认分类
           if (newDefaultId) {
+            // 查找没有分类的文件
             const filesResult = await config.database.prepare('SELECT COUNT(*) as count FROM files WHERE category_id IS NULL').first();
             if (filesResult && filesResult.count > 0) {
               console.log(`发现 ${filesResult.count} 个无分类文件，将它们分配到默认分类...`);
               await config.database.prepare('UPDATE files SET category_id = ? WHERE category_id IS NULL')
                 .bind(newDefaultId).run();
             }
+            
+            // 更新用户设置中没有分类的记录
             const settingsResult = await config.database.prepare('SELECT COUNT(*) as count FROM user_settings WHERE current_category_id IS NULL').first();
             if (settingsResult && settingsResult.count > 0) {
               console.log(`发现 ${settingsResult.count} 条用户设置没有当前分类，更新为默认分类...`);
@@ -180,20 +225,29 @@ async function initDatabase(config) {
       } else {
         console.log(`默认分类存在，ID: ${defaultCategory.id}`);
       }
+  
+      // 再次验证默认分类是否存在
       const checkAgain = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
         .bind('默认分类').first();
+      
       if (!checkAgain) {
         throw new Error('验证失败：即使尝试创建后，默认分类仍然不存在');
       }
+  
       return true;
     } catch (error) {
       console.error('验证数据库结构时出错:', error);
       return false;
     }
   }
+  
+  // 重建分类表
   async function recreateCategoriesTable(config) {
     try {
+      // 备份现有数据
       const existingData = await config.database.prepare('SELECT * FROM categories').all();
+      
+      // 删除并重建表
       await config.database.prepare('DROP TABLE IF EXISTS categories').run();
       await config.database.prepare(`
         CREATE TABLE categories (
@@ -202,6 +256,8 @@ async function initDatabase(config) {
           created_at INTEGER NOT NULL
         )
       `).run();
+      
+      // 恢复数据
       if (existingData && existingData.results && existingData.results.length > 0) {
         for (const row of existingData.results) {
           await config.database.prepare('INSERT OR IGNORE INTO categories (id, name, created_at) VALUES (?, ?, ?)')
@@ -209,14 +265,18 @@ async function initDatabase(config) {
         }
         console.log(`已恢复 ${existingData.results.length} 个分类数据`);
       }
+      
       console.log("分类表重建完成");
     } catch (error) {
       console.error(`重建分类表失败: ${error.message}`);
     }
   }
+  
+  // 重建用户设置表
   async function recreateUserSettingsTable(config) {
     try {
       await config.database.prepare('DROP TABLE IF EXISTS user_settings').run();
+      
       await config.database.prepare(`
         CREATE TABLE user_settings (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,6 +289,7 @@ async function initDatabase(config) {
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `).run();
+      
       console.log('用户设置表重新创建成功');
       return true;
     } catch (error) {
@@ -236,13 +297,20 @@ async function initDatabase(config) {
       return false;
     }
   }
+  
+  // 重建文件表
   async function recreateFilesTable(config) {
     console.log('开始重建文件表...');
     try {
+      // 备份现有数据
       console.log('备份现有数据...');
       const existingData = await config.database.prepare('SELECT * FROM files').all();
+      
+      // 删除表
       console.log('删除现有表...');
       await config.database.prepare('DROP TABLE IF EXISTS files').run();
+      
+      // 重新创建表
       console.log('创建新表...');
       await config.database.prepare(`
         CREATE TABLE files (
@@ -261,12 +329,15 @@ async function initDatabase(config) {
           FOREIGN KEY (category_id) REFERENCES categories(id)
         )
       `).run();
+      
+      // 恢复数据
       console.log('恢复数据...');
       if (existingData && existingData.results && existingData.results.length > 0) {
         console.log(`恢复 ${existingData.results.length} 条记录...`);
         for (const row of existingData.results) {
           const timestamp = row.created_at || Math.floor(Date.now() / 1000);
           const messageId = row.message_id || 0;
+          
           try {
             await config.database.prepare(`
               INSERT INTO files (
@@ -291,6 +362,7 @@ async function initDatabase(config) {
           }
         }
       }
+      
       console.log('文件表重建完成!');
       return true;
     } catch (error) {
@@ -298,84 +370,112 @@ async function initDatabase(config) {
       return false;
     }
   }
+  
   async function checkAndAddMissingColumns(config) {
     try {
+      // 检查文件表是否有custom_suffix字段
       await ensureColumnExists(config, 'files', 'custom_suffix', 'TEXT');
+      // 检查文件表是否有chat_id字段
       await ensureColumnExists(config, 'files', 'chat_id', 'TEXT');
+      
+      // 检查用户设置表是否有custom_suffix字段
       await ensureColumnExists(config, 'user_settings', 'custom_suffix', 'TEXT');
+      
+      // 检查用户设置表是否有waiting_for字段
       await ensureColumnExists(config, 'user_settings', 'waiting_for', 'TEXT');
+      
+      // 检查用户设置表是否有editing_file_id字段
       await ensureColumnExists(config, 'user_settings', 'editing_file_id', 'TEXT');
+      
+      // 检查用户设置表是否有current_category_id列
       await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
+      
       return true;
     } catch (error) {
       console.error('检查并添加缺失列失败:', error);
       return false;
     }
   }
+  
   async function ensureColumnExists(config, tableName, columnName, columnType) {
-    console.log(`确保列 ${columnName} 存在于表 ${tableName} 中...`);
+    console.log(`确保列 ${columnName} 存在于表 ${tableName} 中...`); // Added log
     try {
-      console.log(`检查列 ${columnName} 是否存在于 ${tableName}...`);
+      // 先检查列是否存在
+      console.log(`检查列 ${columnName} 是否存在于 ${tableName}...`); // Added log
       const tableInfo = await config.database.prepare(`PRAGMA table_info(${tableName})`).all();
       const columnExists = tableInfo.results.some(col => col.name === columnName);
+      
       if (columnExists) {
         console.log(`列 ${columnName} 已存在于表 ${tableName} 中`);
-        return true;
+        return true; // Indicate success (column exists)
       }
-      console.log(`列 ${columnName} 不存在于表 ${tableName}，尝试添加...`);
+      
+      // 列不存在，添加它
+      console.log(`列 ${columnName} 不存在于表 ${tableName}，尝试添加...`); // Added log
       try {
         await config.database.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`).run();
         console.log(`列 ${columnName} 已成功添加到表 ${tableName}`);
-        return true;
+        return true; // Indicate success (column added)
       } catch (alterError) {
-        console.warn(`添加列 ${columnName} 到 ${tableName} 时发生错误: ${alterError.message}. 尝试再次检查列是否存在...`, alterError);
+        console.warn(`添加列 ${columnName} 到 ${tableName} 时发生错误: ${alterError.message}. 尝试再次检查列是否存在...`, alterError); // Log the specific ALTER error
+        // Re-check if the column exists after the error, perhaps due to a race condition or specific D1 behavior
         const tableInfoAfterAttempt = await config.database.prepare(`PRAGMA table_info(${tableName})`).all();
         if (tableInfoAfterAttempt.results.some(col => col.name === columnName)) {
            console.log(`列 ${columnName} 在添加尝试失败后被发现存在于表 ${tableName} 中。`);
-           return true;
+           return true; // Column now exists, treat as success
         } else {
            console.error(`添加列 ${columnName} 到 ${tableName} 失败，并且再次检查后列仍不存在。`);
+           // Decide if we should throw or return false
+           // Returning false allows checkAndAddMissingColumns to report overall status
            return false; 
         }
       }
     } catch (error) {
+      // This top-level catch handles errors from PRAGMA or re-checking logic
       console.error(`检查或添加表 ${tableName} 中的列 ${columnName} 时发生严重错误: ${error.message}`, error);
-      return false;
+      return false; // Indicate failure
     }
   }
+  
   async function setWebhook(webhookUrl, botToken) {
     const maxRetries = 3;
     let retryCount = 0;
+    
     while (retryCount < maxRetries) {
       try {
         const response = await fetch(
           `https://api.telegram.org/bot${botToken}/setWebhook?url=${webhookUrl}`
         );
         const result = await response.json();
+        
         if (!result.ok) {
           if (result.error_code === 429) {
+            // 获取重试等待时间
             const retryAfter = result.parameters?.retry_after || 1;
-            console.log("Rate limited, waiting " + retryAfter + " seconds before retry...");
+            console.log(`Rate limited, waiting ${retryAfter} seconds before retry...`);
             await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
             retryCount++;
             continue;
           }
-          console.error("Failed to set webhook: " + JSON.stringify(result));
+          console.error(`Failed to set webhook: ${JSON.stringify(result)}`);
           return false;
         }
-        console.log("Webhook set successfully: " + webhookUrl);
+        
+        console.log(`Webhook set successfully: ${webhookUrl}`);
       return true;
     } catch (error) {
-        console.error("Error setting webhook: " + error.message);
+        console.error(`Error setting webhook: ${error.message}`);
         retryCount++;
         if (retryCount < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, 1000)); // 等待1秒后重试
         }
       }
     }
+    
     console.error('Failed to set webhook after maximum retries');
       return false;
     }
+  
   export default {
     async fetch(request, env) {
       const config = {
@@ -391,36 +491,45 @@ async function initDatabase(config) {
         maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
         bucket: env.BUCKET
       };
+  
       try {
         await initDatabase(config);
       } catch (error) {
-        console.error("Database initialization failed: " + error.message);
+        console.error(`Database initialization failed: ${error.message}`);
         return new Response('Database initialization failed', { status: 500 });
       }
-      const webhookUrl = "https://" + config.domain + "/webhook";
+  
+      const webhookUrl = `https://${config.domain}/webhook`;
       const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
       if (!webhookSet) {
         console.error('Webhook setup failed');
       }
+  
       const { pathname } = new URL(request.url);
+  
       if (pathname === '/config') {
         const safeConfig = { maxSizeMB: config.maxSizeMB };
         return new Response(JSON.stringify(safeConfig), {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
       if (pathname === '/webhook' && request.method === 'POST') {
         return handleTelegramWebhook(request, config);
       }
+  
       if (pathname === '/create-category' && request.method === 'POST') {
         return handleCreateCategoryRequest(request, config);
       }
+  
       if (pathname === '/delete-category' && request.method === 'POST') {
         return handleDeleteCategoryRequest(request, config);
       }
+  
       if (pathname === '/update-suffix' && request.method === 'POST') {
         return handleUpdateSuffixRequest(request, config);
       }
+  
       const routes = {
         '/': () => handleAuthRequest(request, config),
         '/login': () => handleLoginRequest(request, config),
@@ -438,52 +547,82 @@ async function initDatabase(config) {
       return await handleFileRequest(request, config);
     }
   };
+  
   async function handleTelegramWebhook(request, config) {
     try {
       const update = await request.json();
+  
+      // 如果收到的是消息
       if (update.message) {
         const chatId = update.message.chat.id.toString();
+  
+        // 检查用户是否有设置记录，没有则创建
         let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
         if (!userSetting) {
           await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
           userSetting = { chat_id: chatId, storage_type: 'r2' };
         }
+  
+        // 检查用户是否在等待输入
         if (userSetting.waiting_for === 'new_category' && update.message.text) {
+          // 用户正在创建新分类
           const categoryName = update.message.text.trim();
+          
           try {
+            // 检查分类名是否已存在
             const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
             if (existingCategory) {
               await sendMessage(chatId, `⚠️ 分类"${categoryName}"已存在`, config.tgBotToken);
             } else {
+              // 创建新分类
               const time = Date.now();
               await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)').bind(categoryName, time).run();
+              
+              // 获取新创建的分类ID
               const newCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
+              
+              // 设置为当前分类
               await config.database.prepare('UPDATE user_settings SET category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
+              
               await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
             }
     } catch (error) {
             console.error('创建分类失败:', error);
             await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
           }
+          
+          // 清除等待状态
           await config.database.prepare('UPDATE user_settings SET waiting_for = NULL WHERE chat_id = ?').bind(chatId).run();
+          
+          // 更新面板
           userSetting.waiting_for = null;
           await sendPanel(chatId, userSetting, config);
           return new Response('OK');
         }
+        // 处理修改后缀输入
         else if (userSetting.waiting_for === 'new_suffix' && update.message.text && userSetting.editing_file_id) {
+          // 用户正在输入新后缀
           const newSuffix = update.message.text.trim();
           const fileId = userSetting.editing_file_id;
+          
           try {
+            // 获取文件信息
             const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
             if (!file) {
               await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
             } else {
+              // 修改后缀
+              // 从URL提取文件名
               const originalFileName = getFileName(file.url);
               const fileExt = originalFileName.split('.').pop();
-              const newFileName = newSuffix + "." + fileExt;
-              const fileUrl = "https://" + config.domain + "/" + newFileName;
+              const newFileName = `${newSuffix}.${fileExt}`;
+              const fileUrl = `https://${config.domain}/${newFileName}`;
+              
+              // 根据存储类型处理文件
               let success = false;
+              
               if (file.storage_type === 'telegram') {
+                // 对于Telegram存储，只更新URL
                 await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
                   .bind(fileUrl, file.id).run();
                 success = true;
@@ -492,30 +631,41 @@ async function initDatabase(config) {
                 try {
                   const fileId = file.fileId || originalFileName;
                   const r2File = await config.bucket.get(fileId);
+                  
                   if (r2File) {
+                    // 复制文件到新名称
                     const fileData = await r2File.arrayBuffer();
                     await storeFile(fileData, newFileName, r2File.httpMetadata.contentType, config);
+  
+                    // 删除旧文件
                     await deleteFile(fileId, config);
+                    
+                    // 更新数据库记录
                     await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
                       .bind(newFileName, fileUrl, file.id).run();
                     success = true;
                   } else {
+                    // 如果R2中没有找到文件，只更新URL
                     await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
                       .bind(fileUrl, file.id).run();
                     success = true;
                   }
                 } catch (error) {
                   console.error('处理R2文件重命名失败:', error);
+                  
+                  // 即使R2操作失败，仍然更新URL
                   await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
                     .bind(fileUrl, file.id).run();
                   success = true;
                 }
               } 
               else {
+                // 其他情况，直接更新数据库
                 await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
                   .bind(fileUrl, file.id).run();
                 success = true;
               }
+              
               if (success) {
                 await sendMessage(chatId, `✅ 后缀修改成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
               } else {
@@ -526,15 +676,22 @@ async function initDatabase(config) {
             console.error('修改后缀失败:', error);
             await sendMessage(chatId, `❌ 修改后缀失败: ${error.message}`, config.tgBotToken);
           }
+          
+          // 清除等待状态和编辑文件ID
           await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
+          
+          // 更新面板
           userSetting.waiting_for = null;
           userSetting.editing_file_id = null;
           await sendPanel(chatId, userSetting, config);
           return new Response('OK');
         }
+  
+        // 处理命令
         if (update.message.text === '/start') {
           await sendPanel(chatId, userSetting, config);
         }
+        // 处理文件上传 - 增强检测所有类型的媒体文件
         else if (update.message.photo || update.message.document || update.message.video || update.message.audio || update.message.voice || update.message.video_note) {
           console.log('收到文件上传:', JSON.stringify({
             hasPhoto: !!update.message.photo,
@@ -544,8 +701,11 @@ async function initDatabase(config) {
             hasVoice: !!update.message.voice,
             hasVideoNote: !!update.message.video_note
           }));
+          
           let file;
           let isDocument = false;
+          
+          // 按优先级选择文件
           if (update.message.document) {
             file = update.message.document;
             isDocument = true;
@@ -562,32 +722,40 @@ async function initDatabase(config) {
             file = update.message.video_note;
             isDocument = true;
           } else if (update.message.photo) {
-            file = update.message.photo?.slice(-1)[0];
+            file = update.message.photo?.slice(-1)[0]; // 获取最大尺寸的照片
             isDocument = false;
           }
+          
           if (file) {
             await handleMediaUpload(chatId, file, isDocument, config, userSetting);
           } else {
             await sendMessage(chatId, "❌ 无法识别的文件类型", config.tgBotToken);
           }
         }
+        // 通用媒体文件处理 - 捕获其他任何含有file_id的字段
         else {
+          // 检查消息中是否有任何含有file_id的对象
           const message = update.message;
           let fileField = null;
+          
+          // 遍历消息中的所有字段，寻找含有file_id的对象
           for (const field in message) {
             if (message[field] && typeof message[field] === 'object' && message[field].file_id) {
               fileField = field;
               break;
             }
           }
+          
           if (fileField) {
             console.log(`找到未明确处理的文件类型: ${fileField}`, JSON.stringify(message[fileField]));
             await handleMediaUpload(chatId, message[fileField], true, config, userSetting);
           } else if (message.text && message.text !== '/start') {
+            // 不是命令也不是文件，回复默认消息
             await sendMessage(chatId, "请发送图片或文件进行上传，或使用 /start 查看主菜单", config.tgBotToken);
           }
         }
       }
+      // 处理回调查询（按钮点击）
       else if (update.callback_query) {
         const chatId = update.callback_query.from.id.toString();
         let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
@@ -595,39 +763,55 @@ async function initDatabase(config) {
           await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type) VALUES (?, ?)').bind(chatId, 'r2').run();
           userSetting = { chat_id: chatId, storage_type: 'r2' };
         }
+  
         await handleCallbackQuery(update, config, userSetting);
       }
+  
       return new Response('OK');
     } catch (error) {
       console.error('Error handling webhook:', error);
       return new Response('Error processing webhook', { status: 500 });
     }
   }
+  
   async function sendPanel(chatId, userSetting, config) {
+    // 获取当前分类
     let categoryName = '默认';
     let categoryId = userSetting && userSetting.category_id;
+    
+    // 检查该分类是否存在
     if (categoryId) {
       const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(categoryId).first();
       if (category) {
         categoryName = category.name;
       } else {
+        // 用户当前分类不存在，需要重置
         categoryId = null;
       }
     }
+    
+    // 如果没有有效的分类，检查默认分类
     if (!categoryId) {
       let defaultCategory = await config.database.prepare('SELECT id, name FROM categories WHERE name = ?').bind('默认分类').first();
+      
+      // 如果默认分类不存在，创建它
       if (!defaultCategory) {
         try {
           console.log('默认分类不存在，正在创建...');
           const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
             .bind('默认分类', Date.now()).run();
+          
           const newDefaultId = result.meta && result.meta.last_row_id;
           if (newDefaultId) {
             defaultCategory = { id: newDefaultId, name: '默认分类' };
             console.log(`已创建新的默认分类，ID: ${newDefaultId}`);
+            
+            // 更新用户设置
             if (userSetting) {
               await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
                 .bind(newDefaultId, chatId).run();
+              
+              // 更新本地userSetting对象
               userSetting.category_id = newDefaultId;
               categoryId = newDefaultId;
             }
@@ -636,24 +820,38 @@ async function initDatabase(config) {
           console.error('创建默认分类失败:', error);
         }
       } else {
+        // 使用默认分类
         categoryId = defaultCategory.id;
         categoryName = defaultCategory.name;
+        
+        // 更新用户设置
         if (userSetting) {
           await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
             .bind(categoryId, chatId).run();
+              
+          // 更新本地userSetting对象
           userSetting.category_id = categoryId;
         }
       }
     }
+  
+    // 尝试获取GitHub通知内容
     let notificationText = await fetchNotification();
-    const defaultNotification = `➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链
-  ➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作`;
-    const message = `📲 图床助手 3.0
-  📡 系统状态 ─────────────
-  🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}
-  🔹 当前分类: ${categoryName}
-  🔹 文件大小: 最大${config.maxSizeMB}MB
-  ${notificationText || defaultNotification}`;
+  
+    // 默认通知文本
+    const defaultNotification = 
+      "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链\n" +
+      "➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作";
+  
+    // 组装消息内容
+    const message = 
+      "📲 图床助手 3.0\n\n" +
+      "📡 系统状态 ─────────────\n" +
+      `🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}\n` +
+      `🔹 当前分类: ${categoryName}\n` +
+      `🔹 文件大小: 最大${config.maxSizeMB}MB\n\n` +
+      `${notificationText || defaultNotification}`;
+  
     const keyboard = {
       inline_keyboard: [
         [
@@ -669,11 +867,12 @@ async function initDatabase(config) {
           { text: "📋 最近文件", callback_data: "recent_files" }
         ],
         [
-          { text: "🔗 GitHub项目", url: "https://github.com/awfacai/cftc" }
+          { text: "🔗 GitHub项目", url: "https://github.com/iawooo/ctt" }
         ]
       ]
     };
-    await fetch("https://api.telegram.org/bot" + config.tgBotToken + "/sendMessage", {
+  
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -685,10 +884,13 @@ async function initDatabase(config) {
       })
     });
   }
+  
   async function handleCallbackQuery(update, config, userSetting) {
     const cbData = update.callback_query.data;
     const chatId = update.callback_query.from.id.toString();
-    const answerPromise = fetch("https://api.telegram.org/bot" + config.tgBotToken + "/answerCallbackQuery", {
+  
+    // 立即确认消息已收到，减少用户等待时间
+    const answerPromise = fetch(`https://api.telegram.org/bot${config.tgBotToken}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -697,27 +899,36 @@ async function initDatabase(config) {
     }).catch(error => {
       console.error('确认回调查询失败:', error);
     });
+  
+    // 根据回调数据处理不同的操作
     try {
       if (cbData === 'switch_storage') {
+        // 切换存储类型
         const newStorageType = userSetting.storage_type === 'r2' ? 'telegram' : 'r2';
         await config.database.prepare('UPDATE user_settings SET storage_type = ? WHERE chat_id = ?').bind(newStorageType, chatId).run();
         await sendMessage(chatId, `✅ 已切换到 ${newStorageType === 'r2' ? 'R2对象存储' : 'Telegram存储'}`, config.tgBotToken);
         await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
       } else if (cbData === 'list_categories') {
+        // 列出所有分类
         const categoriesPromise = config.database.prepare('SELECT id, name FROM categories').all();
+        
+        // 等待answerPromise完成，确保回调已确认
         await answerPromise;
+        
         const categories = await categoriesPromise;
         if (!categories.results || categories.results.length === 0) {
           await sendMessage(chatId, "⚠️ 暂无分类，请先创建分类", config.tgBotToken);
           return;
         }
+  
         const categoriesText = categories.results.map((cat, i) => `${i + 1}. ${cat.name} (ID: ${cat.id})`).join('\n');
         const keyboard = {
           inline_keyboard: categories.results.map(cat => [
             { text: cat.name, callback_data: `set_category_${cat.id}` }
           ]).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
         };
-        await fetch(`https:
+  
+        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -727,37 +938,49 @@ async function initDatabase(config) {
           })
         });
       } else if (cbData === 'create_category') {
+        // 添加新建分类功能
         await Promise.all([
           sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken),
           config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?').bind('new_category', chatId).run()
         ]);
       } else if (cbData.startsWith('set_category_')) {
+        // 设置当前分类
         const categoryId = parseInt(cbData.split('_')[2]);
+        
+        // 并行执行更新操作和获取分类名称
         const [_, category] = await Promise.all([
           config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?').bind(categoryId, chatId).run(),
           config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(categoryId).first()
         ]);
+  
         await sendMessage(chatId, `✅ 已切换到分类: ${category?.name || '未知分类'}`, config.tgBotToken);
         await sendPanel(chatId, { ...userSetting, category_id: categoryId }, config);
       } else if (cbData === 'back_to_panel') {
+        // 等待answerPromise完成，确保回调已确认
         await answerPromise;
         await sendPanel(chatId, userSetting, config);
       } else if (cbData === 'stats') {
+        // 获取用户统计信息 - 并行执行查询
         await answerPromise;
+        
         const stats = await config.database.prepare(`
           SELECT COUNT(*) as total_files,
                  SUM(file_size) as total_size,
                  COUNT(DISTINCT category_id) as total_categories
           FROM files WHERE chat_id = ?
         `).bind(chatId).first();
+  
         const statsMessage = `📊 您的使用统计
     ─────────────
     📁 总文件数: ${stats.total_files || 0}
     📊 总存储量: ${formatSize(stats.total_size || 0)}
     📋 使用分类: ${stats.total_categories || 0}个`;
+  
         await sendMessage(chatId, statsMessage, config.tgBotToken);
       } else if (cbData === 'edit_suffix') {
+        // 获取用户最近的5个文件 - 并行执行查询
         await answerPromise;
+        
         const recentFiles = await config.database.prepare(`
           SELECT id, url, fileId, file_name, created_at, storage_type 
           FROM files 
@@ -765,17 +988,22 @@ async function initDatabase(config) {
           ORDER BY created_at DESC 
           LIMIT 5
         `).bind(chatId).all();
+  
         if (!recentFiles.results || recentFiles.results.length === 0) {
           await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
           return;
         }
+  
+        // 创建键盘布局，包含用户最近上传的文件
         const keyboard = {
           inline_keyboard: recentFiles.results.map(file => {
             const fileName = file.file_name || getFileName(file.url);
             return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
           }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
         };
-        await fetch(`https:
+  
+        // 发送消息
+        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -785,24 +1013,36 @@ async function initDatabase(config) {
           })
         });
       } else if (cbData.startsWith('edit_suffix_file_')) {
+        // 获取文件ID并请求用户输入新后缀
         const fileId = cbData.split('_')[3];
+        
+        // 等待answerPromise完成，确保回调已确认
         await answerPromise;
+        
+        // 查询文件信息
         const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
         if (!file) {
           await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
           return;
         }
+  
+        // 从URL中提取文件名
         const fileName = getFileName(file.url);
         const fileNameParts = fileName.split('.');
-        const extension = fileNameParts.pop();
-        const currentSuffix = fileNameParts.join('.');
+        const extension = fileNameParts.pop(); // 获取扩展名
+        const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
+  
+        // 并行执行更新操作和发送消息
         await Promise.all([
           config.database.prepare('UPDATE user_settings SET waiting_for = ?, editing_file_id = ? WHERE chat_id = ?')
             .bind('new_suffix', fileId, chatId).run(),
           sendMessage(chatId, `📝 请回复此消息，输入文件的新后缀\n\n当前文件: ${fileName}\n当前后缀: ${currentSuffix}`, config.tgBotToken)
         ]);
+        
       } else if (cbData === 'recent_files') {
+        // 获取用户最近的10个文件 - 并行执行查询
         await answerPromise;
+        
         const recentFiles = await config.database.prepare(`
           SELECT id, url, created_at, file_name, storage_type 
           FROM files 
@@ -810,21 +1050,25 @@ async function initDatabase(config) {
           ORDER BY created_at DESC 
           LIMIT 10
         `).bind(chatId).all();
+  
         if (!recentFiles.results || recentFiles.results.length === 0) {
           await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
           return;
         }
+  
         const filesList = recentFiles.results.map((file, i) => {
           const fileName = file.file_name || getFileName(file.url);
           const date = new Date(file.created_at * 1000).toLocaleString();
           return `${i + 1}. ${fileName}\n   📅 ${date}\n   🔗 ${file.url}`;
         }).join('\n\n');
+  
         const keyboard = {
           inline_keyboard: [
             [{ text: "« 返回", callback_data: "back_to_panel" }]
           ]
         };
-        await fetch(`https:
+  
+        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -837,26 +1081,40 @@ async function initDatabase(config) {
       }
     } catch (error) {
       console.error('处理回调查询时出错:', error);
+      // 确保answerPromise完成
       await answerPromise;
+      // 通知用户出错
       sendMessage(chatId, `❌ 处理请求时出错: ${error.message}`, config.tgBotToken);
     }
   }
+  
   async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
+    // 发送处理状态消息
     const processingMessage = await sendMessage(chatId, "⏳ 正在处理您的文件，请稍候...", config.tgBotToken);
     const processingMessageId = processingMessage?.result?.message_id;
+    
     try {
+      // 记录原始文件信息，用于诊断
       console.log('原始文件信息:', JSON.stringify(file));
-      const response = await fetch(`https:
+      
+      // 第一步：获取文件内容
+      const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`);
       const data = await response.json();
       if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
+  
       console.log('获取到文件路径:', data.result.file_path);
-      const telegramUrl = `https:
+      
+      const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
       const fileResponse = await fetch(telegramUrl);
+  
       if (!fileResponse.ok) throw new Error(`获取文件内容失败: ${fileResponse.status} ${fileResponse.statusText}`);
       const contentLength = fileResponse.headers.get('content-length');
+    
+      // 检查文件大小
       if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
+        // 如果存在处理消息，删除它
         if (processingMessageId) {
-          await fetch(`https:
+          await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -865,29 +1123,43 @@ async function initDatabase(config) {
             })
           }).catch(err => console.error('删除处理消息失败:', err));
         }
+        
         await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
         return;
       }
+  
+      // 第二步：准备文件数据，与网页上传保持一致的格式
+      // 获取文件扩展名和MIME类型
       let fileName = '';
       let ext = '';
       let mimeType = file.mime_type || 'application/octet-stream';
+      
+      // 从文件路径提取扩展名
       const filePathExt = data.result.file_path.split('.').pop().toLowerCase();
+      
+      // 首先从文件名中识别扩展名
       if (file.file_name) {
         fileName = file.file_name;
         ext = (fileName.split('.').pop() || '').toLowerCase();
       } 
+      // 对于没有file_name的特殊类型(如语音消息)，从文件路径获取扩展名
       else if (filePathExt && filePathExt !== data.result.file_path.toLowerCase()) {
         ext = filePathExt;
       } 
+      // 最后从MIME类型获取扩展名
       else {
         ext = getExtensionFromMime(mimeType);
       }
+      
+      // 确保有有效的文件名
       if (!fileName) {
+        // 为不同类型的文件生成适当的文件名
         if (file.video_note) {
           fileName = `video_note_${Date.now()}.${ext}`;
         } else if (file.voice) {
           fileName = `voice_message_${Date.now()}.${ext}`;
         } else if (file.audio) {
+          // 使用音频的标题作为文件名，如果有的话
           fileName = (file.audio.title || `audio_${Date.now()}`) + `.${ext}`;
         } else if (file.video) {
           fileName = `video_${Date.now()}.${ext}`;
@@ -895,11 +1167,19 @@ async function initDatabase(config) {
           fileName = `file_${Date.now()}.${ext}`;
         }
       }
+      
+      // 确保MIME类型正确
       if (!mimeType || mimeType === 'application/octet-stream') {
         mimeType = getContentType(ext);
       }
-      const [mainType, subType] = mimeType.split('/');
-      console.log('处理文件:', { 
+      
+      // 分解MIME类型
+      const mimeParts = mimeType.split('/');
+      const mainType = mimeParts[0] || '';
+      const subType = mimeParts[1] || '';
+      
+      // 记录处理信息
+      console.log('处理文件:', JSON.stringify({ 
         fileName, 
         ext, 
         mimeType, 
@@ -907,8 +1187,10 @@ async function initDatabase(config) {
         subType, 
         size: contentLength,
         filePath: data.result.file_path
-      });
-      await fetch(`https:
+      }));
+      
+      // 更新处理状态消息
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -917,17 +1199,25 @@ async function initDatabase(config) {
           text: "⏳ 文件已接收，正在上传到存储..."
         })
       }).catch(err => console.error('更新处理消息失败:', err));
+      
+      // 第三步：根据存储类型(r2 或 telegram)处理文件存储
       const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
+      
+      // 获取分类ID
       let categoryId = null;
       if (userSetting && userSetting.category_id) {
         categoryId = userSetting.category_id;
       } else {
+        // 查找默认分类
         let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+        
+        // 如果默认分类不存在，创建它
         if (!defaultCategory) {
           try {
             console.log('默认分类不存在，正在创建...');
             const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
               .bind('默认分类', Date.now()).run();
+            
             const newDefaultId = result.meta && result.meta.last_row_id;
             if (newDefaultId) {
               defaultCategory = { id: newDefaultId };
@@ -935,28 +1225,39 @@ async function initDatabase(config) {
             }
           } catch (error) {
             console.error('创建默认分类失败:', error);
+            // 继续处理，但不使用分类
           }
         }
+        
         if (defaultCategory) {
           categoryId = defaultCategory.id;
         }
       }
+      
       let finalUrl, dbFileId, dbMessageId;
+      
+      // 使用时间戳+原文件名的组合作为文件名，保留原始文件名便于识别
       const timestamp = Date.now();
-      const originalFileName = fileName.replace(/[^a-zA-Z0-9\-\_\.]/g, '_');
+      const originalFileName = fileName.replace(/[^a-zA-Z0-9\-\_\.]/g, '_'); // 去除不安全字符
       const key = `${timestamp}_${originalFileName}`;
+      
       if (storageType === 'r2' && config.bucket) {
+        // 上传到R2存储
         const arrayBuffer = await fileResponse.arrayBuffer();
         await config.bucket.put(key, arrayBuffer, { 
           httpMetadata: { contentType: mimeType } 
         });
-        finalUrl = `https:
+        finalUrl = `https://${config.domain}/${key}`;
         dbFileId = key;
         dbMessageId = 0;
       } else {
+        // 使用Telegram存储
+        // 根据文件类型选择不同的发送方法
         let method, field;
         let messageId = null;
         let fileId = null;
+        
+        // 根据主类型和子类型确定使用哪种Telegram API方法
         if (mainType === 'image' && !['svg+xml', 'x-icon'].includes(subType)) {
           method = 'sendPhoto';
           field = 'photo';
@@ -967,43 +1268,58 @@ async function initDatabase(config) {
           method = 'sendAudio';
           field = 'audio';
         } else {
+          // 默认使用文档方式上传
           method = 'sendDocument';
           field = 'document';
         }
+        
         console.log('Telegram上传方法:', { method, field });
+        
+        // 重新发送到存储聊天
         const arrayBuffer = await fileResponse.arrayBuffer();
         const tgFormData = new FormData();
         tgFormData.append('chat_id', config.tgStorageChatId);
         const blob = new Blob([arrayBuffer], { type: mimeType });
         tgFormData.append(field, blob, fileName);
+        
+        // 添加文件说明，帮助识别
         if (field !== 'photo') {
           tgFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
         }
+        
         const tgResponse = await fetch(
-          `https:
+          `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
           { method: 'POST', body: tgFormData }
         );
+        
         if (!tgResponse.ok) {
           const errorText = await tgResponse.text();
           console.error('Telegram API错误:', errorText);
+          
+          // 如果发送失败，尝试用document方法重试一次
           if (method !== 'sendDocument') {
             console.log('尝试使用sendDocument方法重新上传');
+            
             const retryFormData = new FormData();
             retryFormData.append('chat_id', config.tgStorageChatId);
             retryFormData.append('document', blob, fileName);
             retryFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
+            
             const retryResponse = await fetch(
-              `https:
+              `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
               { method: 'POST', body: retryFormData }
             );
+            
             if (!retryResponse.ok) {
               console.error('Telegram文档上传也失败:', await retryResponse.text());
               throw new Error('Telegram文件上传失败');
             }
+            
             const retryData = await retryResponse.json();
             const retryResult = retryData.result;
             messageId = retryResult.message_id;
             fileId = retryResult.document?.file_id;
+            
             if (!fileId || !messageId) {
               throw new Error('重试上传后仍未获取到有效的文件ID');
             }
@@ -1014,9 +1330,11 @@ async function initDatabase(config) {
           const tgData = await tgResponse.json();
           const result = tgData.result;
           messageId = result.message_id;
+          
+          // 根据不同类型提取file_id
           if (field === 'photo') {
             const photos = result.photo;
-            fileId = photos[photos.length - 1]?.file_id;
+            fileId = photos[photos.length - 1]?.file_id; // 获取最大尺寸的图片ID
           } else if (field === 'video') {
             fileId = result.video?.file_id;
           } else if (field === 'audio') {
@@ -1025,13 +1343,17 @@ async function initDatabase(config) {
             fileId = result.document?.file_id;
           }
         }
+                      
         if (!fileId) throw new Error('未获取到文件ID');
         if (!messageId) throw new Error('未获取到tg消息ID');
-        finalUrl = `https:
+        
+        finalUrl = `https://${config.domain}/${key}`;
         dbFileId = fileId;
         dbMessageId = messageId;
       }
-      await fetch(`https:
+  
+      // 更新处理状态消息
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1040,7 +1362,10 @@ async function initDatabase(config) {
           text: "⏳ 正在写入数据库..."
         })
       }).catch(err => console.error('更新处理消息失败:', err));
-      const time = Date.now();
+      
+      // 第四步：写入数据库，与网页上传完全一致的格式
+      const time = Date.now(); // 毫秒级时间戳
+      
       await config.database.prepare(`
         INSERT INTO files (
           url, 
@@ -1058,16 +1383,18 @@ async function initDatabase(config) {
         finalUrl,
         dbFileId,
         dbMessageId,
-        time,
-        fileName,
+        time, // 使用毫秒级时间戳
+        fileName, // 现在使用原始文件名
         contentLength,
         mimeType,
         chatId,
         categoryId,
         storageType
       ).run();
+      
+      // 删除处理状态消息
       if (processingMessageId) {
-        await fetch(`https:
+        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1076,8 +1403,11 @@ async function initDatabase(config) {
           })
         }).catch(err => console.error('删除处理消息失败:', err));
       }
-      const qrCodeUrl = `https:
-      await fetch(`https:
+      
+      // 第五步：发送成功消息给用户
+      const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
+      
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1089,8 +1419,10 @@ async function initDatabase(config) {
       });
     } catch (error) {
       console.error("Error handling media upload:", error);
+      
+      // 删除处理状态消息
       if (processingMessageId) {
-        await fetch(`https:
+        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1099,24 +1431,36 @@ async function initDatabase(config) {
           })
         }).catch(err => console.error('删除处理消息失败:', err));
       }
+      
       await sendMessage(chatId, `❌ 上传失败: ${error.message}`, config.tgBotToken);
     }
   }
+  
   async function getTelegramFileUrl(fileId, botToken, config) {
-    const response = await fetch(`https:
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
     const data = await response.json();
     if (!data.ok) throw new Error('获取文件路径失败');
+    
+    // 获取文件路径
     const filePath = data.result.file_path;
+    
+    // 从路径中提取文件名和扩展名
     const fileName = filePath.split('/').pop();
+    
+    // 使用时间戳重命名文件，保持与其他上传一致
     const timestamp = Date.now();
     const fileExt = fileName.split('.').pop();
     const newFileName = `${timestamp}.${fileExt}`;
+    
+    // 返回域名格式URL
     if (config && config.domain) {
-      return `https:
+      return `https://${config.domain}/${newFileName}`;
     } else {
-      return `https:
+      // 仅在没有配置域名时才返回Telegram API链接
+      return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
     }
   }
+  
   function authenticate(request, config) {
     const cookies = request.headers.get("Cookie") || "";
     const authToken = cookies.match(/auth_token=([^;]+)/);
@@ -1136,6 +1480,7 @@ async function initDatabase(config) {
     }
     return false;
   }
+  
   async function handleAuthRequest(request, config) {
     if (config.enableAuth) {
       const isAuthenticated = authenticate(request, config);
@@ -1146,6 +1491,7 @@ async function initDatabase(config) {
     }
     return handleUploadRequest(request, config);
   }
+  
   async function handleLoginRequest(request, config) {
     if (request.method === 'POST') {
       const { username, password } = await request.json();
@@ -1174,6 +1520,7 @@ async function initDatabase(config) {
       headers: { 'Content-Type': 'text/html;charset=UTF-8' }
     });
   }
+  
   async function handleCreateCategoryRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return new Response(JSON.stringify({ status: 0, msg: "未授权" }), {
@@ -1181,6 +1528,7 @@ async function initDatabase(config) {
         headers: { 'Content-Type': 'application/json' }
       });
     }
+  
     try {
       const { name } = await request.json();
       if (!name || typeof name !== 'string' || name.trim() === '') {
@@ -1189,8 +1537,10 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
       const categoryName = name.trim();
       const time = Date.now();
+  
       const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
       if (existingCategory) {
         return new Response(JSON.stringify({ status: 0, msg: `分类 "${categoryName}" 已存在，请选择一个不同的名称！` }), {
@@ -1198,9 +1548,11 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
       await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
         .bind(categoryName, time).run();
       const category = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
+  
       return new Response(JSON.stringify({ status: 1, msg: "分类创建成功", category: { id: category.id, name: categoryName } }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -1211,6 +1563,7 @@ async function initDatabase(config) {
       });
     }
   }
+  
   async function handleDeleteCategoryRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return new Response(JSON.stringify({ status: 0, msg: "未授权" }), {
@@ -1218,6 +1571,7 @@ async function initDatabase(config) {
         headers: { 'Content-Type': 'application/json' }
       });
     }
+  
     try {
       const { id } = await request.json();
       if (!id || isNaN(id)) {
@@ -1226,14 +1580,18 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
+      // 检查是否是默认分类
       const isDefaultCategory = await config.database.prepare('SELECT id FROM categories WHERE id = ? AND name = ?')
         .bind(id, '默认分类').first();
+      
       if (isDefaultCategory) {
         return new Response(JSON.stringify({ status: 0, msg: "默认分类不能删除" }), {
           status: 403,
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
       const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(id).first();
       if (!category) {
         return new Response(JSON.stringify({ status: 0, msg: "分类不存在" }), {
@@ -1241,27 +1599,41 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
+      // 获取默认分类的ID
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?')
         .bind('默认分类').first();
+      
+      // 如果默认分类不存在，先创建它
       let defaultCategoryId;
       if (!defaultCategory) {
+        // 创建默认分类
         const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
           .bind('默认分类', Date.now()).run();
+        
         defaultCategoryId = result.meta && result.meta.last_row_id ? result.meta.last_row_id : null;
         console.log('创建了新的默认分类，ID:', defaultCategoryId);
       } else {
         defaultCategoryId = defaultCategory.id;
       }
+  
+      // 将当前分类下的文件移动到默认分类，而不是设为NULL
       if (defaultCategoryId) {
         await config.database.prepare('UPDATE files SET category_id = ? WHERE category_id = ?')
           .bind(defaultCategoryId, id).run();
+        
+        // 更新用户设置中的当前分类
         await config.database.prepare('UPDATE user_settings SET current_category_id = ? WHERE current_category_id = ?')
           .bind(defaultCategoryId, id).run();
       } else {
+        // 如果无法创建默认分类，则设为NULL
         await config.database.prepare('UPDATE files SET category_id = NULL WHERE category_id = ?').bind(id).run();
         await config.database.prepare('UPDATE user_settings SET current_category_id = NULL WHERE current_category_id = ?').bind(id).run();
       }
+  
+      // 删除请求的分类
       await config.database.prepare('DELETE FROM categories WHERE id = ?').bind(id).run();
+  
       return new Response(JSON.stringify({ 
         status: 1, 
         msg: `分类 "${category.name}" 删除成功${defaultCategoryId ? '，相关文件已移至默认分类' : ''}` 
@@ -1276,15 +1648,18 @@ async function initDatabase(config) {
       });
     }
   }
+  
   async function handleUploadRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
+  
     if (request.method === 'GET') {
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
       const categoryOptions = categories.results.length
         ? categories.results.map(c => `<option value="${c.id}">${c.name}</option>`).join('')
         : '<option value="">暂无分类</option>';
+  
       const chatId = config.tgChatId[0];
       let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
       if (!userSetting) {
@@ -1293,25 +1668,33 @@ async function initDatabase(config) {
           .bind(chatId, 'telegram', defaultCategory.id).run();
         userSetting = { storage_type: 'telegram', current_category_id: defaultCategory.id };
       }
+  
       const html = generateUploadPage(categoryOptions, userSetting.storage_type);
       return new Response(html, {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
       });
     }
+  
     try {
       const formData = await request.formData();
       const file = formData.get('file');
       const categoryId = formData.get('category');
       const storageType = formData.get('storage_type');
+  
       if (!file) throw new Error('未找到文件');
       if (file.size > config.maxSizeMB * 1024 * 1024) throw new Error(`文件超过${config.maxSizeMB}MB限制`);
+  
       const chatId = config.tgChatId[0];
+      // 查找默认分类
       let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      
+      // 如果默认分类不存在，创建它
       if (!defaultCategory) {
         try {
           console.log('默认分类不存在，正在创建...');
           const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
             .bind('默认分类', Date.now()).run();
+          
           const newDefaultId = result.meta && result.meta.last_row_id;
           if (newDefaultId) {
             defaultCategory = { id: newDefaultId };
@@ -1319,12 +1702,15 @@ async function initDatabase(config) {
           }
         } catch (error) {
           console.error('创建默认分类失败:', error);
+          // 使用categoryId参数或null
           defaultCategory = { id: categoryId || null };
         }
       }
+      
       const finalCategoryId = categoryId || (defaultCategory ? defaultCategory.id : null);
       await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
         .bind(storageType, finalCategoryId, chatId).run();
+  
       const ext = (file.name.split('.').pop() || '').toLowerCase();
       const mimeType = getContentType(ext);
       const [mainType] = mimeType.split('/');
@@ -1334,15 +1720,17 @@ async function initDatabase(config) {
         audio: { method: 'sendAudio', field: 'audio' }
       };
       let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
+  
       if (['application', 'text'].includes(mainType)) {
         method = 'sendDocument';
         field = 'document';
       }
+  
       let finalUrl, dbFileId, dbMessageId;
       if (storageType === 'r2') {
         const key = `${Date.now()}.${ext}`;
         await config.bucket.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: mimeType } });
-        finalUrl = `https:
+        finalUrl = `https://${config.domain}/${key}`;
         dbFileId = key;
         dbMessageId = -1;
       } else {
@@ -1350,10 +1738,11 @@ async function initDatabase(config) {
         tgFormData.append('chat_id', config.tgStorageChatId);
         tgFormData.append(field, file, file.name);
         const tgResponse = await fetch(
-          `https:
+          `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
           { method: 'POST', body: tgFormData }
         );
         if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
+  
         const tgData = await tgResponse.json();
         const result = tgData.result;
         const messageId = result.message_id;
@@ -1363,13 +1752,16 @@ async function initDatabase(config) {
                        (result.photo && result.photo[result.photo.length - 1]?.file_id);
         if (!fileId) throw new Error('未获取到文件ID');
         if (!messageId) throw new Error('未获取到tg消息ID');
-        finalUrl = `https:
+  
+        finalUrl = `https://${config.domain}/${Date.now()}.${ext}`;
         dbFileId = fileId;
         dbMessageId = messageId;
       }
+  
       const time = Date.now();
       const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
-      const url = `https:
+      const url = `https://${config.domain}/${time}.${ext}`;
+  
       await config.database.prepare(`
         INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1384,6 +1776,7 @@ async function initDatabase(config) {
         storageType,
         finalCategoryId
       ).run();
+  
       return new Response(
         JSON.stringify({ status: 1, msg: "✔ 上传成功", url }),
         { headers: { 'Content-Type': 'application/json' } }
@@ -1406,10 +1799,12 @@ async function initDatabase(config) {
       );
     }
   }
+  
   async function handleDeleteMultipleRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
+  
     try {
       const { urls } = await request.json();
       if (!Array.isArray(urls) || urls.length === 0) {
@@ -1421,27 +1816,37 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
       const results = {
         success: [],
         failed: []
       };
+  
       for (const url of urls) {
         try {
+          // 从URL获取文件名以便双重查询
           const fileName = url.split('/').pop();
+          
+          // 尝试通过URL查找文件
           let file = await config.database.prepare(
             'SELECT id, fileId, message_id, storage_type FROM files WHERE url = ?'
           ).bind(url).first();
+          
+          // 如果找不到，尝试通过文件名查找
           if (!file && fileName) {
             file = await config.database.prepare(
               'SELECT id, fileId, message_id, storage_type FROM files WHERE fileId = ?'
             ).bind(fileName).first();
           }
+          
           if (file) {
             console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
+            
+            // 从存储中删除文件
             if (file.storage_type === 'telegram' && file.message_id) {
               try {
                 await fetch(
-                  `https:
+                  `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
                 );
                 console.log(`已从Telegram删除消息: ${file.message_id}`);
               } catch (error) {
@@ -1455,8 +1860,11 @@ async function initDatabase(config) {
                 console.error(`从R2删除文件失败: ${error.message}`);
               }
             }
+            
+            // 从数据库删除记录
             await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
             console.log(`已从数据库删除记录: ID=${file.id}`);
+            
             results.success.push(url);
           } else {
             console.log(`未找到文件记录: ${url}`);
@@ -1467,6 +1875,7 @@ async function initDatabase(config) {
           results.failed.push({url, reason: error.message});
         }
       }
+  
       return new Response(
         JSON.stringify({ 
           status: 1, 
@@ -1490,23 +1899,28 @@ async function initDatabase(config) {
       );
     }
   }
+  
   async function handleAdminRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
+  
     try {
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
       const categoryOptions = categories.results.length
         ? categories.results.map(c => `<option value="${c.id}">${c.name}</option>`).join('')
         : '<option value="">暂无分类</option>';
+  
       const files = await config.database.prepare(`
         SELECT f.url, f.fileId, f.message_id, f.created_at, f.file_name, f.file_size, f.mime_type, f.storage_type, c.name as category_name, c.id as category_id
         FROM files f
         LEFT JOIN categories c ON f.category_id = c.id
         ORDER BY f.created_at DESC
       `).all();
+  
       const fileList = files.results || [];
       console.log(`文件总数: ${fileList.length}`);
+      
       const fileCards = fileList.map(file => {
           const url = file.url;
           return `
@@ -1529,6 +1943,7 @@ async function initDatabase(config) {
             </div>
           `;
       }).join('');
+  
       const html = generateAdminPage(fileCards, categoryOptions);
       return new Response(html, {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
@@ -1538,10 +1953,12 @@ async function initDatabase(config) {
       return new Response(`加载文件列表失败，请检查数据库配置：${error.message}`, { status: 500 });
     }
   }
+  
   async function handleSearchRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
+  
     try {
       const { query } = await request.json();
       const searchPattern = `%${query}%`;
@@ -1552,6 +1969,7 @@ async function initDatabase(config) {
          COLLATE NOCASE
          ORDER BY created_at DESC
       `).bind(searchPattern).all();
+  
       return new Response(
         JSON.stringify({ files: files.results || [] }),
         { headers: { 'Content-Type': 'application/json' } }
@@ -1564,11 +1982,13 @@ async function initDatabase(config) {
       );
     }
   }
+  
   function getPreviewHtml(url) {
     const ext = (url.split('.').pop() || '').toLowerCase();
     const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'icon'].includes(ext);
     const isVideo = ['mp4', 'webm'].includes(ext);
     const isAudio = ['mp3', 'wav', 'ogg'].includes(ext);
+  
     if (isImage) {
       return `<img src="${url}" alt="预览">`;
     } else if (isVideo) {
@@ -1579,107 +1999,156 @@ async function initDatabase(config) {
       return `<div style="font-size: 48px">📄</div>`;
     }
   }
+  
   async function handleFileRequest(request, config) {
     try {
       const url = new URL(request.url);
       const path = decodeURIComponent(url.pathname.slice(1));
+  
       if (!path) {
         return new Response('Not Found', { status: 404 });
       }
+      
+      // 设置公共头部，确保图片等媒体可以正常显示
       const getCommonHeaders = (contentType) => {
         const headers = new Headers();
         headers.set('Content-Type', contentType);
         headers.set('Access-Control-Allow-Origin', '*');
+        
+        // 关键：确保媒体文件使用inline展示
         if (contentType.startsWith('image/') || 
             contentType.startsWith('video/') || 
             contentType.startsWith('audio/')) {
           headers.set('Content-Disposition', 'inline');
         }
+        
+        // 添加缓存相关头
         headers.set('Cache-Control', 'public, max-age=31536000');
+        
         return headers;
       };
+  
+      // 先尝试直接从R2存储获取文件
       if (config.bucket) {
         try {
           const object = await config.bucket.get(path);
+          
           if (object) {
             const contentType = object.httpMetadata.contentType || getContentType(path.split('.').pop());
             const headers = getCommonHeaders(contentType);
             object.writeHttpMetadata(headers);
             headers.set('etag', object.httpEtag);
+            
             return new Response(object.body, { headers });
           }
         } catch (error) {
+          // 只记录真正的错误，避免记录文件不存在的普通情况
           if (error.name !== 'NoSuchKey') {
             console.error('R2获取文件错误:', error.name);
           }
+          // 继续尝试其他方式获取文件
         }
       }
+  
+      // 从数据库查询文件记录
       let file;
-      const urlPattern = `https:
+      
+      // 尝试多种方式查找文件记录
+      const urlPattern = `https://${config.domain}/${path}`;
+      
+      // 1. 通过完整URL查询
       file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
+      
+      // 2. 通过文件名作为fileId查询
       if (!file) {
         file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
       }
+      
+      // 3. 通过文件名查询
       if (!file) {
         const fileName = path.split('/').pop();
         file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
       }
+  
       if (!file) {
+        // 文件不存在属于正常情况，不需要记录
         return new Response('File not found', { status: 404 });
       }
+  
+      // 根据存储类型处理文件
       if (file.storage_type === 'telegram') {
+        // 处理Telegram存储的文件
         try {
+          // 确保使用Telegram的原始文件ID (存储在fileId字段)
           const telegramFileId = file.fileId;
+          
           if (!telegramFileId) {
             console.error('文件记录缺少Telegram fileId');
             return new Response('Missing Telegram file ID', { status: 500 });
           }
-          const response = await fetch(`https:
+          
+          // 从Telegram获取文件链接
+          const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
           const data = await response.json();
+          
           if (!data.ok) {
             console.error('Telegram getFile 失败:', data.description);
             return new Response('Failed to get file from Telegram', { status: 500 });
           }
-          const telegramUrl = `https:
+          
+          const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+          
           const fileResponse = await fetch(telegramUrl);
+          
           if (!fileResponse.ok) {
             console.error(`从Telegram获取文件失败: ${fileResponse.status}`);
             return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
           }
+          
           const contentType = file.mime_type || getContentType(path.split('.').pop());
           const headers = getCommonHeaders(contentType);
+          
+          // 流式传输文件内容，避免内存占用过大
           return new Response(fileResponse.body, { headers });
         } catch (error) {
           console.error('处理Telegram文件出错:', error.message);
           return new Response('Error processing Telegram file', { status: 500 });
         }
       } else if (file.storage_type === 'r2' && config.bucket) {
+        // 如果是R2存储但前面直接访问失败，再尝试通过fileId获取
         try {
           const object = await config.bucket.get(file.fileId);
+          
           if (object) {
             const contentType = object.httpMetadata.contentType || file.mime_type || getContentType(path.split('.').pop());
             const headers = getCommonHeaders(contentType);
             object.writeHttpMetadata(headers);
             headers.set('etag', object.httpEtag);
+            
             return new Response(object.body, { headers });
           }
         } catch (error) {
           console.error('通过fileId从R2获取文件出错:', error.message);
         }
       }
+      
+      // 如果上述方法都失败，尝试重定向到文件URL
       if (file.url && file.url !== urlPattern) {
         return Response.redirect(file.url, 302);
       }
+      
       return new Response('File not available', { status: 404 });
     } catch (error) {
       console.error('处理文件请求出错:', error.message);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
+  
   async function handleDeleteRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
       return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
+  
     try {
       const { id, fileId } = await request.json();
       if (!id && !fileId) {
@@ -1690,15 +2159,22 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
+      // 查询文件信息，支持通过URL或文件ID查询
       let file;
       if (id && id.startsWith('http')) {
+        // 如果是URL格式，通过URL查询
         file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(id).first();
       } else if (id) {
+        // 否则按ID查询
         file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(id).first();
       }
+      
+      // 如果上面的查询没找到且提供了fileId，尝试通过fileId查询
       if (!file && fileId) {
         file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(fileId).first();
       }
+  
       if (!file) {
         return new Response(JSON.stringify({
           status: 0,
@@ -1707,17 +2183,23 @@ async function initDatabase(config) {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+  
       console.log('准备删除文件:', {
         fileId: file.fileId,
         url: file.url,
         存储类型: file.storage_type
       });
+  
+      // 尝试从存储中删除文件
       if (file.storage_type === 'r2' && config.bucket) {
         await deleteFile(file.fileId, config);
         console.log('已从R2存储中删除文件:', file.fileId);
       }
+  
+      // 从数据库中删除文件记录
       await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
       console.log('已从数据库中删除文件记录');
+  
       return new Response(JSON.stringify({
         status: 1,
         message: '删除成功'
@@ -1734,8 +2216,10 @@ async function initDatabase(config) {
       });
     }
   }
+  
   function getContentType(ext) {
     const types = {
+      // 图片类型
       jpg: 'image/jpeg',
       jpeg: 'image/jpeg',
       png: 'image/png',
@@ -1748,6 +2232,8 @@ async function initDatabase(config) {
       bmp: 'image/bmp',
       tiff: 'image/tiff',
       tif: 'image/tiff',
+      
+      // 视频类型
       mp4: 'video/mp4',
       webm: 'video/webm',
       ogg: 'video/ogg',
@@ -1759,6 +2245,8 @@ async function initDatabase(config) {
       mkv: 'video/x-matroska',
       m4v: 'video/x-m4v',
       ts: 'video/mp2t',
+      
+      // 音频类型
       mp3: 'audio/mpeg',
       wav: 'audio/wav',
       ogg: 'audio/ogg',
@@ -1766,6 +2254,8 @@ async function initDatabase(config) {
       aac: 'audio/aac',
       flac: 'audio/flac',
       wma: 'audio/x-ms-wma',
+      
+      // 文档类型
       pdf: 'application/pdf',
       doc: 'application/msword',
       docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -1774,6 +2264,8 @@ async function initDatabase(config) {
       ppt: 'application/vnd.ms-powerpoint',
       pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
       rtf: 'application/rtf',
+      
+      // 文本类型
       txt: 'text/plain',
       md: 'text/markdown',
       csv: 'text/csv',
@@ -1783,21 +2275,29 @@ async function initDatabase(config) {
       js: 'application/javascript',
       xml: 'application/xml',
       json: 'application/json',
+      
+      // 压缩文件
       zip: 'application/zip',
       rar: 'application/x-rar-compressed',
       '7z': 'application/x-7z-compressed',
       tar: 'application/x-tar',
       gz: 'application/gzip',
+      
+      // 其他类型
       swf: 'application/x-shockwave-flash',
       ttf: 'font/ttf',
       otf: 'font/otf',
       woff: 'font/woff',
       woff2: 'font/woff2',
       eot: 'application/vnd.ms-fontobject',
+      
+      // 配置文件
       ini: 'text/plain',
       yml: 'application/yaml',
       yaml: 'application/yaml',
       toml: 'text/plain',
+      
+      // 编程类文件
       py: 'text/x-python',
       java: 'text/x-java',
       c: 'text/x-c',
@@ -1811,26 +2311,32 @@ async function initDatabase(config) {
       bat: 'application/x-bat',
       sql: 'application/sql'
     };
+    
     const lowerExt = ext.toLowerCase();
     return types[lowerExt] || 'application/octet-stream';
   }
+  
   async function handleBingImagesRequest() {
     const cache = caches.default;
-    const cacheKey = new Request('https:
+    const cacheKey = new Request('https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=5');
+  
     const cachedResponse = await cache.match(cacheKey);
     if (cachedResponse) {
       console.log('Returning cached response');
       return cachedResponse;
     }
+  
     try {
       const res = await fetch(cacheKey);
       if (!res.ok) {
         console.error(`Bing API 请求失败，状态码：${res.status}`);
         return new Response('请求 Bing API 失败', { status: res.status });
       }
+  
       const bingData = await res.json();
-      const images = bingData.images.map(image => ({ url: `https:
+      const images = bingData.images.map(image => ({ url: `https://cn.bing.com${image.url}` }));
       const returnData = { status: true, message: "操作成功", data: images };
+  
       const response = new Response(JSON.stringify(returnData), {
         status: 200,
         headers: {
@@ -1839,6 +2345,7 @@ async function initDatabase(config) {
           'Access-Control-Allow-Origin': '*'
         }
       });
+  
       await cache.put(cacheKey, response.clone());
       console.log('响应数据已缓存');
       return response;
@@ -1847,6 +2354,7 @@ async function initDatabase(config) {
       return new Response('请求 Bing API 失败', { status: 500 });
     }
   }
+  
   function formatSize(bytes) {
     const units = ['B', 'KB', 'MB', 'GB'];
     let size = bytes;
@@ -1857,14 +2365,24 @@ async function initDatabase(config) {
     }
     return `${size.toFixed(2)} ${units[unitIndex]}`;
   }
+  
+  // 格式化日期，处理不同格式的时间戳
   function formatDate(timestamp) {
     if (!timestamp) return '未知时间';
+    
     let date;
+    
+    // 处理数字型时间戳（秒或毫秒）
     if (typeof timestamp === 'number') {
+      // 判断是秒还是毫秒
       date = timestamp > 9999999999 ? new Date(timestamp) : new Date(timestamp * 1000);
     } 
+    // 处理字符串型时间戳
     else if (typeof timestamp === 'string') {
+      // 尝试直接解析
       date = new Date(timestamp);
+      
+      // 检查是否为有效日期，如果无效则尝试作为数字解析
       if (isNaN(date.getTime())) {
         const numTimestamp = parseInt(timestamp);
         if (!isNaN(numTimestamp)) {
@@ -1872,14 +2390,20 @@ async function initDatabase(config) {
         }
       }
     }
+    // 默认返回当前时间
     else {
       date = new Date();
     }
+    
+    // 检查日期是否有效
     if (isNaN(date.getTime()) || date.getFullYear() < 2000) {
       return '日期无效';
     }
+    
+    // 格式化为本地时间字符串
     return date.toLocaleString();
   }
+  
   async function sendMessage(chatId, text, botToken, replyToMessageId = null) {
     try {
       const messageData = {
@@ -1887,30 +2411,35 @@ async function initDatabase(config) {
         text: text,
         parse_mode: 'HTML'
       };
+      
       if (replyToMessageId) {
         messageData.reply_to_message_id = replyToMessageId;
       }
-      const response = await fetch(`https:
+      
+      const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(messageData)
       });
+      
       if (!response.ok) {
         const errorData = await response.json();
         console.error('发送消息失败:', errorData);
         return null;
       }
+      
       return await response.json();
     } catch (error) {
       console.error('发送消息时出错:', error);
       return null;
     }
   }
+  
   function generateLoginPage() {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https:
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1969,6 +2498,7 @@ async function initDatabase(config) {
         button:hover {
           background: #0056b3;
         }
+        
         /* 美化弹窗样式 */
         .modal {
           display: none;
@@ -2036,18 +2566,21 @@ async function initDatabase(config) {
           }
           setBingBackground();
           setInterval(setBingBackground, 3600000);
+  
           const loginForm = document.getElementById('loginForm');
           if (loginForm) {
             loginForm.addEventListener('submit', async (e) => {
               e.preventDefault();
               const username = document.getElementById('username').value;
               const password = document.getElementById('password').value;
+              
               try {
                 const response = await fetch('/', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ username, password })
                 });
+                
                 if (response.ok) {
                   window.location.href = '/upload';
                 } else {
@@ -2072,11 +2605,12 @@ async function initDatabase(config) {
     </body>
     </html>`;
   }
+  
   function generateUploadPage(categoryOptions, storageType) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https:
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2307,6 +2841,7 @@ async function initDatabase(config) {
         .copyright a:hover {
           text-decoration: underline;
         }
+        
         /* 美化弹窗样式 */
         .modal {
           display: none;
@@ -2420,10 +2955,11 @@ async function initDatabase(config) {
               <button onclick="copyUrls('html')">复制HTML</button>
             </div>
             <div class="copyright">
-              <span>© 2025 Copyright by <a href="https:
+              <span>© 2025 Copyright by <a href="https://github.com/iawooo/cftc" target="_blank">AWEI's GitHub</a> | <a href="https://awbk.pp.ua/" target="_blank">阿伟</a></span>
             </div>
           </div>
         </div>
+        
         <!-- 通用确认弹窗 -->
         <div id="confirmModal" class="modal">
           <div class="modal-content">
@@ -2436,6 +2972,7 @@ async function initDatabase(config) {
           </div>
         </div>
       </div>
+  
       <script>
         async function setBingBackground() {
           try {
@@ -2451,6 +2988,7 @@ async function initDatabase(config) {
         }
         setBingBackground();
         setInterval(setBingBackground, 3600000);
+  
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
         const previewArea = document.getElementById('previewArea');
@@ -2462,20 +3000,24 @@ async function initDatabase(config) {
         const confirmModalMessage = document.getElementById('confirmModalMessage');
         const confirmModalConfirm = document.getElementById('confirmModalConfirm');
         const confirmModalCancel = document.getElementById('confirmModalCancel');
+        
         let uploadedUrls = [];
         let currentConfirmCallback = null;
+  
         storageButtons.forEach(btn => {
           btn.addEventListener('click', () => {
             storageButtons.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
           });
         });
+  
         async function createNewCategory() {
           const categoryName = newCategoryInput.value.trim();
           if (!categoryName) {
             showConfirmModal('分类名称不能为空！', null, true);
             return;
           }
+  
           try {
             const response = await fetch('/create-category', {
               method: 'POST',
@@ -2483,6 +3025,7 @@ async function initDatabase(config) {
               body: JSON.stringify({ name: categoryName })
             });
             const data = await response.json();
+  
             if (data.status === 1) {
               const option = document.createElement('option');
               option.value = data.category.id;
@@ -2498,10 +3041,15 @@ async function initDatabase(config) {
             showConfirmModal('创建分类失败：' + error.message, null, true);
           }
         }
+  
+        // 显示确认弹窗
         function showConfirmModal(message, callback, alertOnly = false) {
+          // 如果已有弹窗显示，先关闭它
           closeConfirmModal();
+          
           confirmModalMessage.textContent = message;
           currentConfirmCallback = callback;
+          
           if (alertOnly) {
             confirmModalConfirm.textContent = '确定';
             confirmModalCancel.style.display = 'none';
@@ -2509,58 +3057,78 @@ async function initDatabase(config) {
             confirmModalConfirm.textContent = '确认';
             confirmModalCancel.style.display = 'inline-block';
           }
+          
           confirmModal.classList.add('show');
         }
+  
+        // 关闭确认弹窗
         function closeConfirmModal() {
           confirmModal.classList.remove('show');
         }
+  
+        // 确认按钮事件
         confirmModalConfirm.addEventListener('click', () => {
           if (currentConfirmCallback) {
             currentConfirmCallback();
           }
           closeConfirmModal();
         });
+  
+        // 取消按钮事件
         confirmModalCancel.addEventListener('click', closeConfirmModal);
+  
+        // 点击弹窗外部关闭弹窗
         window.addEventListener('click', (event) => {
           if (event.target === confirmModal) {
             closeConfirmModal();
           }
+          
           const qrModal = document.getElementById('qrModal');
           if (event.target === qrModal) {
             qrModal.style.display = 'none';
           }
+          
           if (event.target === editSuffixModal) {
             editSuffixModal.classList.remove('show');
           }
         });
+  
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
           uploadArea.addEventListener(eventName, preventDefaults, false);
           document.body.addEventListener(eventName, preventDefaults, false);
         });
+  
         function preventDefaults(e) {
           e.preventDefault();
           e.stopPropagation();
         }
+  
         ['dragenter', 'dragover'].forEach(eventName => {
           uploadArea.addEventListener(eventName, highlight, false);
         });
+  
         ['dragleave', 'drop'].forEach(eventName => {
           uploadArea.addEventListener(eventName, unhighlight, false);
         });
+  
         function highlight(e) {
           uploadArea.classList.add('dragover');
         }
+  
         function unhighlight(e) {
           uploadArea.classList.remove('dragover');
         }
+  
         uploadArea.addEventListener('drop', handleDrop, false);
         uploadArea.addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', handleFiles);
+  
         function handleDrop(e) {
           const dt = e.dataTransfer;
           const files = dt.files;
           handleFiles({ target: { files } });
         }
+  
         document.addEventListener('paste', async (e) => {
           const items = (e.clipboardData || e.originalEvent.clipboardData).items;
           for (let item of items) {
@@ -2570,6 +3138,7 @@ async function initDatabase(config) {
             }
           }
         });
+  
         async function handleFiles(e) {
           const response = await fetch('/config');
           if (!response.ok) {
@@ -2585,12 +3154,15 @@ async function initDatabase(config) {
             await uploadFile(file);
           }
         }
+  
         async function uploadFile(file) {
           const preview = createPreview(file);
           previewArea.appendChild(preview);
+  
           const xhr = new XMLHttpRequest();
           const progressTrack = preview.querySelector('.progress-track');
           const progressText = preview.querySelector('.progress-text');
+  
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
               const percent = Math.round((e.loaded / e.total) * 100);
@@ -2598,6 +3170,7 @@ async function initDatabase(config) {
               progressText.textContent = \`\${percent}%\`;
             }
           });
+  
           xhr.addEventListener('load', () => {
             try {
               const data = JSON.parse(xhr.responseText);
@@ -2617,6 +3190,7 @@ async function initDatabase(config) {
               preview.classList.add('error');
             }
           });
+  
           const formData = new FormData();
           formData.append('file', file);
           formData.append('category', categorySelect.value);
@@ -2624,14 +3198,17 @@ async function initDatabase(config) {
           xhr.open('POST', '/upload');
           xhr.send(formData);
         }
+  
         function createPreview(file) {
           const div = document.createElement('div');
           div.className = 'preview-item';
+          
           if (file.type.startsWith('image/')) {
             const img = document.createElement('img');
             img.src = URL.createObjectURL(file);
             div.appendChild(img);
           }
+  
           const info = document.createElement('div');
           info.className = 'info';
           info.innerHTML = \`
@@ -2643,8 +3220,10 @@ async function initDatabase(config) {
             </div>
           \`;
           div.appendChild(info);
+  
           return div;
         }
+  
         function formatSize(bytes) {
           const units = ['B', 'KB', 'MB', 'GB'];
           let size = bytes;
@@ -2655,9 +3234,11 @@ async function initDatabase(config) {
           }
           return \`\${size.toFixed(2)} \${units[unitIndex]}\`;
         }
+  
         function updateUrlArea() {
           urlArea.value = uploadedUrls.join('\\n');
         }
+  
         function copyUrls(format) {
           let text = '';
           switch (format) {
@@ -2683,17 +3264,18 @@ async function initDatabase(config) {
     </body>
     </html>`;
   }
+  
   function generateAdminPage(fileCards, categoryOptions) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https:
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>文件管理</title>
       <!-- 确保QR码库在页面加载前就可用 -->
-      <script src="https:
+      <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
       <style>
         body {
           font-family: 'Segoe UI', Arial, sans-serif;
@@ -2921,6 +3503,7 @@ async function initDatabase(config) {
         .btn-edit:hover {
           background: #e67e22;
         }
+        
         /* 美化弹窗样式 */
         .modal {
           display: none;
@@ -2998,6 +3581,7 @@ async function initDatabase(config) {
         .modal-cancel:hover {
           background: #7f8c8d;
         }
+        
         /* 二维码弹窗样式 */
         #qrModal {
           display: none;
@@ -3094,6 +3678,7 @@ async function initDatabase(config) {
         .qr-close:hover {
           background: #7f8c8d;
         }
+        
         /* 修改后缀弹窗样式 */
         #editSuffixModal {
           display: none;
@@ -3141,6 +3726,7 @@ async function initDatabase(config) {
             </select>
           </div>
         </div>
+        
         <div class="action-bar">
           <div class="action-bar-left">
             <h3>文件操作：</h3>
@@ -3155,9 +3741,11 @@ async function initDatabase(config) {
             <button class="action-button delete-category-btn" id="deleteCategoryBtn">删除分类</button>
           </div>
         </div>
+        
         <div class="grid" id="fileGrid">
           ${fileCards}
         </div>
+        
         <!-- 确认删除弹窗 -->
         <div id="confirmModal" class="modal">
           <div class="modal-content">
@@ -3169,6 +3757,7 @@ async function initDatabase(config) {
             </div>
           </div>
         </div>
+        
         <!-- 修改后缀弹窗 -->
         <div id="editSuffixModal" class="modal">
           <div class="modal-content">
@@ -3181,10 +3770,15 @@ async function initDatabase(config) {
           </div>
         </div>
       </div>
+  
       <script>
+        // 全局变量声明
         let currentShareUrl = '';
         let currentConfirmCallback = null;
         let currentEditUrl = '';
+        let confirmModal, confirmModalMessage, confirmModalConfirm, confirmModalCancel, editSuffixModal;
+
+        // 设置背景图片
         async function setBingBackground() {
           try {
             const response = await fetch('/bing', { cache: 'no-store' });
@@ -3197,9 +3791,13 @@ async function initDatabase(config) {
             console.error('获取背景图失败:', error);
           }
         }
+        // 延迟加载背景，优先显示内容
         setTimeout(setBingBackground, 1000);
+        
+        // DOM加载完成后初始化
         document.addEventListener('DOMContentLoaded', function() {
           console.log('DOM已加载，初始化页面...');
+          // 获取DOM元素引用
           const searchInput = document.getElementById('searchInput');
           const categoryFilter = document.getElementById('categoryFilter');
           const fileGrid = document.getElementById('fileGrid');
@@ -3212,10 +3810,13 @@ async function initDatabase(config) {
           confirmModalConfirm = document.getElementById('confirmModalConfirm');
           confirmModalCancel = document.getElementById('confirmModalCancel');
           editSuffixModal = document.getElementById('editSuffixModal');
+          
           console.log('页面元素引用:', {
             confirmModal: !!confirmModal,
             editSuffixModal: !!editSuffixModal
           });
+          
+          // 绑定事件处理器
           if (searchInput) searchInput.addEventListener('input', filterFiles);
           if (categoryFilter) categoryFilter.addEventListener('change', filterFiles);
           if (selectAllBtn) selectAllBtn.addEventListener('click', toggleSelectAll);
@@ -3223,64 +3824,94 @@ async function initDatabase(config) {
           if (deleteCategoryBtn) deleteCategoryBtn.addEventListener('click', confirmDeleteCategory);
           if (confirmModalConfirm) confirmModalConfirm.addEventListener('click', handleConfirmModalConfirm);
           if (confirmModalCancel) confirmModalCancel.addEventListener('click', closeConfirmModal);
+          
+          // 初始化修改后缀对话框
           const editSuffixConfirm = document.getElementById('editSuffixConfirm');
           const editSuffixCancel = document.getElementById('editSuffixCancel');
+          
           if (editSuffixCancel) {
             editSuffixCancel.addEventListener('click', () => {
               if (editSuffixModal) editSuffixModal.classList.remove('show');
             });
           }
+          
           if (editSuffixConfirm) {
             editSuffixConfirm.addEventListener('click', updateFileSuffix);
           }
+          
+          // 点击弹窗外部关闭弹窗
           window.addEventListener('click', handleWindowClick);
+          
+          // 初始化文件点击事件
           initializeFileCards();
         });
+        
+        // 初始化文件卡片点击事件
         function initializeFileCards() {
           const fileGrid = document.getElementById('fileGrid');
           if (!fileGrid) return;
+          
           const fileCards = Array.from(fileGrid.children);
           fileCards.forEach(card => {
             const checkbox = card.querySelector('.file-checkbox');
             if (!checkbox) return;
+            
+            // 点击卡片区域选中/取消选中文件
             card.addEventListener('click', (e) => {
+              // 如果点击在按钮上不触发选择
               if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A' || 
                   e.target.closest('.btn') || e.target.closest('.file-actions')) {
                 return;
               }
+              
+              // 切换复选框状态
               checkbox.checked = !checkbox.checked;
+              // 更新卡片选中状态
               card.classList.toggle('selected', checkbox.checked);
-              e.preventDefault();
+              e.preventDefault(); // 防止其他点击事件
             });
+            
+            // 复选框状态变化时更新卡片选中状态
             checkbox.addEventListener('change', () => {
               card.classList.toggle('selected', checkbox.checked);
             });
           });
         }
+        
+        // 过滤文件
         function filterFiles() {
           const searchInput = document.getElementById('searchInput');
           const categoryFilter = document.getElementById('categoryFilter');
           const fileGrid = document.getElementById('fileGrid');
           if (!searchInput || !categoryFilter || !fileGrid) return;
+          
           const searchTerm = searchInput.value.toLowerCase();
           const selectedCategory = categoryFilter.value;
           const fileCards = Array.from(fileGrid.children);
+  
           fileCards.forEach(card => {
             const fileInfo = card.querySelector('.file-info');
             if (!fileInfo) return;
+            
             const fileName = fileInfo.querySelector('div:first-child')?.textContent.toLowerCase() || '';
             const categoryId = card.getAttribute('data-category-id') || '';
+  
             const matchesSearch = fileName.includes(searchTerm);
             const matchesCategory = selectedCategory === '' || categoryId === selectedCategory;
+  
             card.style.display = matchesSearch && matchesCategory ? '' : 'none';
           });
         }
+        
+        // 全选/取消全选
         function toggleSelectAll() {
           const fileGrid = document.getElementById('fileGrid');
           if (!fileGrid) return;
+          
           const fileCards = Array.from(fileGrid.children);
           const visibleCards = fileCards.filter(card => card.style.display !== 'none');
           const allSelected = visibleCards.every(card => card.querySelector('.file-checkbox')?.checked);
+          
           visibleCards.forEach(card => {
             const checkbox = card.querySelector('.file-checkbox');
             if (checkbox) {
@@ -3289,47 +3920,67 @@ async function initDatabase(config) {
             }
           });
         }
+        
+        // 确认删除选中文件
         function confirmDeleteSelected() {
           const selectedCheckboxes = document.querySelectorAll('.file-checkbox:checked');
           if (selectedCheckboxes.length === 0) {
             showConfirmModal('请先选择要删除的文件！', null, true);
             return;
           }
+          
           showConfirmModal(
             \`确定要删除选中的 \${selectedCheckboxes.length} 个文件吗？\`, 
             deleteSelectedFiles
           );
         }
+        
+        // 确认删除分类
         function confirmDeleteCategory() {
           const select = document.getElementById('categoryDeleteSelect');
           if (!select) return;
+          
           const categoryId = select.value;
           if (!categoryId) {
             showConfirmModal('请选择要删除的分类', null, true);
             return;
           }
+  
           const categoryName = select.options[select.selectedIndex].text;
           showConfirmModal(
             \`确定要删除分类 "\${categoryName}" 吗？这将清空所有关联文件的分类！\`, 
             deleteCategory
           );
         }
+        
+        // 分享文件 - 简化版，直接使用prompt
         function shareFile(url, fileName) {
           console.log('分享文件:', url);
           try {
+            // 创建弹窗
             const modal = document.createElement('div');
             modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;display:flex;justify-content:center;align-items:center;';
+            
+            // 创建弹窗内容
             const content = document.createElement('div');
             content.style.cssText = 'background:white;padding:20px;border-radius:10px;max-width:90%;width:350px;text-align:center;';
+            
+            // 弹窗标题
             const title = document.createElement('h3');
             title.style.cssText = 'margin-top:0;color:#333;';
             title.textContent = '分享文件';
+            
+            // 文件名显示
             const fileNameElem = document.createElement('div');
             fileNameElem.style.cssText = 'margin-bottom:10px;word-break:break-all;font-size:14px;color:#666;';
             fileNameElem.textContent = fileName || getFileName(url);
+            
+            // 二维码容器
             const qrContainer = document.createElement('div');
             qrContainer.id = 'qrcode-container';
             qrContainer.style.cssText = 'margin:20px auto;height:200px;width:200px;';
+            
+            // 生成二维码
             try {
               const qrcode = new QRCode(qrContainer, {
                 text: url,
@@ -3343,8 +3994,12 @@ async function initDatabase(config) {
               console.error('二维码生成失败:', qrError);
               qrContainer.innerHTML = '<div style="padding:20px;word-break:break-all;border:1px dashed #ccc;">' + url + '</div>';
             }
+            
+            // 按钮容器
             const buttons = document.createElement('div');
             buttons.style.cssText = 'display:flex;gap:10px;justify-content:center;margin-top:20px;';
+            
+            // 复制按钮
             const copyBtn = document.createElement('button');
             copyBtn.id = 'copy-link-btn';
             copyBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#3498db;color:white;cursor:pointer;';
@@ -3359,12 +4014,16 @@ async function initDatabase(config) {
                   prompt('请手动复制链接:', url);
                 });
             };
+            
+            // 下载按钮
             const downloadBtn = document.createElement('a');
             downloadBtn.id = 'download-file-btn';
             downloadBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#2ecc71;color:white;cursor:pointer;text-decoration:none;display:inline-block;text-align:center;';
             downloadBtn.textContent = '下载';
             downloadBtn.href = url;
             downloadBtn.setAttribute('download', fileName || getFileName(url));
+            
+            // 取消按钮
             const cancelBtn = document.createElement('button');
             cancelBtn.id = 'close-share-btn';
             cancelBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#95a5a6;color:white;cursor:pointer;';
@@ -3372,6 +4031,8 @@ async function initDatabase(config) {
             cancelBtn.onclick = function() {
               document.body.removeChild(modal);
             };
+            
+            // 组装弹窗
             buttons.appendChild(copyBtn);
             buttons.appendChild(downloadBtn);
             buttons.appendChild(cancelBtn);
@@ -3380,14 +4041,19 @@ async function initDatabase(config) {
             content.appendChild(qrContainer);
             content.appendChild(buttons);
             modal.appendChild(content);
+            
+            // 点击弹窗外部关闭
             modal.addEventListener('click', function(e) {
               if (e.target === modal) {
                 document.body.removeChild(modal);
               }
             });
+            
+            // 显示弹窗
             document.body.appendChild(modal);
           } catch (error) {
             console.error('分享功能出错:', error);
+            // 降级到简单复制
             try {
               navigator.clipboard.writeText(url)
                 .then(() => alert('链接已复制: ' + url))
@@ -3397,11 +4063,16 @@ async function initDatabase(config) {
             }
           }
         }
+        
+        // 关闭二维码弹窗
         function closeQrModal() {
           if (qrModal) qrModal.style.display = 'none';
         }
+        
+        // 复制当前分享URL
         function copyCurrentShareUrl() {
           if (!currentShareUrl) return;
+          
           navigator.clipboard.writeText(currentShareUrl)
             .then(() => {
               if (qrCopyBtn) {
@@ -3415,15 +4086,22 @@ async function initDatabase(config) {
               prompt('请手动复制链接:', currentShareUrl);
             });
         }
+        
+        // 显示确认弹窗
         function showConfirmModal(message, callback, alertOnly = false) {
           if (!confirmModal || !confirmModalMessage || !confirmModalConfirm || !confirmModalCancel) {
+            // 如果元素不存在，退化为使用alert
             alert(message);
             if (callback && !alertOnly) callback();
             return;
           }
+          
+          // 关闭已有弹窗
           closeConfirmModal();
+          
           confirmModalMessage.textContent = message;
           currentConfirmCallback = callback;
+          
           if (alertOnly) {
             confirmModalConfirm.textContent = '确定';
             confirmModalCancel.style.display = 'none';
@@ -3431,17 +4109,24 @@ async function initDatabase(config) {
             confirmModalConfirm.textContent = '确认';
             confirmModalCancel.style.display = 'inline-block';
           }
+          
           confirmModal.classList.add('show');
         }
+        
+        // 关闭确认弹窗
         function closeConfirmModal() {
           if (confirmModal) confirmModal.classList.remove('show');
         }
+        
+        // 确认按钮事件处理
         function handleConfirmModalConfirm() {
           if (currentConfirmCallback) {
             currentConfirmCallback();
           }
           closeConfirmModal();
         }
+        
+        // 窗口点击事件处理
         function handleWindowClick(event) {
           if (confirmModal && event.target === confirmModal) {
             closeConfirmModal();
@@ -3453,6 +4138,8 @@ async function initDatabase(config) {
             editSuffixModal.classList.remove('show');
           }
         }
+        
+        // 修改后缀
         function showEditSuffixModal(url) {
           console.log('显示修改后缀弹窗:', url, '弹窗元素:', !!editSuffixModal);
           if (!editSuffixModal) {
@@ -3460,13 +4147,17 @@ async function initDatabase(config) {
             alert('修改后缀功能不可用');
             return;
           }
+          
           currentEditUrl = url;
+          
+          // 获取当前后缀
           const urlObj = new URL(url);
           const pathParts = urlObj.pathname.split('/');
           const fileName = pathParts[pathParts.length - 1];
           const fileNameParts = fileName.split('.');
-          const extension = fileNameParts.pop();
-          const currentSuffix = fileNameParts.join('.');
+          const extension = fileNameParts.pop(); // 获取扩展名
+          const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
+          
           const editSuffixInput = document.getElementById('editSuffixInput');
           if (editSuffixInput) {
             editSuffixInput.value = currentSuffix;
@@ -3475,20 +4166,26 @@ async function initDatabase(config) {
             console.error('找不到编辑后缀输入框');
           }
         }
+        
+        // 删除单个文件
         async function deleteFile(url, card) {
           try {
+            // 从URL提取文件名用于查询
             const urlObj = new URL(url);
             const pathParts = urlObj.pathname.split('/');
             const fileName = pathParts[pathParts.length - 1];
+            
             const response = await fetch('/delete', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ id: url, fileId: fileName })
+              body: JSON.stringify({ id: url, fileId: fileName }) // 同时发送url和文件名
             });
+  
             if (!response.ok) {
               const errorData = await response.json();
               throw new Error(errorData.error || errorData.message || '删除失败');
             }
+            
             if (card) {
               card.remove();
             } else {
@@ -3500,19 +4197,24 @@ async function initDatabase(config) {
             showConfirmModal('文件删除失败: ' + error.message, null, true);
           }
         }
+        
+        // 删除选中的文件
         async function deleteSelectedFiles() {
           const checkboxes = document.querySelectorAll('.file-checkbox:checked');
           const urls = Array.from(checkboxes).map(cb => cb.value);
+  
           try {
             const response = await fetch('/delete-multiple', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ urls })
             });
+  
             if (!response.ok) {
               const errorData = await response.json();
               throw new Error(errorData.error || '批量删除失败');
             }
+  
             checkboxes.forEach(cb => {
               const card = cb.closest('.file-card');
               if (card) card.remove();
@@ -3522,16 +4224,21 @@ async function initDatabase(config) {
             showConfirmModal('批量删除失败: ' + error.message, null, true);
           }
         }
+        
+        // 删除分类
         async function deleteCategory() {
           const select = document.getElementById('categoryDeleteSelect');
           if (!select) return;
+          
           const categoryId = select.value;
+  
           try {
             const response = await fetch('/delete-category', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ id: categoryId })
             });
+  
             const data = await response.json();
             if (data.status === 1) {
               select.remove(select.selectedIndex);
@@ -3545,10 +4252,14 @@ async function initDatabase(config) {
             showConfirmModal('删除分类失败: ' + error.message, null, true);
           }
         }
+        
+        // 更新文件后缀
         async function updateFileSuffix() {
           const editSuffixInput = document.getElementById('editSuffixInput');
           if (!editSuffixInput) return;
+          
           const newSuffix = editSuffixInput.value;
+          
           try {
             const response = await fetch('/update-suffix', {
               method: 'POST',
@@ -3558,15 +4269,24 @@ async function initDatabase(config) {
                 suffix: newSuffix
               })
             });
+            
             const data = await response.json();
+            
             if (data.status === 1) {
+              // 更新成功，隐藏弹窗
               if (editSuffixModal) editSuffixModal.classList.remove('show');
+              
+              // 更新页面上的URL
               const card = document.querySelector('.file-card[data-url="' + currentEditUrl + '"]');
               if (card) {
+                // 更新卡片的URL值
                 card.setAttribute('data-url', data.newUrl);
+                
+                // 更新卡片中的按钮URL
                 const shareBtn = card.querySelector('.btn-share');
                 const deleteBtn = card.querySelector('.btn-delete');
                 const editBtn = card.querySelector('.btn-edit');
+                
                 if (shareBtn) {
                   const fileName = getFileName(data.newUrl);
                   shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
@@ -3578,18 +4298,25 @@ async function initDatabase(config) {
                 if (editBtn) {
                   editBtn.setAttribute('onclick', 'showEditSuffixModal("' + data.newUrl + '")');
                 }
+                
+                // 更新描述中的文件名
                 const fileNameElement = card.querySelector('.file-info div:first-child');
                 if (fileNameElement) {
                   const urlObj = new URL(data.newUrl);
                   const fileName = urlObj.pathname.split('/').pop();
                   fileNameElement.textContent = fileName;
                 }
+                
+                // 更新复选框值
                 const checkbox = card.querySelector('.file-checkbox');
                 if (checkbox) {
                   checkbox.value = data.newUrl;
                 }
               }
+              
+              // 更新当前编辑的URL
               currentEditUrl = data.newUrl;
+              
               showConfirmModal(data.msg, null, true);
             } else {
               showConfirmModal(data.msg || '修改后缀失败', null, true);
@@ -3598,6 +4325,8 @@ async function initDatabase(config) {
             showConfirmModal('修改后缀时出错：' + error.message, null, true);
           }
         }
+        
+        // 获取文件名
         function getFileName(url) {
           try {
             const urlObj = new URL(url);
@@ -3611,21 +4340,30 @@ async function initDatabase(config) {
     </body>
     </html>`;
   }
+  
   async function handleUpdateSuffixRequest(request, config) {
     try {
       const { url, suffix } = await request.json();
+  
       if (!url || !suffix) {
         return new Response(JSON.stringify({
           status: 0,
           msg: '文件链接和后缀不能为空'
         }), { headers: { 'Content-Type': 'application/json' } });
       }
+  
+      // 从URL提取文件名
       const originalFileName = getFileName(url);
+      
+      // 从数据库中查找对应的文件记录
       let fileRecord = await config.database.prepare('SELECT * FROM files WHERE url = ?')
         .bind(url).first();
+        
       if (!fileRecord) {
+        // 如果按URL找不到，尝试用文件名查找
         fileRecord = await config.database.prepare('SELECT * FROM files WHERE fileId = ?')
           .bind(originalFileName).first();
+          
         if (!fileRecord) {
           return new Response(JSON.stringify({
             status: 0,
@@ -3633,25 +4371,34 @@ async function initDatabase(config) {
           }), { headers: { 'Content-Type': 'application/json' } });
         }
       }
+      
+      // 获取文件扩展名
       const fileExt = originalFileName.split('.').pop();
       const newFileName = `${suffix}.${fileExt}`;
-      let fileUrl = `https:
+      let fileUrl = `https://${config.domain}/${newFileName}`;
+      
+      // 检查后缀是否已被使用
       const existingFile = await config.database.prepare('SELECT * FROM files WHERE fileId = ? AND id != ?')
         .bind(newFileName, fileRecord.id).first();
+        
       if (existingFile) {
         return new Response(JSON.stringify({
           status: 0,
           msg: '后缀已存在，无法修改'
         }), { headers: { 'Content-Type': 'application/json' } });
       }
+      
+      // 同时检查URL是否已存在
       const existingUrl = await config.database.prepare('SELECT * FROM files WHERE url = ? AND id != ?')
         .bind(fileUrl, fileRecord.id).first();
+        
       if (existingUrl) {
         return new Response(JSON.stringify({
           status: 0,
           msg: '该URL已被使用，请尝试其他后缀'
         }), { headers: { 'Content-Type': 'application/json' } });
       }
+      
       console.log('准备更新文件:', {
         记录ID: fileRecord.id,
         原URL: fileRecord.url,
@@ -3660,26 +4407,39 @@ async function initDatabase(config) {
         新文件名: newFileName,
         新URL: fileUrl
       });
+      
+      // 处理存储在Telegram的文件
       if (fileRecord.storage_type === 'telegram') {
+        // 对于Telegram存储，我们只更新url，保留原始的Telegram fileId
         await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
           .bind(fileUrl, fileRecord.id).run();
+          
         console.log('Telegram文件更新完成:', {
           id: fileRecord.id,
           新URL: fileUrl
         });
       } 
+      // 处理存储在R2的文件
       else if (config.bucket) {
         try {
           const fileId = fileRecord.fileId || originalFileName;
           console.log('尝试从R2获取文件:', fileId);
+          
           const file = await config.bucket.get(fileId);
+          
           if (file) {
             console.log('R2文件存在，正在复制到新名称:', newFileName);
+            // 复制文件到新名称
             const fileData = await file.arrayBuffer();
             await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
+  
+            // 删除旧文件
             await deleteFile(fileId, config);
+            
+            // 更新数据库记录
             await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
               .bind(newFileName, fileUrl, fileRecord.id).run();
+              
             console.log('R2文件更新完成:', {
               id: fileRecord.id,
               新fileId: newFileName,
@@ -3687,20 +4447,25 @@ async function initDatabase(config) {
             });
           } else {
             console.log('R2中未找到文件，只更新URL:', fileId);
+            // 如果R2中没有找到文件，只更新URL
             await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
               .bind(fileUrl, fileRecord.id).run();
           }
         } catch (error) {
           console.error('处理R2文件重命名失败:', error);
+          
+          // 即使R2操作失败，仍然更新URL
           await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
             .bind(fileUrl, fileRecord.id).run();
         }
       } 
+      // 其他情况，直接更新数据库
       else {
         console.log('未知存储类型，只更新URL');
         await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
           .bind(fileUrl, fileRecord.id).run();
       }
+  
       return new Response(JSON.stringify({
         status: 1,
         msg: '后缀修改成功',
@@ -3714,16 +4479,20 @@ async function initDatabase(config) {
       }), { headers: { 'Content-Type': 'application/json' } });
     }
   } 
+  
+  // 修改generateNewUrl函数，直接使用域名和文件名生成URL
   function generateNewUrl(url, suffix, config) {
     const fileName = getFileName(url);
     const newFileName = suffix + '.' + fileName.split('.').pop();
-    return `https:
+    return `https://${config.domain}/${newFileName}`;
   }
+  
   function getFileName(url) {
     const urlObj = new URL(url);
     const pathParts = urlObj.pathname.split('/');
     return pathParts[pathParts.length - 1];
   }
+  
   function copyToClipboard(text) {
     navigator.clipboard.writeText(text)
       .then(() => {
@@ -3733,9 +4502,14 @@ async function initDatabase(config) {
         showConfirmModal('复制失败，请手动复制', null, true);
       });
   }
+  
+  
+  // 从MIME类型获取文件扩展名
   function getExtensionFromMime(mimeType) {
     if (!mimeType) return 'jpg';
+    
     const mimeMap = {
+      // 图片类型
       'image/jpeg': 'jpg',
       'image/jpg': 'jpg',
       'image/png': 'png',
@@ -3746,6 +4520,8 @@ async function initDatabase(config) {
       'image/avif': 'avif',
       'image/tiff': 'tiff',
       'image/x-icon': 'ico',
+      
+      // 视频类型
       'video/mp4': 'mp4',
       'video/webm': 'webm',
       'video/ogg': 'ogv',
@@ -3756,6 +4532,8 @@ async function initDatabase(config) {
       'video/x-matroska': 'mkv',
       'video/x-m4v': 'm4v',
       'video/mp2t': 'ts',
+      
+      // 音频类型
       'audio/mpeg': 'mp3',
       'audio/mp3': 'mp3',
       'audio/ogg': 'ogg',
@@ -3764,6 +4542,8 @@ async function initDatabase(config) {
       'audio/aac': 'aac',
       'audio/flac': 'flac',
       'audio/x-ms-wma': 'wma',
+      
+      // 文档类型
       'application/pdf': 'pdf',
       'application/msword': 'doc',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
@@ -3772,11 +4552,15 @@ async function initDatabase(config) {
       'application/vnd.ms-powerpoint': 'ppt',
       'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
       'application/rtf': 'rtf',
+      
+      // 压缩文件
       'application/zip': 'zip',
       'application/x-rar-compressed': 'rar',
       'application/x-7z-compressed': '7z',
       'application/x-tar': 'tar',
       'application/gzip': 'gz',
+      
+      // 文本类型
       'text/plain': 'txt',
       'text/markdown': 'md',
       'text/csv': 'csv',
@@ -3786,16 +4570,23 @@ async function initDatabase(config) {
       'application/javascript': 'js',
       'application/json': 'json',
       'application/xml': 'xml',
+      
+      // 字体类型
       'font/ttf': 'ttf',
       'font/otf': 'otf',
       'font/woff': 'woff',
       'font/woff2': 'woff2',
       'application/vnd.ms-fontobject': 'eot',
+      
+      // 其他类型
       'application/octet-stream': 'bin',
       'application/x-shockwave-flash': 'swf'
     };
+    
     return mimeMap[mimeType] || 'bin';
   }
+  
+  // 上传文件到R2对象存储
   async function uploadToR2(arrayBuffer, fileName, mimeType, config) {
     try {
       return await storeFile(arrayBuffer, fileName, mimeType, config);
@@ -3804,32 +4595,42 @@ async function initDatabase(config) {
       throw new Error(`上传到存储服务失败: ${error.message}`);
     }
   }
+  
+  // 添加用于处理R2/Telegram存储操作的通用函数
   async function storeFile(arrayBuffer, fileName, mimeType, config) {
     if (config.bucket) {
       try {
         await config.bucket.put(fileName, arrayBuffer, {
           httpMetadata: { contentType: mimeType || 'application/octet-stream' }
         });
-        return `https:
+        return `https://${config.domain}/${fileName}`;
       } catch (error) {
+        // 减少日志输出，使用更简洁的错误消息
         console.error(`R2存储失败: ${error.message}`);
+        // 尝试使用Telegram作为备选存储
         return await storeFileInTelegram(arrayBuffer, fileName, mimeType, config);
       }
     } else {
+      // 没有配置R2，使用Telegram
       return await storeFileInTelegram(arrayBuffer, fileName, mimeType, config);
     }
   }
+  
   async function storeFileInTelegram(arrayBuffer, fileName, mimeType, config) {
     if (!config.tgBotToken || !config.tgStorageChatId) {
       throw new Error('未配置Telegram存储参数 (TG_BOT_TOKEN 和 TG_STORAGE_CHAT_ID)');
     }
+  
+    // 创建FormData对象模拟文件上传
     const formData = new FormData();
     const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
     formData.append('document', blob, fileName);
-    const response = await fetch(`https:
+  
+    const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument?chat_id=${config.tgStorageChatId}`, {
       method: 'POST',
       body: formData
     });
+  
     const result = await response.json();
     if (result.ok) {
       const fileId = result.result.document.file_id;
@@ -3839,17 +4640,20 @@ async function initDatabase(config) {
       throw new Error('Telegram存储失败: ' + JSON.stringify(result));
     }
   }
+  
   async function getFile(fileId, config) {
     if (config.bucket) {
       try {
         return await config.bucket.get(fileId);
       } catch (error) {
         console.error('R2获取文件失败:', error);
+        // 如果是存储在Telegram的文件，可能需要其他方式获取
         return null;
       }
     }
     return null;
   }
+  
   async function deleteFile(fileId, config) {
     if (config.bucket) {
       try {
@@ -3860,19 +4664,27 @@ async function initDatabase(config) {
         return false;
       }
     }
-    return true;
+    return true; // 如果没有R2桶，假设文件已删除或不需要删除
   }
+  
+  // 从GitHub获取通知内容
   async function fetchNotification() {
     try {
-      const response = await fetch('https:
+      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+      
       if (!response.ok) {
+        // 静默失败，返回null而不打印错误日志
         return null;
       }
+      
       return await response.text();
     } catch (error) {
+      // 静默失败，返回null而不打印错误日志
       return null;
     }
   }
+  
+  // 复制分享链接到剪贴板 (替代QR码分享)
   function copyShareUrl(url, fileName) {
     console.log('复制分享链接:', url);
     try {
@@ -3889,16 +4701,22 @@ async function initDatabase(config) {
       prompt('请手动复制以下链接:', url);
     }
   }
+    
+  // DOM加载完成后即初始化全局变量
   try {
     document.addEventListener('DOMContentLoaded', function() {
       try {
         console.log('DOM加载完成，初始化页面元素引用');
+        
+        // 获取修改后缀弹窗元素
         window.editSuffixModal = document.getElementById('editSuffixModal');
         if (window.editSuffixModal) {
           console.log('成功获取修改后缀弹窗元素');
         } else {
           console.error('无法获取修改后缀弹窗元素');
         }
+        
+        // 设置全局变量，确保即使在脚本加载前也能访问
         window.currentEditUrl = '';
         window.showEditSuffixModal = showEditSuffixModal;
       } catch (error) {
