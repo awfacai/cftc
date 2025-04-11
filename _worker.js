@@ -421,19 +421,16 @@ async function initDatabase(config) {
         bucket: env.BUCKET,
         fileCache: new Map(),
         fileCacheTTL: 3600000, // 1小时缓存
-        // 添加按钮缓存，提高响应速度
         buttonCache: new Map(),
         buttonCacheTTL: 600000, // 按钮缓存10分钟过期
         menuCache: new Map(),
         menuCacheTTL: 300000 // 菜单缓存5分钟过期
       };
       
-      // 确保认证配置有效
-      if (config.enableAuth) {
-        if (!config.username || !config.password) {
+      // 确保认证配置有效 (如果启用)
+      if (config.enableAuth && (!config.username || !config.password)) {
           console.error("启用了认证但未配置用户名或密码");
           return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { status: 500 });
-        }
       }
       
       // favicon.ico处理
@@ -444,44 +441,42 @@ async function initDatabase(config) {
       const url = new URL(request.url);
       const { pathname } = url;
       
-      // 公开资源白名单
-      const publicPaths = ['/login', '/webhook', '/config', '/favicon.ico'];
-      // 受保护的页面列表
-      const protectedPaths = ['/', '/admin', '/upload', '/search', '/delete', '/delete-multiple'];
+      // --- 核心认证逻辑 --- 
+      const isAuthEnabled = config.enableAuth;
+      const isAuthenticated = isAuthEnabled ? authenticate(request, config) : true; // 如果未启用认证，则视为已认证
+      const isLoginPage = pathname === '/login';
+      const isPublicApi = pathname === '/webhook' || pathname === '/config'; // 公开API路径
       
-      // 所有POST请求都需要登录验证
-      const needsAuth = 
-        // 是受保护的路径
-        (protectedPaths.includes(pathname) || 
-        // 或者不在公开白名单中
-        !publicPaths.includes(pathname)) && 
-        // 且启用了认证
-        config.enableAuth;
+      // 需要认证的路径
+      const protectedPaths = ['/', '/upload', '/admin', '/create-category', '/delete-category', '/update-suffix', '/delete', '/delete-multiple', '/search'];
+      const requiresAuth = isAuthEnabled && protectedPaths.includes(pathname);
       
-      // 登录权限检查
-      if (needsAuth && !authenticate(request, config)) {
-        console.log(`未授权访问: ${pathname}`);
-        
-        // 如果是API请求，返回JSON格式的授权错误
-        if (pathname.startsWith('/api/') || 
-            request.headers.get('Accept')?.includes('application/json') ||
-            request.method === 'POST') {
-          return new Response(JSON.stringify({ 
-            status: 0, 
-            error: "未授权访问",
-            redirect: `${url.origin}/login?redirect=${encodeURIComponent(pathname)}`
-          }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-        
-        // 否则重定向到登录页面
-        return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(pathname)}`, 302);
+      // 如果需要认证但未认证，且不是登录页面
+      if (requiresAuth && !isAuthenticated && !isLoginPage) {
+          console.log(`认证失败: 访问受保护路径 ${pathname}，重定向到登录`);
+          // 对于API或POST请求，返回JSON错误
+          if (request.method === 'POST' || request.headers.get('Accept')?.includes('application/json')) {
+              return new Response(JSON.stringify({ status: 0, error: "未授权访问", redirect: `${url.origin}/login` }), {
+                  status: 401,
+                  headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+              });
+          }
+          // 否则重定向到登录页，并附带原始请求路径
+          return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(pathname)}`, 302);
       }
       
+      // 如果访问登录页但已认证，重定向到上传页
+      if (isAuthEnabled && isAuthenticated && isLoginPage) {
+          console.log(`已认证用户访问登录页，重定向到 /upload`);
+          return Response.redirect(`${url.origin}/upload`, 302);
+      }
+      
+      // --- 数据库初始化 (移到认证之后) ---
       try {
-        await initDatabase(config);
+        // 对于不需要数据库的公共 API 或已认证的文件请求，可以考虑延迟初始化
+        if (!isPublicApi && pathname !== '/login') { 
+            await initDatabase(config);
+        }
       } catch (error) {
         console.error(`数据库初始化失败: ${error.message}`);
         return new Response(`数据库初始化失败: ${error.message}`, { 
@@ -490,52 +485,59 @@ async function initDatabase(config) {
         });
       }
       
-      // 仅当配置了Telegram机器人令牌时才设置webhook
+      // --- Webhook 设置 (仅当配置了Bot Token) ---
       if (config.tgBotToken) {
         try {
           const webhookUrl = `https://${config.domain}/webhook`;
-          const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
-          if (!webhookSet) {
-            console.error('Webhook设置失败');
-          }
+          // 考虑不在每次请求时都设置webhook，或添加检查逻辑
+          // const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
+          // if (!webhookSet) { console.error('Webhook设置失败'); }
         } catch (error) {
           console.error(`设置webhook时出错: ${error.message}`);
-          // 继续处理请求，不中断操作
         }
       }
       
-      if (pathname === '/config') {
-        const safeConfig = { maxSizeMB: config.maxSizeMB };
-        return new Response(JSON.stringify(safeConfig), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      if (pathname === '/webhook' && request.method === 'POST') {
-        return handleTelegramWebhook(request, config);
-      }
-      if (pathname === '/create-category' && request.method === 'POST') {
-        return handleCreateCategoryRequest(request, config);
-      }
-      if (pathname === '/delete-category' && request.method === 'POST') {
-        return handleDeleteCategoryRequest(request, config);
-      }
-      if (pathname === '/update-suffix' && request.method === 'POST') {
-        return handleUpdateSuffixRequest(request, config);
-      }
+      // --- 路由处理 ---
       const routes = {
-        '/': () => handleAuthRequest(request, config),
+        // 根路径处理: 未认证导向登录，已认证导向上传
+        '/': async () => {
+            if (!isAuthEnabled || isAuthenticated) {
+                return handleUploadRequest(request, config);
+            } else {
+                return handleLoginRequest(request, config);
+            }
+        },
         '/login': () => handleLoginRequest(request, config),
         '/upload': () => handleUploadRequest(request, config),
         '/admin': () => handleAdminRequest(request, config),
         '/delete': () => handleDeleteRequest(request, config),
         '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
         '/search': () => handleSearchRequest(request, config),
+        '/create-category': () => handleCreateCategoryRequest(request, config),
+        '/delete-category': () => handleDeleteCategoryRequest(request, config),
+        '/update-suffix': () => handleUpdateSuffixRequest(request, config),
+        '/config': () => {
+            const safeConfig = { maxSizeMB: config.maxSizeMB };
+            return new Response(JSON.stringify(safeConfig), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+        },
+        '/webhook': () => handleTelegramWebhook(request, config),
         '/bing': handleBingImagesRequest
       };
+      
       const handler = routes[pathname];
+      
       if (handler) {
-        return await handler();
+        try {
+            return await handler();
+        } catch (error) {
+            console.error(`处理路由 ${pathname} 出错:`, error);
+            return new Response("服务器内部错误", { status: 500 });
+        }
       }
+      
+      // 文件请求处理 (默认情况)
       return await handleFileRequest(request, config);
     }
   };
@@ -1503,6 +1505,7 @@ async function initDatabase(config) {
       if (!isAuthenticated) {
         return handleLoginRequest(request, config);
       }
+      return handleUploadRequest(request, config);
     }
     return handleUploadRequest(request, config);
   }
@@ -1639,10 +1642,9 @@ async function initDatabase(config) {
     }
   }
   async function handleUploadRequest(request, config) {
-    // 检查认证状态
-    const authResponse = ensureAuthenticated(request, config);
-    if (authResponse) return authResponse;
-    
+    if (config.enableAuth && !authenticate(request, config)) {
+      return Response.redirect(`${new URL(request.url).origin}/`, 302);
+    }
     if (request.method === 'GET') {
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
       const categoryOptions = categories.results.length
@@ -1770,10 +1772,93 @@ async function initDatabase(config) {
     }
   }
   async function handleDeleteMultipleRequest(request, config) {
-    // 检查认证状态
-    const authResponse = ensureAuthenticated(request, config);
-    if (authResponse) return authResponse;
-    
+    if (config.enableAuth && !authenticate(request, config)) {
+      return Response.redirect(`${new URL(request.url).origin}/`, 302);
+    }
+    try {
+      const { urls } = await request.json();
+      if (!Array.isArray(urls) || urls.length === 0) {
+        return new Response(JSON.stringify({ 
+          status: 0, 
+          error: '无效的URL列表' 
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      const results = {
+        success: [],
+        failed: []
+      };
+      for (const url of urls) {
+        try {
+          const fileName = url.split('/').pop();
+          let file = await config.database.prepare(
+            'SELECT id, fileId, message_id, storage_type FROM files WHERE url = ?'
+          ).bind(url).first();
+          if (!file && fileName) {
+            file = await config.database.prepare(
+              'SELECT id, fileId, message_id, storage_type FROM files WHERE fileId = ?'
+            ).bind(fileName).first();
+          }
+          if (file) {
+            console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
+            if (file.storage_type === 'telegram' && file.message_id) {
+              try {
+                await fetch(
+                  `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
+                );
+                console.log(`已从Telegram删除消息: ${file.message_id}`);
+              } catch (error) {
+                console.error(`从Telegram删除消息失败: ${error.message}`);
+              }
+            } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
+              try {
+                await config.bucket.delete(file.fileId);
+                console.log(`已从R2删除文件: ${file.fileId}`);
+              } catch (error) {
+                console.error(`从R2删除文件失败: ${error.message}`);
+              }
+            }
+            await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
+            console.log(`已从数据库删除记录: ID=${file.id}`);
+            results.success.push(url);
+          } else {
+            console.log(`未找到文件记录: ${url}`);
+            results.failed.push({url, reason: '未找到文件记录'});
+          }
+        } catch (error) {
+          console.error(`删除文件失败 ${url}: ${error.message}`);
+          results.failed.push({url, reason: error.message});
+        }
+      }
+      return new Response(
+        JSON.stringify({ 
+          status: 1, 
+          message: '批量删除处理完成',
+          results: {
+            success: results.success.length,
+            failed: results.failed.length,
+            details: results
+          }
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    } catch (error) {
+      console.error(`[Delete Multiple Error] ${error.message}`);
+      return new Response(
+        JSON.stringify({ 
+          status: 0, 
+          error: error.message 
+        }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+  }
+  async function handleAdminRequest(request, config) {
+    if (config.enableAuth && !authenticate(request, config)) {
+      return Response.redirect(`${new URL(request.url).origin}/`, 302);
+    }
     try {
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
       const categoryOptions = categories.results.length
@@ -1818,23 +1903,10 @@ async function initDatabase(config) {
       return new Response(`加载文件列表失败，请检查数据库配置：${error.message}`, { status: 500 });
     }
   }
-  
   async function handleSearchRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
-      const url = new URL(request.url);
-      if (request.method === 'POST') {
-        return new Response(JSON.stringify({ 
-          status: 0, 
-          error: "未授权访问",
-          redirect: `${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`, 302);
+      return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
-    
     try {
       const { query } = await request.json();
       const searchPattern = `%${query}%`;
@@ -2016,17 +2088,8 @@ async function initDatabase(config) {
   }
   async function handleDeleteRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
-      const url = new URL(request.url);
-      return new Response(JSON.stringify({ 
-        status: 0, 
-        error: "未授权访问",
-        redirect: `${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
-      });
+      return Response.redirect(`${new URL(request.url).origin}/`, 302);
     }
-    
     try {
       const { id, fileId } = await request.json();
       if (!id && !fileId) {
@@ -3983,27 +4046,13 @@ async function initDatabase(config) {
     </html>`;
   }
   async function handleUpdateSuffixRequest(request, config) {
-    if (config.enableAuth && !authenticate(request, config)) {
-      const reqUrl = new URL(request.url);
-      return new Response(JSON.stringify({ 
-        status: 0, 
-        error: "未授权访问",
-        redirect: `${reqUrl.origin}/login?redirect=${encodeURIComponent(reqUrl.pathname)}`
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-    
     try {
       const { url, suffix } = await request.json();
       if (!url || !suffix) {
         return new Response(JSON.stringify({
           status: 0,
-          message: '缺少文件URL或新后缀'
-        }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
+          msg: '文件链接和后缀不能为空'
+        }), { headers: { 'Content-Type': 'application/json' } });
       }
       const originalFileName = getFileName(url);
       let fileRecord = await config.database.prepare('SELECT * FROM files WHERE url = ?')
@@ -4292,42 +4341,5 @@ async function initDatabase(config) {
     });
   } catch (error) {
     console.error('添加DOMContentLoaded事件监听器失败:', error);
-  }
-    
-  // 确保用户已登录，返回适当的响应
-  function ensureAuthenticated(request, config) {
-    if (!config.enableAuth) {
-      return null; // 认证未启用，直接通过
-    }
-    
-    if (authenticate(request, config)) {
-      return null; // 已登录，直接通过
-    }
-    
-    // 未登录，返回适当的响应
-    const url = new URL(request.url);
-    
-    // API请求返回JSON
-    if (url.pathname.startsWith('/api/') || 
-        request.headers.get('Accept')?.includes('application/json') ||
-        request.method === 'POST') {
-      return new Response(JSON.stringify({ 
-        status: 0, 
-        error: "未授权访问",
-        redirect: `${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`
-      }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-    
-    // 普通页面请求重定向到登录
-    return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`, 302);
-  }
-  
-  // 确保用户已认证的方法 - 简化版，用于辅助函数
-  function checkAuthentication(request, config) {
-    // 如果未启用认证，或者已经通过认证，则返回true
-    return !config.enableAuth || authenticate(request, config);
   }
     
