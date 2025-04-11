@@ -4,6 +4,13 @@ async function initDatabase(config) {
       console.error("数据库配置缺失");
       throw new Error("数据库配置无效，请检查D1数据库是否正确绑定");
     }
+    
+    // 初始化缓存
+    if (!global.fileCache) {
+      global.fileCache = new Map();
+      global.fileCacheTTL = 3600000; // 1小时缓存过期时间
+    }
+    
     const maxRetries = 3;
     let lastError = null;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -375,35 +382,30 @@ async function initDatabase(config) {
     console.error('Failed to set webhook after maximum retries');
       return false;
     }
-  const cache = new Map();
-
-  function getCachedData(key) {
-    const cached = cache.get(key);
-    if (cached && (Date.now() - cached.timestamp < 60000)) { // 缓存1分钟
-      return cached.data;
-    }
-    return null;
-  }
-
-  function setCachedData(key, data) {
-    cache.set(key, { data, timestamp: Date.now() });
-  }
-
   export default {
     async fetch(request, env) {
       const config = {
         domain: env.DOMAIN,
         database: env.DATABASE,
-        username: env.USERNAME,
-        password: env.PASSWORD,
-        enableAuth: env.ENABLE_AUTH === 'true',
+        username: env.USERNAME || '',
+        password: env.PASSWORD || '',
+        enableAuth: env.ENABLE_AUTH === 'true' || false,
         tgBotToken: env.TG_BOT_TOKEN,
-        tgChatId: env.TG_CHAT_ID.split(","),
+        tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [],
         tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID,
         cookie: Number(env.COOKIE) || 7,
         maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
         bucket: env.BUCKET
       };
+      
+      // 确保认证配置有效
+      if (config.enableAuth) {
+        if (!config.username || !config.password) {
+          console.error("启用了认证但未配置用户名或密码");
+          return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { status: 500 });
+        }
+      }
+      
       try {
         await initDatabase(config);
       } catch (error) {
@@ -1135,18 +1137,21 @@ async function initDatabase(config) {
     }
   }
   function authenticate(request, config) {
-    const cookieHeader = request.headers.get('Cookie');
-    if (!cookieHeader) return false;
-    const cookies = Object.fromEntries(cookieHeader.split('; ').map(c => c.split('=')));
-    const token = cookies['auth_token'];
-    if (!token) return false;
-    try {
-      const tokenData = JSON.parse(atob(token));
-      if (tokenData.username === config.username && tokenData.expiration > Date.now()) {
-        return true;
-      }
+    const cookies = request.headers.get("Cookie") || "";
+    const authToken = cookies.match(/auth_token=([^;]+)/);
+    if (authToken) {
+      try {
+        const tokenData = JSON.parse(atob(authToken[1]));
+        const now = Date.now();
+        if (now > tokenData.expiration) {
+          console.log("Token已过期");
+          return false;
+        }
+        return tokenData.username === config.username;
     } catch (error) {
-      console.error('Token解析失败:', error);
+        console.error("Token的用户名不匹配", error);
+      return false;
+    }
     }
     return false;
   }
@@ -1165,7 +1170,9 @@ async function initDatabase(config) {
       const { username, password } = await request.json();
       if (username === config.username && password === config.password) {
         const expirationDate = new Date();
-        expirationDate.setDate(expirationDate.getDate() + config.cookie);
+        // 使用配置的cookie值（天数）
+        const cookieDays = config.cookie || 7; // 默认7天
+        expirationDate.setDate(expirationDate.getDate() + cookieDays);
         const expirationTimestamp = expirationDate.getTime();
         const tokenData = JSON.stringify({
           username: config.username,
@@ -1600,6 +1607,31 @@ async function initDatabase(config) {
       if (!path) {
         return new Response('Not Found', { status: 404 });
       }
+      
+      // 检查缓存
+      const cacheKey = `file:${path}`;
+      if (global.fileCache && global.fileCache.has(cacheKey)) {
+        const cachedData = global.fileCache.get(cacheKey);
+        if (Date.now() - cachedData.timestamp < global.fileCacheTTL) {
+          console.log(`从缓存提供文件: ${path}`);
+          return cachedData.response.clone();
+        } else {
+          // 缓存过期，删除
+          global.fileCache.delete(cacheKey);
+        }
+      }
+      
+      // 辅助函数：缓存并返回响应
+      const cacheAndReturnResponse = (response) => {
+        if (global.fileCache) {
+          global.fileCache.set(cacheKey, {
+            response: response.clone(),
+            timestamp: Date.now()
+          });
+        }
+        return response;
+      };
+      
       const getCommonHeaders = (contentType) => {
         const headers = new Headers();
         headers.set('Content-Type', contentType);
@@ -1612,6 +1644,8 @@ async function initDatabase(config) {
         headers.set('Cache-Control', 'public, max-age=31536000');
         return headers;
       };
+      
+      // 尝试从R2存储桶直接获取文件
       if (config.bucket) {
         try {
           const object = await config.bucket.get(path);
@@ -1620,7 +1654,7 @@ async function initDatabase(config) {
             const headers = getCommonHeaders(contentType);
             object.writeHttpMetadata(headers);
             headers.set('etag', object.httpEtag);
-            return new Response(object.body, { headers });
+            return cacheAndReturnResponse(new Response(object.body, { headers }));
           }
         } catch (error) {
           if (error.name !== 'NoSuchKey') {
@@ -1628,19 +1662,26 @@ async function initDatabase(config) {
           }
         }
       }
+      
+      // 从数据库查找文件
       let file;
       const urlPattern = `https://${config.domain}/${path}`;
       file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
+      
       if (!file) {
         file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
       }
+      
       if (!file) {
         const fileName = path.split('/').pop();
         file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
       }
+      
       if (!file) {
         return new Response('File not found', { status: 404 });
       }
+      
+      // 处理Telegram存储的文件
       if (file.storage_type === 'telegram') {
         try {
           const telegramFileId = file.fileId;
@@ -1648,26 +1689,34 @@ async function initDatabase(config) {
             console.error('文件记录缺少Telegram fileId');
             return new Response('Missing Telegram file ID', { status: 500 });
           }
+          
           const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
           const data = await response.json();
+          
           if (!data.ok) {
             console.error('Telegram getFile 失败:', data.description);
             return new Response('Failed to get file from Telegram', { status: 500 });
           }
+          
           const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
           const fileResponse = await fetch(telegramUrl);
+          
           if (!fileResponse.ok) {
             console.error(`从Telegram获取文件失败: ${fileResponse.status}`);
             return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
           }
+          
           const contentType = file.mime_type || getContentType(path.split('.').pop());
           const headers = getCommonHeaders(contentType);
-          return new Response(fileResponse.body, { headers });
+          return cacheAndReturnResponse(new Response(fileResponse.body, { headers }));
+          
         } catch (error) {
           console.error('处理Telegram文件出错:', error.message);
           return new Response('Error processing Telegram file', { status: 500 });
         }
-      } else if (file.storage_type === 'r2' && config.bucket) {
+      } 
+      // 处理R2存储的文件
+      else if (file.storage_type === 'r2' && config.bucket) {
         try {
           const object = await config.bucket.get(file.fileId);
           if (object) {
@@ -1675,15 +1724,18 @@ async function initDatabase(config) {
             const headers = getCommonHeaders(contentType);
             object.writeHttpMetadata(headers);
             headers.set('etag', object.httpEtag);
-            return new Response(object.body, { headers });
+            return cacheAndReturnResponse(new Response(object.body, { headers }));
           }
         } catch (error) {
           console.error('通过fileId从R2获取文件出错:', error.message);
         }
       }
+      
+      // 如果文件URL与请求的不同，重定向到正确的URL
       if (file.url && file.url !== urlPattern) {
         return Response.redirect(file.url, 302);
       }
+      
       return new Response('File not available', { status: 404 });
     } catch (error) {
       console.error('处理文件请求出错:', error.message);
@@ -2760,6 +2812,22 @@ async function initDatabase(config) {
         .backup:hover {
           color: #2980b9;
         }
+        .return-btn {
+          background: #2ecc71;
+          color: white;
+          padding: 0.7rem 1.5rem;
+          border: none;
+          border-radius: 8px;
+          cursor: pointer;
+          font-size: 0.9rem;
+          transition: all 0.3s ease;
+          text-decoration: none;
+          margin-left: 10px;
+        }
+        .return-btn:hover {
+          background: #27ae60;
+          transform: translateY(-2px);
+        }
         .action-bar {
           background: rgba(255, 255, 255, 0.95);
           padding: 1.5rem;
@@ -3143,11 +3211,13 @@ async function initDatabase(config) {
         <div class="header">
           <h2>文件管理</h2>
           <div class="right-content">
-            <input type="text" class="search" id="searchInput" name="searchInput" placeholder="搜索文件...">
-            <select class="category-filter" id="categoryFilter" name="categoryFilter">
-              <option value="">全部分类</option>
+            <input type="text" id="search-input" class="search" placeholder="搜索文件名...">
+            <select id="category-filter" class="category-filter">
+              <option value="">所有分类</option>
               ${categoryOptions}
             </select>
+            <a href="javascript:void(0)" class="backup" onclick="downloadBackup()">备份数据</a>
+            <a href="/upload" class="return-btn">返回上传</a>
           </div>
         </div>
         <div class="action-bar">
@@ -3209,8 +3279,8 @@ async function initDatabase(config) {
         setTimeout(setBingBackground, 1000);
         document.addEventListener('DOMContentLoaded', function() {
           console.log('DOM已加载，初始化页面...');
-          const searchInput = document.getElementById('searchInput');
-          const categoryFilter = document.getElementById('categoryFilter');
+          const searchInput = document.getElementById('search-input');
+          const categoryFilter = document.getElementById('category-filter');
           const fileGrid = document.getElementById('fileGrid');
           const fileCards = Array.from(fileGrid?.children || []);
           const selectAllBtn = document.getElementById('selectAllBtn');
@@ -3267,8 +3337,8 @@ async function initDatabase(config) {
           });
         }
         function filterFiles() {
-          const searchInput = document.getElementById('searchInput');
-          const categoryFilter = document.getElementById('categoryFilter');
+          const searchInput = document.getElementById('search-input');
+          const categoryFilter = document.getElementById('category-filter');
           const fileGrid = document.getElementById('fileGrid');
           if (!searchInput || !categoryFilter || !fileGrid) return;
           const searchTerm = searchInput.value.toLowerCase();
