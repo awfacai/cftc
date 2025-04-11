@@ -424,7 +424,10 @@ async function initDatabase(config) {
         buttonCache: new Map(),
         buttonCacheTTL: 600000, // 按钮缓存10分钟过期
         menuCache: new Map(),
-        menuCacheTTL: 300000 // 菜单缓存5分钟过期
+        menuCacheTTL: 300000, // 菜单缓存5分钟过期
+        notificationCache: '', // 公告缓存
+        notificationCacheTTL: 3600000, // 公告缓存1小时过期
+        lastNotificationFetch: 0 // 上次获取公告的时间戳
       };
       
       // 确保认证配置有效 (如果启用)
@@ -817,20 +820,51 @@ async function initDatabase(config) {
     
     // 获取当前分类信息 - 并行查询
     let categoryName = '未选择分类';
-    if (userSetting.current_category_id) {
-      const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?')
-        .bind(userSetting.current_category_id).first();
-      if (category) {
-        categoryName = category.name;
-      }
-    }
-    
+    const categoryPromise = userSetting.current_category_id ? 
+        config.database.prepare('SELECT name FROM categories WHERE id = ?')
+          .bind(userSetting.current_category_id).first() 
+        : Promise.resolve(null);
+        
     // 获取用户统计信息 - 并行查询
-    const stats = await config.database.prepare(`
+    const statsPromise = config.database.prepare(`
       SELECT COUNT(*) as total_files, SUM(file_size) as total_size
       FROM files WHERE chat_id = ?
     `).bind(chatId).first();
     
+    // 获取或更新公告信息
+    const notificationPromise = (async () => {
+      const now = Date.now();
+      // 如果缓存为空或已过期，则重新获取
+      if (!config.notificationCache || (now - config.lastNotificationFetch > config.notificationCacheTTL)) {
+        try {
+          console.log('[Notification] Fetching new notification...');
+          config.notificationCache = await fetchNotification();
+          config.lastNotificationFetch = now;
+        } catch (error) {
+          console.error('[Notification] Failed to fetch notification:', error);
+          // 出错时保留旧缓存（如果存在）或使用默认值
+          config.notificationCache = config.notificationCache || ''; 
+        }
+      }
+      return config.notificationCache;
+    })();
+    
+    // 等待所有并行操作完成
+    const [categoryResult, stats, notificationText] = await Promise.all([
+      categoryPromise,
+      statsPromise,
+      notificationPromise
+    ]);
+    
+    if (categoryResult) {
+      categoryName = categoryResult.name;
+    }
+    
+    // 默认公告内容
+    const defaultNotification = 
+      "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链\n" +
+      "➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作";
+      
     // 生成面板文本
     const messageBody = `🔷 <b>文件上传机器人</b>
     
@@ -838,6 +872,8 @@ async function initDatabase(config) {
     📁 当前分类：${categoryName}
     📊 已上传：${stats?.total_files || 0} 个文件
     💾 已用空间：${formatSize(stats?.total_size || 0)}
+    
+    ${notificationText || defaultNotification}
     
     👇 请选择操作：`;
     
@@ -2313,26 +2349,61 @@ async function initDatabase(config) {
   }
   function formatDate(timestamp) {
     if (!timestamp) return '未知时间';
+    
     let date;
-    if (typeof timestamp === 'number') {
-      date = timestamp > 9999999999 ? new Date(timestamp) : new Date(timestamp * 1000);
-    } 
-    else if (typeof timestamp === 'string') {
-      date = new Date(timestamp);
-      if (isNaN(date.getTime())) {
-        const numTimestamp = parseInt(timestamp);
-        if (!isNaN(numTimestamp)) {
-          date = numTimestamp > 9999999999 ? new Date(numTimestamp) : new Date(numTimestamp * 1000);
+    try {
+      // 尝试将各种输入转换为毫秒时间戳
+      let msTimestamp;
+      if (typeof timestamp === 'number') {
+        // 如果是秒时间戳 (例如10位数)，转换为毫秒
+        msTimestamp = timestamp > 9999999999 ? timestamp : timestamp * 1000;
+      } else if (typeof timestamp === 'string') {
+        // 尝试解析字符串日期或数字字符串
+        date = new Date(timestamp);
+        if (!isNaN(date.getTime())) {
+          msTimestamp = date.getTime();
+        } else {
+          const numTimestamp = parseInt(timestamp);
+          if (!isNaN(numTimestamp)) {
+            msTimestamp = numTimestamp > 9999999999 ? numTimestamp : numTimestamp * 1000;
+          } else {
+            return '日期无效 (无法解析)';
+          }
         }
+      } else if (timestamp instanceof Date) {
+        msTimestamp = timestamp.getTime();
+      } else {
+         return '日期无效 (类型错误)';
       }
+      
+      // 验证时间戳是否合理 (例如，在某个合理范围内)
+      if (msTimestamp < 0 || msTimestamp > 8640000000000000) { // 检查是否在 Date 对象有效范围内
+          return '日期无效 (范围超限)';
+      }
+      
+      // 创建 Date 对象
+      date = new Date(msTimestamp);
+      
+      // 检查 Date 对象是否有效
+      if (isNaN(date.getTime())) {
+          return '日期无效 (转换失败)';
+      }
+      
+      // 转换为北京时间 (UTC+8)
+      const beijingTimeOffset = 8 * 60 * 60 * 1000; // 8小时的毫秒数
+      const beijingDate = new Date(date.getTime() + beijingTimeOffset);
+      
+      // 格式化为 YYYY/MM/DD
+      const year = beijingDate.getUTCFullYear();
+      const month = (beijingDate.getUTCMonth() + 1).toString().padStart(2, '0'); // 月份从0开始，需要+1
+      const day = beijingDate.getUTCDate().toString().padStart(2, '0');
+      
+      return `${year}/${month}/${day}`;
+      
+    } catch (error) {
+      console.error("formatDate 错误:", error, "原始输入:", timestamp);
+      return '日期格式化错误';
     }
-    else {
-      date = new Date();
-    }
-    if (isNaN(date.getTime()) || date.getFullYear() < 2000) {
-      return '日期无效';
-    }
-    return date.toLocaleString();
   }
   async function sendMessage(chatId, text, botToken, replyToMessageId = null) {
     try {
