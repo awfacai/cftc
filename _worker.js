@@ -3948,19 +3948,108 @@ async function initDatabase(config) {
         
         // 分享文件 - 简化版，直接使用prompt
         function shareFile(url, fileName) {
+          console.log('分享文件:', url);
           try {
-            // 尝试复制到剪贴板
-            navigator.clipboard.writeText(url)
-              .then(() => {
-                alert('链接已复制到剪贴板: ' + url);
-              })
-              .catch(() => {
-                // 复制失败时使用prompt
-                prompt('请复制以下链接:', url);
+            // 创建弹窗
+            const modal = document.createElement('div');
+            modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;display:flex;justify-content:center;align-items:center;';
+            
+            // 创建弹窗内容
+            const content = document.createElement('div');
+            content.style.cssText = 'background:white;padding:20px;border-radius:10px;max-width:90%;width:350px;text-align:center;';
+            
+            // 弹窗标题
+            const title = document.createElement('h3');
+            title.style.cssText = 'margin-top:0;color:#333;';
+            title.textContent = '分享文件';
+            
+            // 文件名显示
+            const fileNameElem = document.createElement('div');
+            fileNameElem.style.cssText = 'margin-bottom:10px;word-break:break-all;font-size:14px;color:#666;';
+            fileNameElem.textContent = fileName || getFileName(url);
+            
+            // 二维码容器
+            const qrContainer = document.createElement('div');
+            qrContainer.style.cssText = 'margin:20px auto;height:200px;width:200px;';
+            
+            // 生成二维码
+            try {
+              const qrcode = new QRCode(qrContainer, {
+                text: url,
+                width: 200,
+                height: 200,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.H
               });
+            } catch (qrError) {
+              console.error('二维码生成失败:', qrError);
+              qrContainer.innerHTML = '<div style="padding:20px;word-break:break-all;border:1px dashed #ccc;">' + url + '</div>';
+            }
+            
+            // 按钮容器
+            const buttons = document.createElement('div');
+            buttons.style.cssText = 'display:flex;gap:10px;justify-content:center;margin-top:20px;';
+            
+            // 复制按钮
+            const copyBtn = document.createElement('button');
+            copyBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#3498db;color:white;cursor:pointer;';
+            copyBtn.textContent = '复制';
+            copyBtn.onclick = function() {
+              navigator.clipboard.writeText(url)
+                .then(() => {
+                  copyBtn.textContent = '已复制';
+                  setTimeout(() => { copyBtn.textContent = '复制'; }, 2000);
+                })
+                .catch(() => {
+                  prompt('请手动复制链接:', url);
+                });
+            };
+            
+            // 下载按钮
+            const downloadBtn = document.createElement('a');
+            downloadBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#2ecc71;color:white;cursor:pointer;text-decoration:none;display:inline-block;text-align:center;';
+            downloadBtn.textContent = '下载';
+            downloadBtn.href = url;
+            downloadBtn.setAttribute('download', fileName || getFileName(url));
+            
+            // 取消按钮
+            const cancelBtn = document.createElement('button');
+            cancelBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#95a5a6;color:white;cursor:pointer;';
+            cancelBtn.textContent = '取消';
+            cancelBtn.onclick = function() {
+              document.body.removeChild(modal);
+            };
+            
+            // 组装弹窗
+            buttons.appendChild(copyBtn);
+            buttons.appendChild(downloadBtn);
+            buttons.appendChild(cancelBtn);
+            content.appendChild(title);
+            content.appendChild(fileNameElem);
+            content.appendChild(qrContainer);
+            content.appendChild(buttons);
+            modal.appendChild(content);
+            
+            // 点击弹窗外部关闭
+            modal.addEventListener('click', function(e) {
+              if (e.target === modal) {
+                document.body.removeChild(modal);
+              }
+            });
+            
+            // 显示弹窗
+            document.body.appendChild(modal);
           } catch (error) {
-            // 出错时使用prompt
-            prompt('请复制以下链接:', url);
+            console.error('分享功能出错:', error);
+            // 降级到简单复制
+            try {
+              navigator.clipboard.writeText(url)
+                .then(() => alert('链接已复制: ' + url))
+                .catch(() => prompt('请复制链接:', url));
+            } catch (e) {
+              prompt('请复制链接:', url);
+            }
           }
         }
         
