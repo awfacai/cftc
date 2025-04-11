@@ -3712,24 +3712,23 @@ async function initDatabase(config) {
         <div class="header">
           <h2>文件管理</h2>
           <div class="right-content">
-            <a href="/upload" class="backup">返回上传</a>
-            <select id="categoryFilter" class="category-filter">
-              <option value="">所有分类</option>
+            <input type="text" class="search" id="searchInput" name="searchInput" placeholder="搜索文件...">
+            <select class="category-filter" id="categoryFilter" name="categoryFilter">
+              <option value="">全部分类</option>
               ${categoryOptions}
             </select>
-            <input type="text" class="search" placeholder="搜索文件..." id="searchInput">
           </div>
         </div>
         
         <div class="action-bar">
           <div class="action-bar-left">
-            <button class="action-button select-all-btn" id="selectAllBtn">全选</button>
-            <button class="action-button delete-files-btn" id="deleteFilesBtn">删除所选文件</button>
+            <h3>文件操作：</h3>
+            <button class="action-button select-all-btn" id="selectAllBtn">全选/取消</button>
+            <button class="action-button delete-files-btn" id="deleteFilesBtn">删除选中</button>
           </div>
           <div class="action-bar-right">
-            <h3>分类管理</h3>
-            <select id="categoryDeleteSelect">
-              <option value="">选择要删除的分类</option>
+            <h3>分类管理：</h3>
+            <select id="categoryDeleteSelect" name="categoryDeleteSelect">
               ${categoryOptions}
             </select>
             <button class="action-button delete-category-btn" id="deleteCategoryBtn">删除分类</button>
@@ -3740,7 +3739,7 @@ async function initDatabase(config) {
           ${fileCards}
         </div>
         
-        <!-- 通用确认弹窗 -->
+        <!-- 确认删除弹窗 -->
         <div id="confirmModal" class="modal">
           <div class="modal-content">
             <h3 class="modal-title">确认操作</h3>
@@ -3752,25 +3751,11 @@ async function initDatabase(config) {
           </div>
         </div>
         
-        <!-- 二维码弹窗 -->
-        <div id="qrModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000; justify-content:center; align-items:center;">
-          <div style="background:white; padding:2rem; border-radius:15px; box-shadow:0 15px 40px rgba(0,0,0,0.3); text-align:center; width:90%; max-width:350px;">
-            <h3 style="color:#2c3e50; font-size:1.3rem; margin-top:0; margin-bottom:0.5rem;">分享文件</h3>
-            <div id="qrFileName" style="color:#7f8c8d; font-size:0.9rem; margin-bottom:1rem; word-break:break-all;"></div>
-            <div id="qrcode" style="margin:1.5rem auto;"></div>
-            <div style="display:flex; gap:0.5rem; justify-content:center; margin-top:1.5rem;">
-              <button id="qrCopyBtn" style="background:#3498db; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">复制链接</button>
-              <a id="qrDownloadBtn" download style="background:#2ecc71; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center;">下载文件</a>
-              <button id="qrCloseBtn" style="background:#95a5a6; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">关闭</button>
-            </div>
-          </div>
-        </div>
-        
         <!-- 修改后缀弹窗 -->
         <div id="editSuffixModal" class="modal">
           <div class="modal-content">
             <h3 class="modal-title">修改文件后缀</h3>
-            <input type="text" id="editSuffixInput" placeholder="输入新的文件后缀">
+            <input type="text" id="editSuffixInput" name="editSuffixInput" placeholder="输入新的文件后缀">
             <div class="modal-buttons">
               <button class="modal-button modal-confirm" id="editSuffixConfirm">确认</button>
               <button class="modal-button modal-cancel" id="editSuffixCancel">取消</button>
@@ -3780,6 +3765,12 @@ async function initDatabase(config) {
       </div>
   
       <script>
+        // 全局变量声明
+        let currentShareUrl = '';
+        let currentConfirmCallback = null;
+        let currentEditUrl = '';
+        let confirmModal, confirmModalMessage, confirmModalConfirm, confirmModalCancel, editSuffixModal;
+
         // 设置背景图片
         async function setBingBackground() {
           try {
@@ -3795,20 +3786,15 @@ async function initDatabase(config) {
         }
         // 延迟加载背景，优先显示内容
         setTimeout(setBingBackground, 1000);
-
-        // 全局变量定义，确保所有元素都能被正确引用
-        let currentShareUrl = '';
-        let currentConfirmCallback = null;
-        let confirmModal, confirmModalMessage, confirmModalConfirm, confirmModalCancel;
-        let qrModal, qrCloseBtn, qrCopyBtn, editSuffixModal;
         
         // DOM加载完成后初始化
         document.addEventListener('DOMContentLoaded', function() {
+          console.log('DOM已加载，初始化页面...');
           // 获取DOM元素引用
           const searchInput = document.getElementById('searchInput');
           const categoryFilter = document.getElementById('categoryFilter');
           const fileGrid = document.getElementById('fileGrid');
-          const fileCards = Array.from(fileGrid.children);
+          const fileCards = Array.from(fileGrid?.children || []);
           const selectAllBtn = document.getElementById('selectAllBtn');
           const deleteFilesBtn = document.getElementById('deleteFilesBtn');
           const deleteCategoryBtn = document.getElementById('deleteCategoryBtn');
@@ -3816,10 +3802,12 @@ async function initDatabase(config) {
           confirmModalMessage = document.getElementById('confirmModalMessage');
           confirmModalConfirm = document.getElementById('confirmModalConfirm');
           confirmModalCancel = document.getElementById('confirmModalCancel');
-          qrModal = document.getElementById('qrModal');
-          qrCloseBtn = document.getElementById('qrCloseBtn');
-          qrCopyBtn = document.getElementById('qrCopyBtn');
           editSuffixModal = document.getElementById('editSuffixModal');
+          
+          console.log('页面元素引用:', {
+            confirmModal: !!confirmModal,
+            editSuffixModal: !!editSuffixModal
+          });
           
           // 绑定事件处理器
           if (searchInput) searchInput.addEventListener('input', filterFiles);
@@ -3827,10 +3815,22 @@ async function initDatabase(config) {
           if (selectAllBtn) selectAllBtn.addEventListener('click', toggleSelectAll);
           if (deleteFilesBtn) deleteFilesBtn.addEventListener('click', confirmDeleteSelected);
           if (deleteCategoryBtn) deleteCategoryBtn.addEventListener('click', confirmDeleteCategory);
-          if (qrCloseBtn) qrCloseBtn.addEventListener('click', closeQrModal);
-          if (qrCopyBtn) qrCopyBtn.addEventListener('click', copyCurrentShareUrl);
           if (confirmModalConfirm) confirmModalConfirm.addEventListener('click', handleConfirmModalConfirm);
           if (confirmModalCancel) confirmModalCancel.addEventListener('click', closeConfirmModal);
+          
+          // 初始化修改后缀对话框
+          const editSuffixConfirm = document.getElementById('editSuffixConfirm');
+          const editSuffixCancel = document.getElementById('editSuffixCancel');
+          
+          if (editSuffixCancel) {
+            editSuffixCancel.addEventListener('click', () => {
+              if (editSuffixModal) editSuffixModal.classList.remove('show');
+            });
+          }
+          
+          if (editSuffixConfirm) {
+            editSuffixConfirm.addEventListener('click', updateFileSuffix);
+          }
           
           // 点击弹窗外部关闭弹窗
           window.addEventListener('click', handleWindowClick);
@@ -3970,6 +3970,7 @@ async function initDatabase(config) {
             
             // 二维码容器
             const qrContainer = document.createElement('div');
+            qrContainer.id = 'qrcode-container';
             qrContainer.style.cssText = 'margin:20px auto;height:200px;width:200px;';
             
             // 生成二维码
@@ -3993,6 +3994,7 @@ async function initDatabase(config) {
             
             // 复制按钮
             const copyBtn = document.createElement('button');
+            copyBtn.id = 'copy-link-btn';
             copyBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#3498db;color:white;cursor:pointer;';
             copyBtn.textContent = '复制';
             copyBtn.onclick = function() {
@@ -4008,6 +4010,7 @@ async function initDatabase(config) {
             
             // 下载按钮
             const downloadBtn = document.createElement('a');
+            downloadBtn.id = 'download-file-btn';
             downloadBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#2ecc71;color:white;cursor:pointer;text-decoration:none;display:inline-block;text-align:center;';
             downloadBtn.textContent = '下载';
             downloadBtn.href = url;
@@ -4015,6 +4018,7 @@ async function initDatabase(config) {
             
             // 取消按钮
             const cancelBtn = document.createElement('button');
+            cancelBtn.id = 'close-share-btn';
             cancelBtn.style.cssText = 'flex:1;padding:8px 15px;border:none;border-radius:4px;background:#95a5a6;color:white;cursor:pointer;';
             cancelBtn.textContent = '取消';
             cancelBtn.onclick = function() {
@@ -4130,7 +4134,9 @@ async function initDatabase(config) {
         
         // 修改后缀
         function showEditSuffixModal(url) {
+          console.log('显示修改后缀弹窗:', url, '弹窗元素:', !!editSuffixModal);
           if (!editSuffixModal) {
+            console.error('修改后缀弹窗元素不存在');
             alert('修改后缀功能不可用');
             return;
           }
@@ -4149,6 +4155,8 @@ async function initDatabase(config) {
           if (editSuffixInput) {
             editSuffixInput.value = currentSuffix;
             editSuffixModal.classList.add('show');
+          } else {
+            console.error('找不到编辑后缀输入框');
           }
         }
         
@@ -4237,22 +4245,6 @@ async function initDatabase(config) {
             showConfirmModal('删除分类失败: ' + error.message, null, true);
           }
         }
-        
-        // 初始化修改后缀对话框
-        document.addEventListener('DOMContentLoaded', function() {
-          const editSuffixConfirm = document.getElementById('editSuffixConfirm');
-          const editSuffixCancel = document.getElementById('editSuffixCancel');
-          
-          if (editSuffixCancel) {
-            editSuffixCancel.addEventListener('click', () => {
-              if (editSuffixModal) editSuffixModal.classList.remove('show');
-            });
-          }
-          
-          if (editSuffixConfirm) {
-            editSuffixConfirm.addEventListener('click', updateFileSuffix);
-          }
-        });
         
         // 更新文件后缀
         async function updateFileSuffix() {
@@ -4701,5 +4693,30 @@ async function initDatabase(config) {
       console.error('复制出错:', error);
       prompt('请手动复制以下链接:', url);
     }
+  }
+    
+  // DOM加载完成后即初始化全局变量
+  try {
+    document.addEventListener('DOMContentLoaded', function() {
+      try {
+        console.log('DOM加载完成，初始化页面元素引用');
+        
+        // 获取修改后缀弹窗元素
+        window.editSuffixModal = document.getElementById('editSuffixModal');
+        if (window.editSuffixModal) {
+          console.log('成功获取修改后缀弹窗元素');
+        } else {
+          console.error('无法获取修改后缀弹窗元素');
+        }
+        
+        // 设置全局变量，确保即使在脚本加载前也能访问
+        window.currentEditUrl = '';
+        window.showEditSuffixModal = showEditSuffixModal;
+      } catch (error) {
+        console.error('初始化页面元素引用时出错:', error);
+      }
+    });
+  } catch (error) {
+    console.error('添加DOMContentLoaded事件监听器失败:', error);
   }
     
