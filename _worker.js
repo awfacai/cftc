@@ -444,14 +444,25 @@ async function initDatabase(config) {
       const url = new URL(request.url);
       const { pathname } = url;
       
-      // 登录权限检查
-      if (config.enableAuth && 
-          pathname !== '/' && 
-          pathname !== '/login' && 
-          pathname !== '/webhook' && 
-          pathname !== '/config' && 
-          !pathname.startsWith('/login') && 
-          !authenticate(request, config)) {
+      // 公开路径，不需要认证
+      const publicPaths = [
+        '/login',    // 登录页面
+        '/webhook',  // Telegram webhook
+        '/config',   // 公开配置
+        '/bing'      // 背景图片API
+      ];
+      
+      // 检查是否为静态资源文件扩展名
+      const isStaticAsset = /\.(jpg|jpeg|png|gif|ico|css|js)$/i.test(pathname);
+      
+      // 严格的认证检查 - 只有公开路径和静态资源可以不登录访问
+      const needsAuth = config.enableAuth && 
+                        !publicPaths.includes(pathname) && 
+                        !isStaticAsset;
+      
+      if (needsAuth && !authenticate(request, config)) {
+        console.log(`需要登录: ${pathname}`);
+        
         // 如果是API请求，返回JSON格式的授权错误
         if (pathname.startsWith('/api/') || 
             request.headers.get('Accept')?.includes('application/json') ||
@@ -465,7 +476,13 @@ async function initDatabase(config) {
             headers: { 'Content-Type': 'application/json' }
           });
         }
-        // 否则重定向到登录页面
+        
+        // 对于根路径重定向到登录
+        if (pathname === '/') {
+          return Response.redirect(`${url.origin}/login`, 302);
+        }
+        
+        // 对于其他页面请求重定向到登录页面，保留原始URL
         return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(pathname)}`, 302);
       }
       
@@ -493,38 +510,38 @@ async function initDatabase(config) {
         }
       }
       
-      if (pathname === '/config') {
-        const safeConfig = { maxSizeMB: config.maxSizeMB };
-        return new Response(JSON.stringify(safeConfig), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      if (pathname === '/webhook' && request.method === 'POST') {
-        return handleTelegramWebhook(request, config);
-      }
-      if (pathname === '/create-category' && request.method === 'POST') {
-        return handleCreateCategoryRequest(request, config);
-      }
-      if (pathname === '/delete-category' && request.method === 'POST') {
-        return handleDeleteCategoryRequest(request, config);
-      }
-      if (pathname === '/update-suffix' && request.method === 'POST') {
-        return handleUpdateSuffixRequest(request, config);
-      }
+      // 路由定义 - 根据路径分发请求
+      // 注意：handleAuthRequest已废弃，直接使用特定路由处理器
       const routes = {
-        '/': () => handleAuthRequest(request, config),
+        '/': () => config.enableAuth && !authenticate(request, config) 
+              ? Response.redirect(`${url.origin}/login`, 302) 
+              : handleUploadRequest(request, config),
         '/login': () => handleLoginRequest(request, config),
         '/upload': () => handleUploadRequest(request, config),
         '/admin': () => handleAdminRequest(request, config),
         '/delete': () => handleDeleteRequest(request, config),
         '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
         '/search': () => handleSearchRequest(request, config),
-        '/bing': handleBingImagesRequest
+        '/webhook': () => handleTelegramWebhook(request, config),
+        '/create-category': () => handleCreateCategoryRequest(request, config),
+        '/delete-category': () => handleDeleteCategoryRequest(request, config),
+        '/update-suffix': () => handleUpdateSuffixRequest(request, config),
+        '/config': () => {
+          const safeConfig = { maxSizeMB: config.maxSizeMB };
+          return new Response(JSON.stringify(safeConfig), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        },
+        '/bing': () => handleBingImagesRequest()
       };
+      
+      // 根据路径执行相应处理函数
       const handler = routes[pathname];
       if (handler) {
         return await handler();
       }
+      
+      // 默认处理文件请求
       return await handleFileRequest(request, config);
     }
   };
@@ -1490,7 +1507,8 @@ async function initDatabase(config) {
     if (config.enableAuth) {
       const isAuthenticated = authenticate(request, config);
       if (!isAuthenticated) {
-        return handleLoginRequest(request, config);
+        const url = new URL(request.url);
+        return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent('/upload')}`, 302);
       }
       return handleUploadRequest(request, config);
     }
@@ -1498,28 +1516,45 @@ async function initDatabase(config) {
   }
   async function handleLoginRequest(request, config) {
     if (request.method === 'POST') {
-      const { username, password } = await request.json();
-      if (username === config.username && password === config.password) {
-        const expirationDate = new Date();
-        // 使用配置的cookie值（天数）
-        const cookieDays = config.cookie || 7; // 默认7天
-        expirationDate.setDate(expirationDate.getDate() + cookieDays);
-        const expirationTimestamp = expirationDate.getTime();
-        const tokenData = JSON.stringify({
-          username: config.username,
-          expiration: expirationTimestamp
-        });
-        const token = btoa(tokenData);
-        const cookie = `auth_token=${token}; Path=/; HttpOnly; Secure; Expires=${expirationDate.toUTCString()}`;
-        return new Response("登录成功", {
-          status: 200,
-          headers: {
-            "Set-Cookie": cookie,
-            "Content-Type": "text/plain"
-          }
-        });
+      try {
+        const { username, password } = await request.json();
+        // 先检查认证是否启用
+        if (!config.enableAuth) {
+          return new Response("认证系统未启用", { status: 403 });
+        }
+        
+        // 检查凭据是否有效
+        if (!config.username || !config.password) {
+          console.error("认证配置错误: 缺少用户名或密码");
+          return new Response("系统配置错误：未设置用户名或密码", { status: 500 });
+        }
+        
+        // 检查登录凭据
+        if (username === config.username && password === config.password) {
+          const expirationDate = new Date();
+          // 使用配置的cookie值（天数）
+          const cookieDays = config.cookie || 7; // 默认7天
+          expirationDate.setDate(expirationDate.getDate() + cookieDays);
+          const expirationTimestamp = expirationDate.getTime();
+          const tokenData = JSON.stringify({
+            username: config.username,
+            expiration: expirationTimestamp
+          });
+          const token = btoa(tokenData);
+          const cookie = `auth_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Expires=${expirationDate.toUTCString()}`;
+          return new Response("登录成功", {
+            status: 200,
+            headers: {
+              "Set-Cookie": cookie,
+              "Content-Type": "text/plain"
+            }
+          });
+        }
+        return new Response("用户名或密码错误", { status: 401 });
+      } catch (error) {
+        console.error("处理登录请求失败:", error);
+        return new Response("处理登录请求失败: " + error.message, { status: 400 });
       }
-      return new Response("认证失败", { status: 401 });
     }
     const html = generateLoginPage();
     return new Response(html, {
@@ -1939,6 +1974,15 @@ async function initDatabase(config) {
         return new Response('Not Found', { status: 404 });
       }
       
+      // 检查认证 - 未启用认证或已认证通过才允许访问文件
+      if (config.enableAuth && !authenticate(request, config)) {
+        // 对于文件请求，可以返回403或者重定向到登录页面
+        return new Response('需要登录才能访问文件', { 
+          status: 403,
+          headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
+        });
+      }
+      
       // 检查缓存
       const cacheKey = `file:${path}`;
       if (config.fileCache && config.fileCache.has(cacheKey)) {
@@ -2318,7 +2362,7 @@ async function initDatabase(config) {
       <meta name="description" content="文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>登录</title>
+      <title>登录验证</title>
       <style>
         body {
           font-family: 'Segoe UI', Arial, sans-serif;
@@ -2404,77 +2448,95 @@ async function initDatabase(config) {
           border-radius: 8px;
           display: none;
         }
+        .locked-info {
+          text-align: center;
+          margin-top: 1rem;
+          color: #7f8c8d;
+          font-size: 0.9rem;
+        }
+        .locked-info i {
+          margin-right: 5px;
+          color: #e74c3c;
+        }
       </style>
     </head>
     <body>
       <div class="container">
         <div class="header">
-          <h1>登录</h1>
-          <p>请输入管理员账号和密码</p>
+          <h1>登录验证</h1>
+          <p>需要登录才能访问系统</p>
         </div>
         <form id="loginForm">
           <div class="form-group">
             <label for="username">用户名</label>
-            <input type="text" id="username" name="username" required>
+            <input type="text" id="username" name="username" required autocomplete="username">
           </div>
           <div class="form-group">
             <label for="password">密码</label>
-            <input type="password" id="password" name="password" required>
+            <input type="password" id="password" name="password" required autocomplete="current-password">
           </div>
-          <button type="submit" class="btn-login">登录</button>
+          <button type="submit" class="btn-login">登录验证</button>
         </form>
         <div id="errorMessage" class="error-message"></div>
         <div id="successMessage" class="success-message"></div>
+        <div class="locked-info">
+          <i>🔒</i> 此站点受到保护，访问任何页面都需要登录
+        </div>
       </div>
       <script>
-        // 获取重定向参数
-        const urlParams = new URLSearchParams(window.location.search);
-        const redirectPath = urlParams.get('redirect') || '/upload';
-        
-        document.getElementById('loginForm').addEventListener('submit', async function(event) {
-          event.preventDefault();
+        document.addEventListener('DOMContentLoaded', function() {
+          // 获取重定向参数
+          const urlParams = new URLSearchParams(window.location.search);
+          const redirectPath = urlParams.get('redirect') || '/upload';
           
-          const username = document.getElementById('username').value;
-          const password = document.getElementById('password').value;
+          const loginForm = document.getElementById('loginForm');
           const errorMessage = document.getElementById('errorMessage');
           const successMessage = document.getElementById('successMessage');
           
-          errorMessage.style.display = 'none';
-          successMessage.style.display = 'none';
-          
-          if (!username || !password) {
-            errorMessage.textContent = '请输入用户名和密码';
-            errorMessage.style.display = 'block';
-            return;
-          }
-          
-          try {
-            const response = await fetch('/login', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({ username, password })
-            });
+          loginForm.addEventListener('submit', async function(event) {
+            event.preventDefault();
             
-            if (response.ok) {
-              successMessage.textContent = '登录成功，正在跳转...';
-              successMessage.style.display = 'block';
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            errorMessage.style.display = 'none';
+            successMessage.style.display = 'none';
+            
+            if (!username || !password) {
+              errorMessage.textContent = '请输入用户名和密码';
+              errorMessage.style.display = 'block';
+              return;
+            }
+            
+            try {
+              // 注意：确保提交到/login路径
+              const response = await fetch('/login', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ username, password })
+              });
               
-              // 延迟跳转，让用户看到成功提示
-              setTimeout(() => {
-                window.location.href = redirectPath;
-              }, 1000);
-            } else {
-              const data = await response.text();
-              errorMessage.textContent = data || '用户名或密码错误';
+              if (response.ok) {
+                successMessage.textContent = '登录成功，正在跳转...';
+                successMessage.style.display = 'block';
+                
+                // 延迟跳转，让用户看到成功提示
+                setTimeout(() => {
+                  window.location.href = redirectPath;
+                }, 1000);
+              } else {
+                const data = await response.text();
+                errorMessage.textContent = data || '用户名或密码错误';
+                errorMessage.style.display = 'block';
+              }
+            } catch (error) {
+              console.error('登录错误:', error);
+              errorMessage.textContent = '登录请求失败，请稍后重试';
               errorMessage.style.display = 'block';
             }
-          } catch (error) {
-            errorMessage.textContent = '登录请求失败，请稍后重试';
-            errorMessage.style.display = 'block';
-            console.error('登录错误:', error);
-          }
+          });
         });
       </script>
     </body>
