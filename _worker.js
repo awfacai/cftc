@@ -1103,13 +1103,16 @@ async function initDatabase(config) {
           });
         } else {
           // 并行查询最近文件
-          const recentFiles = await config.database.prepare(`
+          const recentFilesPromise = config.database.prepare(`
             SELECT id, url, created_at, file_name, storage_type 
             FROM files 
             WHERE chat_id = ?
             ORDER BY created_at DESC 
             LIMIT 10
           `).bind(chatId).all();
+          
+          await answerPromise;
+          const recentFiles = await recentFilesPromise;
           
           if (!recentFiles.results || recentFiles.results.length === 0) {
             await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
@@ -1118,7 +1121,8 @@ async function initDatabase(config) {
           
           const filesList = recentFiles.results.map((file, i) => {
             const fileName = file.file_name || getFileName(file.url);
-            const date = new Date(file.created_at * 1000).toLocaleString();
+            // 使用 formatDate 函数处理日期
+            const date = formatDate(file.created_at);
             return `${i + 1}. ${fileName}\n   📅 ${date}\n   🔗 ${file.url}`;
           }).join('\n\n');
           
@@ -4382,3 +4386,4 @@ async function initDatabase(config) {
   } catch (error) {
     console.error('添加DOMContentLoaded事件监听器失败:', error);
   }
+    
