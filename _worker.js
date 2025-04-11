@@ -407,6 +407,15 @@ async function initDatabase(config) {
         return new Response('缺少必要配置: DATABASE 环境变量未设置', { status: 500 });
       }
       
+      // 创建请求性能追踪记录
+      const startTime = Date.now();
+      const perfData = {
+        start: startTime,
+        dbInit: 0,
+        processing: 0,
+        total: 0
+      };
+      
       const config = {
         domain: env.DOMAIN || request.headers.get("host") || '',
         database: env.DATABASE,
@@ -420,8 +429,16 @@ async function initDatabase(config) {
         maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
         bucket: env.BUCKET,
         fileCache: new Map(),
-        fileCacheTTL: 3600000 // 1小时缓存
+        fileCacheTTL: 3600000, // 1小时缓存
+        responseCache: new Map(), // 页面响应缓存
+        responseCacheTTL: 300000, // 5分钟页面缓存
+        perfData: perfData // 性能数据
       };
+      
+      // 检查并处理预检请求
+      if (request.method === 'OPTIONS') {
+        return handleCorsRequest();
+      }
       
       // 确保认证配置有效
       if (config.enableAuth) {
@@ -432,12 +449,36 @@ async function initDatabase(config) {
       }
       
       try {
+        // 处理favicon请求
         if (request.url.includes('favicon.ico')) {
-          // 对于favicon请求直接返回204，避免数据库初始化
           return new Response(null, { status: 204 });
         }
         
+        // 优先检查响应缓存
+        const cacheKey = request.url + (authenticate(request, config) ? ':auth' : ':noauth');
+        if (config.responseCache.has(cacheKey)) {
+          const cachedData = config.responseCache.get(cacheKey);
+          if (Date.now() - cachedData.timestamp < config.responseCacheTTL) {
+            // 添加缓存命中信息头
+            const response = cachedData.response.clone();
+            const headers = new Headers(response.headers);
+            headers.set('X-Cache', 'HIT');
+            headers.set('X-Cache-Age', Math.floor((Date.now() - cachedData.timestamp) / 1000) + 's');
+            
+            return new Response(response.body, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: headers
+            });
+          } else {
+            config.responseCache.delete(cacheKey);
+          }
+        }
+        
+        const dbInitStart = Date.now();
         await initDatabase(config);
+        config.perfData.dbInit = Date.now() - dbInitStart;
+        
       } catch (error) {
         console.error(`数据库初始化失败: ${error.message}`);
         return new Response(`数据库初始化失败: ${error.message}`, { 
@@ -461,41 +502,124 @@ async function initDatabase(config) {
       }
       
       const { pathname } = new URL(request.url);
+      let response;
+      
+      const processingStart = Date.now();
+      
+      // 处理主要请求
       if (pathname === '/config') {
         const safeConfig = { maxSizeMB: config.maxSizeMB };
-        return new Response(JSON.stringify(safeConfig), {
+        response = new Response(JSON.stringify(safeConfig), {
           headers: { 'Content-Type': 'application/json' }
         });
+      } else if (pathname === '/webhook' && request.method === 'POST') {
+        response = await handleTelegramWebhook(request, config);
+      } else if (pathname === '/create-category' && request.method === 'POST') {
+        response = await handleCreateCategoryRequest(request, config);
+      } else if (pathname === '/delete-category' && request.method === 'POST') {
+        response = await handleDeleteCategoryRequest(request, config);
+      } else if (pathname === '/update-suffix' && request.method === 'POST') {
+        response = await handleUpdateSuffixRequest(request, config);
+      } else {
+        const routes = {
+          '/': () => handleAuthRequest(request, config),
+          '/login': () => handleLoginRequest(request, config),
+          '/upload': () => handleUploadRequest(request, config),
+          '/admin': () => handleAdminRequest(request, config),
+          '/delete': () => handleDeleteRequest(request, config),
+          '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
+          '/search': () => handleSearchRequest(request, config),
+          '/bing': handleBingImagesRequest
+        };
+        
+        const handler = routes[pathname];
+        if (handler) {
+          response = await handler();
+        } else {
+          response = await handleFileRequest(request, config);
+        }
       }
-      if (pathname === '/webhook' && request.method === 'POST') {
-        return handleTelegramWebhook(request, config);
+      
+      config.perfData.processing = Date.now() - processingStart;
+      
+      // 处理响应（添加缓存和性能信息）
+      response = await enhanceResponse(response, request, config);
+      
+      // 记录总处理时间
+      config.perfData.total = Date.now() - startTime;
+      
+      // 仅对GET请求和特定HTML响应进行缓存
+      if (request.method === 'GET' && 
+          (pathname === '/' || pathname === '/login' || pathname === '/upload' || pathname === '/admin') &&
+          response.headers.get('Content-Type')?.includes('text/html')) {
+        // 缓存响应
+        config.responseCache.set(cacheKey, {
+          response: response.clone(),
+          timestamp: Date.now()
+        });
       }
-      if (pathname === '/create-category' && request.method === 'POST') {
-        return handleCreateCategoryRequest(request, config);
-      }
-      if (pathname === '/delete-category' && request.method === 'POST') {
-        return handleDeleteCategoryRequest(request, config);
-      }
-      if (pathname === '/update-suffix' && request.method === 'POST') {
-        return handleUpdateSuffixRequest(request, config);
-      }
-      const routes = {
-        '/': () => handleAuthRequest(request, config),
-        '/login': () => handleLoginRequest(request, config),
-        '/upload': () => handleUploadRequest(request, config),
-        '/admin': () => handleAdminRequest(request, config),
-        '/delete': () => handleDeleteRequest(request, config),
-        '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
-        '/search': () => handleSearchRequest(request, config),
-        '/bing': handleBingImagesRequest
-      };
-      const handler = routes[pathname];
-      if (handler) {
-        return await handler();
-      }
-      return await handleFileRequest(request, config);
+      
+      return response;
     }
   };
+  
+  // 处理CORS请求
+  function handleCorsRequest() {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Max-Age': '86400'
+      }
+    });
+  }
+  
+  // 增强响应
+  async function enhanceResponse(response, request, config) {
+    if (!response) {
+      return new Response('未处理的请求', { status: 404 });
+    }
+    
+    // 添加性能头信息
+    const headers = new Headers(response.headers);
+    headers.set('X-Response-Time', `${config.perfData.total}ms`);
+    
+    if (config.perfData.dbInit > 0) {
+      headers.set('X-DB-Init-Time', `${config.perfData.dbInit}ms`);
+    }
+    
+    headers.set('X-Processing-Time', `${config.perfData.processing}ms`);
+    headers.set('X-Cache', 'MISS');
+    
+    // 根据Accept-Encoding压缩响应
+    const acceptEncoding = request.headers.get('Accept-Encoding') || '';
+    let body = response.body;
+    
+    // 只压缩HTML和JSON响应
+    const contentType = response.headers.get('Content-Type') || '';
+    const compressible = contentType.includes('text/html') || 
+                        contentType.includes('application/json') || 
+                        contentType.includes('text/css') || 
+                        contentType.includes('text/javascript');
+    
+    if (compressible && response.status === 200) {
+      if (acceptEncoding.includes('br')) {
+        // Brotli压缩 (Cloudflare自动处理)
+        headers.set('Content-Encoding', 'br');
+      } else if (acceptEncoding.includes('gzip')) {
+        // Gzip压缩 (Cloudflare自动处理)
+        headers.set('Content-Encoding', 'gzip');
+      }
+    }
+    
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: headers
+    });
+  }
   async function handleTelegramWebhook(request, config) {
     try {
       const update = await request.json();
@@ -1054,20 +1178,25 @@ async function initDatabase(config) {
             retryFormData.append('chat_id', config.tgStorageChatId);
             retryFormData.append('document', blob, fileName);
             retryFormData.append('caption', `File: ${fileName}\nType: ${mimeType}\nSize: ${formatSize(parseInt(contentLength || '0'))}`);
-            const retryResponse = await fetch(
-              `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
-              { method: 'POST', body: retryFormData }
-            );
-            if (!retryResponse.ok) {
-              console.error('Telegram文档上传也失败:', await retryResponse.text());
+            try {
+              const retryResponse = await fetch(
+                `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
+                { method: 'POST', body: retryFormData }
+              );
+              if (!retryResponse.ok) {
+                console.error('Telegram文档上传也失败:', await retryResponse.text());
+                throw new Error('Telegram文件上传失败');
+              }
+              const retryData = await retryResponse.json();
+              const retryResult = retryData.result;
+              messageId = retryResult.message_id;
+              fileId = retryResult.document?.file_id;
+              if (!fileId || !messageId) {
+                throw new Error('重试上传后仍未获取到有效的文件ID');
+              }
+            } catch (retryError) {
+              console.error('重试上传失败:', retryError);
               throw new Error('Telegram文件上传失败');
-            }
-            const retryData = await retryResponse.json();
-            const retryResult = retryData.result;
-            messageId = retryResult.message_id;
-            fileId = retryResult.document?.file_id;
-            if (!fileId || !messageId) {
-              throw new Error('重试上传后仍未获取到有效的文件ID');
             }
           } else {
             throw new Error('Telegram参数配置错误: ' + errorText);
@@ -2846,15 +2975,7 @@ async function initDatabase(config) {
           outline: none;
           border-color: #3498db;
         }
-        .backup {
-          color: #3498db;
-          text-decoration: none;
-          font-size: 1rem;
-          transition: color 0.3s ease;
-        }
-        .backup:hover {
-          color: #2980b9;
-        }
+        /* 返回上传按钮样式 */
         .return-btn {
           background: #2ecc71;
           color: white;
@@ -3259,7 +3380,6 @@ async function initDatabase(config) {
               <option value="">所有分类</option>
               ${categoryOptions}
             </select>
-            <a href="javascript:void(0)" class="backup" onclick="downloadBackup()">备份数据</a>
             <a href="/upload" class="return-btn">返回上传</a>
           </div>
         </div>
