@@ -375,6 +375,20 @@ async function initDatabase(config) {
     console.error('Failed to set webhook after maximum retries');
       return false;
     }
+  const cache = new Map();
+
+  function getCachedData(key) {
+    const cached = cache.get(key);
+    if (cached && (Date.now() - cached.timestamp < 60000)) { // 缓存1分钟
+      return cached.data;
+    }
+    return null;
+  }
+
+  function setCachedData(key, data) {
+    cache.set(key, { data, timestamp: Date.now() });
+  }
+
   export default {
     async fetch(request, env) {
       const config = {
@@ -1121,21 +1135,18 @@ async function initDatabase(config) {
     }
   }
   function authenticate(request, config) {
-    const cookies = request.headers.get("Cookie") || "";
-    const authToken = cookies.match(/auth_token=([^;]+)/);
-    if (authToken) {
-      try {
-        const tokenData = JSON.parse(atob(authToken[1]));
-        const now = Date.now();
-        if (now > tokenData.expiration) {
-          console.log("Token已过期");
-          return false;
-        }
-        return tokenData.username === config.username;
+    const cookieHeader = request.headers.get('Cookie');
+    if (!cookieHeader) return false;
+    const cookies = Object.fromEntries(cookieHeader.split('; ').map(c => c.split('=')));
+    const token = cookies['auth_token'];
+    if (!token) return false;
+    try {
+      const tokenData = JSON.parse(atob(token));
+      if (tokenData.username === config.username && tokenData.expiration > Date.now()) {
+        return true;
+      }
     } catch (error) {
-        console.error("Token的用户名不匹配", error);
-      return false;
-    }
+      console.error('Token解析失败:', error);
     }
     return false;
   }
@@ -1913,7 +1924,7 @@ async function initDatabase(config) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744302340226.ico" type="image/x-icon">
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2078,7 +2089,7 @@ async function initDatabase(config) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744302340226.ico" type="image/x-icon">
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2688,7 +2699,7 @@ async function initDatabase(config) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744302340226.ico" type="image/x-icon">
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3183,7 +3194,6 @@ async function initDatabase(config) {
         let currentShareUrl = '';
         let currentConfirmCallback = null;
         let currentEditUrl = '';
-        let confirmModal, confirmModalMessage, confirmModalConfirm, confirmModalCancel, editSuffixModal;
         async function setBingBackground() {
           try {
             const response = await fetch('/bing', { cache: 'no-store' });
@@ -3863,7 +3873,7 @@ async function initDatabase(config) {
   }
   async function fetchNotification() {
     try {
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/cftc/refs/heads/main/cftc/panel.md');
+      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
       if (!response.ok) {
         return null;
       }
