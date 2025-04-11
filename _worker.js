@@ -4342,4 +4342,3 @@ async function initDatabase(config) {
   } catch (error) {
     console.error('添加DOMContentLoaded事件监听器失败:', error);
   }
-    
