@@ -420,7 +420,12 @@ async function initDatabase(config) {
         maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
         bucket: env.BUCKET,
         fileCache: new Map(),
-        fileCacheTTL: 3600000 // 1小时缓存
+        fileCacheTTL: 3600000, // 1小时缓存
+        // 添加按钮缓存，提高响应速度
+        buttonCache: new Map(),
+        buttonCacheTTL: 600000, // 按钮缓存10分钟过期
+        menuCache: new Map(),
+        menuCacheTTL: 300000 // 菜单缓存5分钟过期
       };
       
       // 确保认证配置有效
@@ -431,12 +436,40 @@ async function initDatabase(config) {
         }
       }
       
-      try {
-        if (request.url.includes('favicon.ico')) {
-          // 对于favicon请求直接返回204，避免数据库初始化
-          return new Response(null, { status: 204 });
+      // favicon.ico处理
+      if (request.url.includes('favicon.ico')) {
+        return new Response(null, { status: 204 });
+      }
+      
+      const url = new URL(request.url);
+      const { pathname } = url;
+      
+      // 登录权限检查
+      if (config.enableAuth && 
+          pathname !== '/' && 
+          pathname !== '/login' && 
+          pathname !== '/webhook' && 
+          pathname !== '/config' && 
+          !pathname.startsWith('/login') && 
+          !authenticate(request, config)) {
+        // 如果是API请求，返回JSON格式的授权错误
+        if (pathname.startsWith('/api/') || 
+            request.headers.get('Accept')?.includes('application/json') ||
+            request.method === 'POST') {
+          return new Response(JSON.stringify({ 
+            status: 0, 
+            error: "未授权访问",
+            redirect: `${url.origin}/login?redirect=${encodeURIComponent(pathname)}`
+          }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' }
+          });
         }
-        
+        // 否则重定向到登录页面
+        return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(pathname)}`, 302);
+      }
+      
+      try {
         await initDatabase(config);
       } catch (error) {
         console.error(`数据库初始化失败: ${error.message}`);
@@ -460,7 +493,6 @@ async function initDatabase(config) {
         }
       }
       
-      const { pathname } = new URL(request.url);
       if (pathname === '/config') {
         const safeConfig = { maxSizeMB: config.maxSizeMB };
         return new Response(JSON.stringify(safeConfig), {
@@ -662,88 +694,130 @@ async function initDatabase(config) {
     }
   }
   async function sendPanel(chatId, userSetting, config) {
-    let categoryName = '默认';
-    let categoryId = userSetting && userSetting.category_id;
-    if (categoryId) {
-      const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?').bind(categoryId).first();
+    try {
+      // 使用菜单缓存
+      const cacheKey = `menu:${chatId}:${userSetting.storage_type || 'default'}`;
+      if (config.menuCache && config.menuCache.has(cacheKey)) {
+        const cachedData = config.menuCache.get(cacheKey);
+        if (Date.now() - cachedData.timestamp < config.menuCacheTTL) {
+          console.log(`使用缓存的菜单: ${cacheKey}`);
+          
+          // 发送缓存的菜单消息
+          const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: cachedData.menuData
+          });
+          
+          if (!response.ok) {
+            // 缓存可能过期，删除并重新生成
+            config.menuCache.delete(cacheKey);
+            console.log(`缓存菜单发送失败，重新生成: ${await response.text()}`);
+          } else {
+            return await response.json();
+          }
+        } else {
+          // 缓存过期，删除
+          config.menuCache.delete(cacheKey);
+        }
+      }
+      
+      // 生成菜单
+      const { messageBody, keyboard } = await generateMainMenu(chatId, userSetting, config);
+      
+      // 准备请求数据
+      const menuData = JSON.stringify({
+        chat_id: chatId,
+        text: messageBody,
+        parse_mode: 'HTML',
+        reply_markup: keyboard
+      });
+      
+      // 缓存菜单数据
+      if (config.menuCache) {
+        config.menuCache.set(cacheKey, {
+          menuData,
+          timestamp: Date.now()
+        });
+      }
+      
+      // 发送菜单
+      const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: menuData
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`发送面板失败: ${errorText}`);
+        return null;
+      }
+      
+      return await response.json();
+    } catch (error) {
+      console.error('发送面板出错:', error);
+      return null;
+    }
+  }
+  
+  async function generateMainMenu(chatId, userSetting, config) {
+    // 获取存储类型文本
+    const storageText = userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储';
+    
+    // 获取当前分类信息 - 并行查询
+    let categoryName = '未选择分类';
+    if (userSetting.current_category_id) {
+      const category = await config.database.prepare('SELECT name FROM categories WHERE id = ?')
+        .bind(userSetting.current_category_id).first();
       if (category) {
         categoryName = category.name;
-      } else {
-        categoryId = null;
       }
     }
-    if (!categoryId) {
-      let defaultCategory = await config.database.prepare('SELECT id, name FROM categories WHERE name = ?').bind('默认分类').first();
-      if (!defaultCategory) {
-        try {
-          console.log('默认分类不存在，正在创建...');
-          const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
-            .bind('默认分类', Date.now()).run();
-          const newDefaultId = result.meta && result.meta.last_row_id;
-          if (newDefaultId) {
-            defaultCategory = { id: newDefaultId, name: '默认分类' };
-            console.log(`已创建新的默认分类，ID: ${newDefaultId}`);
-            if (userSetting) {
-              await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
-                .bind(newDefaultId, chatId).run();
-              userSetting.category_id = newDefaultId;
-              categoryId = newDefaultId;
-            }
-          }
-        } catch (error) {
-          console.error('创建默认分类失败:', error);
-        }
-      } else {
-        categoryId = defaultCategory.id;
-        categoryName = defaultCategory.name;
-        if (userSetting) {
-          await config.database.prepare('UPDATE user_settings SET category_id = ? WHERE chat_id = ?')
-            .bind(categoryId, chatId).run();
-          userSetting.category_id = categoryId;
-        }
-      }
-    }
-    let notificationText = await fetchNotification();
-    const defaultNotification = 
-      "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链\n" +
-      "➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作";
-    const message = 
-      "📲 图床助手 3.0\n\n" +
-      "📡 系统状态 ─────────────\n" +
-      `🔹 存储类型: ${userSetting.storage_type === 'r2' ? 'R2对象存储' : 'Telegram存储'}\n` +
-      `🔹 当前分类: ${categoryName}\n` +
-      `🔹 文件大小: 最大${config.maxSizeMB}MB\n\n` +
-      `${notificationText || defaultNotification}`;
-    const keyboard = {
+    
+    // 获取用户统计信息 - 并行查询
+    const stats = await config.database.prepare(`
+      SELECT COUNT(*) as total_files, SUM(file_size) as total_size
+      FROM files WHERE chat_id = ?
+    `).bind(chatId).first();
+    
+    // 生成面板文本
+    const messageBody = `🔷 <b>文件上传机器人</b>
+    
+    📂 当前存储：${storageText}
+    📁 当前分类：${categoryName}
+    📊 已上传：${stats?.total_files || 0} 个文件
+    💾 已用空间：${formatSize(stats?.total_size || 0)}
+    
+    👇 请选择操作：`;
+    
+    // 获取键盘布局
+    const keyboard = getKeyboardLayout(userSetting);
+    
+    return { messageBody, keyboard };
+  }
+  
+  function getKeyboardLayout(userSetting) {
+    // 常用按钮组合的缓存键
+    const storageType = userSetting.storage_type || 'telegram';
+    
+    // 返回固定布局的键盘
+    return {
       inline_keyboard: [
         [
-          { text: "🔄 切换存储方式", callback_data: "switch_storage" },
-          { text: "📊 统计信息", callback_data: "stats" }
+          { text: "📤 切换存储", callback_data: "switch_storage" },
+          { text: "📋 选择分类", callback_data: "list_categories" }
         ],
         [
-          { text: "📂 选择分类", callback_data: "list_categories" },
-          { text: "➕ 新建分类", callback_data: "create_category" }
+          { text: "📝 创建分类", callback_data: "create_category" },
+          { text: "📊 使用统计", callback_data: "stats" }
         ],
         [
-          { text: "📝 修改后缀", callback_data: "edit_suffix" },
-          { text: "📋 最近文件", callback_data: "recent_files" }
-        ],
-        [
-          { text: "🔗 GitHub项目", url: "https://github.com/iawooo/ctt" }
+          { text: "📂 最近文件", callback_data: "recent_files" },
+          { text: "✏️ 修改后缀", callback_data: "edit_suffix" }
         ]
       ]
     };
-    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        reply_markup: keyboard,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true
-      })
-    });
   }
   async function handleCallbackQuery(update, config, userSetting) {
     const chatId = update.callback_query.from.id.toString();
@@ -759,6 +833,45 @@ async function initDatabase(config) {
     });
 
     try {
+      // 检查按钮缓存
+      const cacheKey = `button:${chatId}:${cbData}`;
+      if (config.buttonCache && config.buttonCache.has(cacheKey)) {
+        const cachedData = config.buttonCache.get(cacheKey);
+        if (Date.now() - cachedData.timestamp < config.buttonCacheTTL) {
+          console.log(`使用缓存的按钮响应: ${cacheKey}`);
+          
+          // 处理缓存命中，直接使用缓存的响应数据
+          await answerPromise;
+          
+          if (cachedData.responseText) {
+            await sendMessage(chatId, cachedData.responseText, config.tgBotToken);
+          }
+          
+          if (cachedData.sendPanel) {
+            await sendPanel(chatId, userSetting, config);
+          }
+          
+          if (cachedData.replyMarkup) {
+            await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: cachedData.replyText,
+                reply_markup: cachedData.replyMarkup,
+                parse_mode: 'HTML',
+                disable_web_page_preview: cachedData.disablePreview || false
+              })
+            });
+          }
+          
+          return;
+        } else {
+          // 缓存过期，删除
+          config.buttonCache.delete(cacheKey);
+        }
+      }
+      
       // 使用并行处理模式，减少等待时间
       if (cbData === 'switch_storage') {
         const newStorageType = userSetting.storage_type === 'r2' ? 'telegram' : 'r2';
@@ -767,6 +880,15 @@ async function initDatabase(config) {
             .bind(newStorageType, chatId).run(),
           answerPromise
         ]);
+        
+        // 缓存响应
+        if (config.buttonCache) {
+          config.buttonCache.set(cacheKey, {
+            timestamp: Date.now(),
+            sendPanel: true
+          });
+        }
+        
         await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
       } 
       else if (cbData === 'list_categories') {
@@ -790,6 +912,15 @@ async function initDatabase(config) {
           ]).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
         };
         
+        // 缓存响应
+        if (config.buttonCache) {
+          config.buttonCache.set(cacheKey, {
+            timestamp: Date.now(),
+            replyText: "📂 请选择要使用的分类：\n\n" + categoriesText,
+            replyMarkup: keyboard
+          });
+        }
+        
         await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -801,13 +932,21 @@ async function initDatabase(config) {
         });
       } 
       else if (cbData === 'create_category') {
+        // 对于简单操作也添加缓存
+        if (config.buttonCache) {
+          config.buttonCache.set(cacheKey, {
+            timestamp: Date.now(),
+            responseText: "📝 请回复此消息，输入新分类名称"
+          });
+        }
+        
         await Promise.all([
           answerPromise,
           sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken),
           config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
             .bind('new_category', chatId).run()
         ]);
-      } 
+      }
       else if (cbData.startsWith('set_category_')) {
         const categoryId = parseInt(cbData.split('_')[2]);
         
@@ -823,15 +962,29 @@ async function initDatabase(config) {
         await answerPromise;
         const [_, category] = await Promise.all([updatePromise, categoryPromise]);
         
-        await sendMessage(
-          chatId, 
-          `✅ 已切换到分类: ${category?.name || '未知分类'}`, 
-          config.tgBotToken
-        );
+        const responseText = `✅ 已切换到分类: ${category?.name || '未知分类'}`;
         
+        // 缓存按钮响应
+        if (config.buttonCache) {
+          config.buttonCache.set(`button:${chatId}:${cbData}`, {
+            timestamp: Date.now(),
+            responseText,
+            sendPanel: true
+          });
+        }
+        
+        await sendMessage(chatId, responseText, config.tgBotToken);
         await sendPanel(chatId, { ...userSetting, current_category_id: categoryId }, config);
       } 
       else if (cbData === 'back_to_panel') {
+        // 缓存返回操作
+        if (config.buttonCache) {
+          config.buttonCache.set(cacheKey, {
+            timestamp: Date.now(),
+            sendPanel: true
+          });
+        }
+        
         await answerPromise;
         await sendPanel(chatId, userSetting, config);
       } 
@@ -853,43 +1006,90 @@ async function initDatabase(config) {
     📊 总存储量: ${formatSize(stats.total_size || 0)}
     📋 使用分类: ${stats.total_categories || 0}个`;
         
-        await sendMessage(chatId, statsMessage, config.tgBotToken);
-      } 
-      else if (cbData === 'edit_suffix') {
-        // 并行查询最近文件
-        const recentFilesPromise = config.database.prepare(`
-          SELECT id, url, fileId, file_name, created_at, storage_type 
-          FROM files 
-          WHERE chat_id = ?
-          ORDER BY created_at DESC 
-          LIMIT 5
-        `).bind(chatId).all();
-        
-        await answerPromise;
-        const recentFiles = await recentFilesPromise;
-        
-        if (!recentFiles.results || recentFiles.results.length === 0) {
-          await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
-          return;
+        // 缓存统计信息
+        if (config.buttonCache) {
+          config.buttonCache.set(cacheKey, {
+            timestamp: Date.now(),
+            responseText: statsMessage
+          });
         }
         
-        const keyboard = {
-          inline_keyboard: recentFiles.results.map(file => {
-            const fileName = file.file_name || getFileName(file.url);
-            return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
-          }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
-        };
-        
-        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: "📝 请选择要修改后缀的文件：",
-            reply_markup: keyboard
-          })
-        });
+        await sendMessage(chatId, statsMessage, config.tgBotToken);
       } 
+      else if (cbData === 'edit_suffix' || cbData === 'recent_files') {
+        // 这两个操作涉及数据库查询，不适合缓存内容，但可以缓存响应逻辑
+        await answerPromise;
+        
+        if (cbData === 'edit_suffix') {
+          // 并行查询最近文件
+          const recentFiles = await config.database.prepare(`
+            SELECT id, url, fileId, file_name, created_at, storage_type 
+            FROM files 
+            WHERE chat_id = ?
+            ORDER BY created_at DESC 
+            LIMIT 5
+          `).bind(chatId).all();
+          
+          if (!recentFiles.results || recentFiles.results.length === 0) {
+            await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
+            return;
+          }
+          
+          const keyboard = {
+            inline_keyboard: recentFiles.results.map(file => {
+              const fileName = file.file_name || getFileName(file.url);
+              return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
+            }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
+          };
+          
+          await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: "📝 请选择要修改后缀的文件：",
+              reply_markup: keyboard
+            })
+          });
+        } else {
+          // 并行查询最近文件
+          const recentFiles = await config.database.prepare(`
+            SELECT id, url, created_at, file_name, storage_type 
+            FROM files 
+            WHERE chat_id = ?
+            ORDER BY created_at DESC 
+            LIMIT 10
+          `).bind(chatId).all();
+          
+          if (!recentFiles.results || recentFiles.results.length === 0) {
+            await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
+            return;
+          }
+          
+          const filesList = recentFiles.results.map((file, i) => {
+            const fileName = file.file_name || getFileName(file.url);
+            const date = new Date(file.created_at * 1000).toLocaleString();
+            return `${i + 1}. ${fileName}\n   📅 ${date}\n   🔗 ${file.url}`;
+          }).join('\n\n');
+          
+          const keyboard = {
+            inline_keyboard: [
+              [{ text: "« 返回", callback_data: "back_to_panel" }]
+            ]
+          };
+          
+          await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: "📋 您最近上传的文件：\n\n" + filesList,
+              reply_markup: keyboard,
+              disable_web_page_preview: true
+            })
+          });
+        }
+      }
       else if (cbData.startsWith('edit_suffix_file_')) {
         const fileId = cbData.split('_')[3];
         
@@ -917,47 +1117,6 @@ async function initDatabase(config) {
             config.tgBotToken
           )
         ]);
-      } 
-      else if (cbData === 'recent_files') {
-        // 并行查询最近文件
-        const recentFilesPromise = config.database.prepare(`
-          SELECT id, url, created_at, file_name, storage_type 
-          FROM files 
-          WHERE chat_id = ?
-          ORDER BY created_at DESC 
-          LIMIT 10
-        `).bind(chatId).all();
-        
-        await answerPromise;
-        const recentFiles = await recentFilesPromise;
-        
-        if (!recentFiles.results || recentFiles.results.length === 0) {
-          await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
-          return;
-        }
-        
-        const filesList = recentFiles.results.map((file, i) => {
-          const fileName = file.file_name || getFileName(file.url);
-          const date = new Date(file.created_at * 1000).toLocaleString();
-          return `${i + 1}. ${fileName}\n   📅 ${date}\n   🔗 ${file.url}`;
-        }).join('\n\n');
-        
-        const keyboard = {
-          inline_keyboard: [
-            [{ text: "« 返回", callback_data: "back_to_panel" }]
-          ]
-        };
-        
-        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: "📋 您最近上传的文件：\n\n" + filesList,
-            reply_markup: keyboard,
-            disable_web_page_preview: true
-          })
-        });
       }
     } catch (error) {
       console.error('处理回调查询时出错:', error);
@@ -1284,23 +1443,48 @@ async function initDatabase(config) {
     }
   }
   function authenticate(request, config) {
-    const cookies = request.headers.get("Cookie") || "";
-    const authToken = cookies.match(/auth_token=([^;]+)/);
-    if (authToken) {
-      try {
-        const tokenData = JSON.parse(atob(authToken[1]));
-        const now = Date.now();
-        if (now > tokenData.expiration) {
-          console.log("Token已过期");
-          return false;
-        }
-        return tokenData.username === config.username;
-    } catch (error) {
-        console.error("Token的用户名不匹配", error);
+    // 如果没有启用认证，直接返回通过
+    if (!config.enableAuth) {
+      return true;
+    }
+    
+    // 如果缺少用户名或密码配置，认证失败
+    if (!config.username || !config.password) {
+      console.error("认证配置错误: 缺少用户名或密码");
       return false;
     }
+    
+    // 检查cookie
+    const cookies = request.headers.get("Cookie") || "";
+    const authToken = cookies.match(/auth_token=([^;]+)/);
+    
+    if (!authToken) {
+      return false;
     }
-    return false;
+    
+    try {
+      // 解析token
+      const tokenData = JSON.parse(atob(authToken[1]));
+      
+      // 检查过期时间
+      const now = Date.now();
+      if (now > tokenData.expiration) {
+        console.log("登录令牌已过期");
+        return false;
+      }
+      
+      // 验证用户名匹配
+      if (tokenData.username !== config.username) {
+        console.log("令牌用户名不匹配");
+        return false;
+      }
+      
+      // 认证通过
+      return true;
+    } catch (error) {
+      console.error("令牌验证失败", error);
+      return false;
+    }
   }
   async function handleAuthRequest(request, config) {
     if (config.enableAuth) {
@@ -2131,160 +2315,165 @@ async function initDatabase(config) {
     <html lang="zh-CN">
     <head>
       <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
-      <meta name="description" content="Telegram文件存储与分享平台">
+      <meta name="description" content="文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>登录</title>
       <style>
         body {
+          font-family: 'Segoe UI', Arial, sans-serif;
+          margin: 0;
+          padding: 0;
+          min-height: 100vh;
+          background: linear-gradient(135deg, #f0f4f8, #d9e2ec);
           display: flex;
           justify-content: center;
           align-items: center;
-          height: 100vh;
-          background: linear-gradient(135deg, #74ebd5, #acb6e5);
-          font-family: 'Segoe UI', Arial, sans-serif;
-          margin: 0;
         }
-        .login-container {
+        .container {
+          max-width: 400px;
+          width: 100%;
           background: rgba(255, 255, 255, 0.95);
-          padding: 2rem 3rem;
           border-radius: 15px;
           box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-          width: 100%;
-          max-width: 400px;
+          padding: 2rem;
+          margin: 20px;
         }
-        h2 {
+        .header {
+          margin-bottom: 1.5rem;
           text-align: center;
-          color: #333;
-          margin-bottom: 2rem;
-          font-size: 1.5rem;
+        }
+        h1 {
+          color: #2c3e50;
+          margin: 0;
+          font-size: 1.8rem;
+          font-weight: 600;
         }
         .form-group {
-          margin-bottom: 1rem;
+          margin-bottom: 1.5rem;
         }
-        input {
+        .form-group label {
+          display: block;
+          margin-bottom: 0.5rem;
+          color: #2c3e50;
+          font-weight: 500;
+        }
+        .form-group input {
           width: 100%;
-          padding: 0.75rem;
-          border: 2px solid #ddd;
+          padding: 0.8rem;
+          border: 2px solid #dfe6e9;
           border-radius: 8px;
           font-size: 1rem;
           background: #fff;
-          transition: border-color 0.3s ease;
+          transition: border-color 0.3s ease, box-shadow 0.3s ease;
+          box-sizing: border-box;
         }
-        input:focus {
+        .form-group input:focus {
           outline: none;
-          border-color: #007bff;
+          border-color: #3498db;
+          box-shadow: 0 0 8px rgba(52,152,219,0.3);
         }
-        button {
+        .btn-login {
           width: 100%;
-          padding: 0.75rem;
-          background: #007bff;
+          padding: 0.8rem;
+          background: #3498db;
           color: white;
           border: none;
           border-radius: 8px;
           font-size: 1rem;
+          font-weight: 600;
           cursor: pointer;
           transition: background 0.3s ease;
         }
-        button:hover {
-          background: #0056b3;
+        .btn-login:hover {
+          background: #2980b9;
         }
-        .modal {
+        .error-message {
+          color: #e74c3c;
+          margin-top: 1rem;
+          padding: 0.8rem;
+          background: rgba(231, 76, 60, 0.1);
+          border-radius: 8px;
           display: none;
-          position: fixed;
-          top: 0;
-          left: 0;
-          width: 100%;
-          height: 100%;
-          background: rgba(0, 0, 0, 0.7);
-          justify-content: center;
-          align-items: center;
-          z-index: 1000;
-          opacity: 0;
-          transition: opacity 0.3s ease;
         }
-        .modal.show {
-          display: flex;
-          opacity: 1;
-        }
-        .modal-content {
-          background: white;
-          padding: 1.5rem 2rem;
-          border-radius: 15px;
-          box-shadow: 0 15px 40px rgba(0,0,0,0.3);
-          text-align: center;
-          color: #dc3545;
-          font-size: 1rem;
-          transform: scale(0.9);
-          transition: transform 0.3s ease;
-        }
-        .modal.show .modal-content {
-          transform: scale(1);
+        .success-message {
+          color: #27ae60;
+          margin-top: 1rem;
+          padding: 0.8rem;
+          background: rgba(39, 174, 96, 0.1);
+          border-radius: 8px;
+          display: none;
         }
       </style>
     </head>
     <body>
-      <div class="login-container">
-        <h2>登录</h2>
+      <div class="container">
+        <div class="header">
+          <h1>登录</h1>
+          <p>请输入管理员账号和密码</p>
+        </div>
         <form id="loginForm">
           <div class="form-group">
-            <input type="text" id="username" placeholder="用户名" required>
+            <label for="username">用户名</label>
+            <input type="text" id="username" name="username" required>
           </div>
           <div class="form-group">
-            <input type="password" id="password" placeholder="密码" required>
+            <label for="password">密码</label>
+            <input type="password" id="password" name="password" required>
           </div>
-          <button type="submit">登录</button>
+          <button type="submit" class="btn-login">登录</button>
         </form>
-      </div>
-      <div id="notification" class="modal">
-        <div class="modal-content">用户名或密码错误</div>
+        <div id="errorMessage" class="error-message"></div>
+        <div id="successMessage" class="success-message"></div>
       </div>
       <script>
-        document.addEventListener('DOMContentLoaded', function() {
-          async function setBingBackground() {
-            try {
-              const response = await fetch('/bing', { cache: 'no-store' });
-              const data = await response.json();
-              if (data.status && data.data && data.data.length > 0) {
-                const randomIndex = Math.floor(Math.random() * data.data.length);
-                document.body.style.backgroundImage = \`url(\${data.data[randomIndex].url})\`;
-              }
-            } catch (error) {
-              console.error('获取背景图失败:', error);
-            }
+        // 获取重定向参数
+        const urlParams = new URLSearchParams(window.location.search);
+        const redirectPath = urlParams.get('redirect') || '/upload';
+        
+        document.getElementById('loginForm').addEventListener('submit', async function(event) {
+          event.preventDefault();
+          
+          const username = document.getElementById('username').value;
+          const password = document.getElementById('password').value;
+          const errorMessage = document.getElementById('errorMessage');
+          const successMessage = document.getElementById('successMessage');
+          
+          errorMessage.style.display = 'none';
+          successMessage.style.display = 'none';
+          
+          if (!username || !password) {
+            errorMessage.textContent = '请输入用户名和密码';
+            errorMessage.style.display = 'block';
+            return;
           }
-          setBingBackground();
-          setInterval(setBingBackground, 3600000);
-          const loginForm = document.getElementById('loginForm');
-          if (loginForm) {
-            loginForm.addEventListener('submit', async (e) => {
-              e.preventDefault();
-              const username = document.getElementById('username').value;
-              const password = document.getElementById('password').value;
-              try {
-                const response = await fetch('/', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ username, password })
-                });
-                if (response.ok) {
-                  window.location.href = '/upload';
-                } else {
-                  const notification = document.getElementById('notification');
-                  if (notification) {
-                    notification.classList.add('show');
-                    setTimeout(() => notification.classList.remove('show'), 3000);
-                  }
-                }
-              } catch (err) {
-                console.error('登录失败:', err);
-                const notification = document.getElementById('notification');
-                if (notification) {
-                  notification.classList.add('show');
-                  setTimeout(() => notification.classList.remove('show'), 3000);
-                }
-              }
+          
+          try {
+            const response = await fetch('/login', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ username, password })
             });
+            
+            if (response.ok) {
+              successMessage.textContent = '登录成功，正在跳转...';
+              successMessage.style.display = 'block';
+              
+              // 延迟跳转，让用户看到成功提示
+              setTimeout(() => {
+                window.location.href = redirectPath;
+              }, 1000);
+            } else {
+              const data = await response.text();
+              errorMessage.textContent = data || '用户名或密码错误';
+              errorMessage.style.display = 'block';
+            }
+          } catch (error) {
+            errorMessage.textContent = '登录请求失败，请稍后重试';
+            errorMessage.style.display = 'block';
+            console.error('登录错误:', error);
           }
         });
       </script>
