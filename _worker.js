@@ -1913,26 +1913,26 @@ async function handleAdminRequest(request, config) {
 
     const fileList = files.results || [];
     const fileCards = fileList.map(file => {
-      const url = file.url;
-      return `
-        <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}">
-          <input type="checkbox" class="file-checkbox" value="${url}">
-          <div class="file-preview">
-            ${getPreviewHtml(url)}
+        const url = file.url;
+        return `
+          <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}">
+            <input type="checkbox" class="file-checkbox" value="${url}">
+            <div class="file-preview">
+              ${getPreviewHtml(url)}
+            </div>
+            <div class="file-info">
+              <div>${getFileName(url)}</div>
+              <div>大小: ${formatSize(file.file_size || 0)}</div>
+              <div>上传时间: ${formatDate(file.created_at)}</div>
+              <div>分类: ${file.category_name || '无分类'}</div>
+            </div>
+            <div class="file-actions">
+              <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
+              <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
+              <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
+            </div>
           </div>
-          <div class="file-info">
-            <div>${getFileName(url)}</div>
-            <div>大小: ${formatSize(file.file_size || 0)}</div>
-            <div>上传时间: ${formatDate(file.created_at)}</div>
-            <div>分类: ${file.category_name || '无分类'}</div>
-          </div>
-          <div class="file-actions">
-            <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
-            <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-            <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
-          </div>
-        </div>
-      `;
+        `;
     }).join('');
 
     const html = generateAdminPage(fileCards, categoryOptions);
