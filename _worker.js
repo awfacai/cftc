@@ -1929,7 +1929,7 @@ async function initDatabase(config) {
                 <div>分类: ${file.category_name || '无分类'}</div>
               </div>
               <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
-                <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="copyShareUrl('${url}', '${getFileName(url)}')">复制链接</button>
+                <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
                 <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
                 <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
               </div>
@@ -3793,65 +3793,100 @@ async function initDatabase(config) {
             console.error('获取背景图失败:', error);
           }
         }
-        setBingBackground();
-        setInterval(setBingBackground, 3600000);
-  
-        // 搜索和筛选功能
-        const searchInput = document.getElementById('searchInput');
-        const categoryFilter = document.getElementById('categoryFilter');
-        const fileGrid = document.getElementById('fileGrid');
-        const fileCards = Array.from(fileGrid.children);
-        const selectAllBtn = document.getElementById('selectAllBtn');
-        const deleteFilesBtn = document.getElementById('deleteFilesBtn');
-        const deleteCategoryBtn = document.getElementById('deleteCategoryBtn');
-        const confirmModal = document.getElementById('confirmModal');
-        const confirmModalMessage = document.getElementById('confirmModalMessage');
-        const confirmModalConfirm = document.getElementById('confirmModalConfirm');
-        const confirmModalCancel = document.getElementById('confirmModalCancel');
-        const qrModal = document.getElementById('qrModal');
-        const qrCloseBtn = document.getElementById('qrCloseBtn');
-        const editSuffixModal = document.getElementById('editSuffixModal');
-        const editSuffixInput = document.getElementById('editSuffixInput');
-        const editSuffixConfirm = document.getElementById('editSuffixConfirm');
-        const editSuffixCancel = document.getElementById('editSuffixCancel');
-        
+        // 延迟加载背景，优先显示内容
+        setTimeout(setBingBackground, 1000);
+
+        // 全局变量定义，确保所有元素都能被正确引用
         let currentShareUrl = '';
         let currentConfirmCallback = null;
-  
-        searchInput.addEventListener('input', filterFiles);
-        categoryFilter.addEventListener('change', filterFiles);
-  
-        // 初始化文件点击事件
-        fileCards.forEach(card => {
-          const checkbox = card.querySelector('.file-checkbox');
+        let confirmModal, confirmModalMessage, confirmModalConfirm, confirmModalCancel;
+        let qrModal, qrCloseBtn, qrCopyBtn, editSuffixModal;
+        
+        // DOM加载完成后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+          // 获取DOM元素引用
+          const searchInput = document.getElementById('searchInput');
+          const categoryFilter = document.getElementById('categoryFilter');
+          const fileGrid = document.getElementById('fileGrid');
+          const fileCards = Array.from(fileGrid.children);
+          const selectAllBtn = document.getElementById('selectAllBtn');
+          const deleteFilesBtn = document.getElementById('deleteFilesBtn');
+          const deleteCategoryBtn = document.getElementById('deleteCategoryBtn');
+          confirmModal = document.getElementById('confirmModal');
+          confirmModalMessage = document.getElementById('confirmModalMessage');
+          confirmModalConfirm = document.getElementById('confirmModalConfirm');
+          confirmModalCancel = document.getElementById('confirmModalCancel');
+          qrModal = document.getElementById('qrModal');
+          qrCloseBtn = document.getElementById('qrCloseBtn');
+          qrCopyBtn = document.getElementById('qrCopyBtn');
+          editSuffixModal = document.getElementById('editSuffixModal');
           
-          // 点击卡片区域就可以选中/取消选中文件
-          card.addEventListener('click', (e) => {
-            // 如果点击在按钮上则不触发选择
-            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A' || 
-                e.target.closest('.btn') || e.target.closest('.file-actions')) {
-              return;
-            }
-            
-            // 切换复选框状态
-            checkbox.checked = !checkbox.checked;
-            // 更新卡片选中状态
-            card.classList.toggle('selected', checkbox.checked);
-            e.preventDefault(); // 防止其他点击事件
-          });
+          // 绑定事件处理器
+          if (searchInput) searchInput.addEventListener('input', filterFiles);
+          if (categoryFilter) categoryFilter.addEventListener('change', filterFiles);
+          if (selectAllBtn) selectAllBtn.addEventListener('click', toggleSelectAll);
+          if (deleteFilesBtn) deleteFilesBtn.addEventListener('click', confirmDeleteSelected);
+          if (deleteCategoryBtn) deleteCategoryBtn.addEventListener('click', confirmDeleteCategory);
+          if (qrCloseBtn) qrCloseBtn.addEventListener('click', closeQrModal);
+          if (qrCopyBtn) qrCopyBtn.addEventListener('click', copyCurrentShareUrl);
+          if (confirmModalConfirm) confirmModalConfirm.addEventListener('click', handleConfirmModalConfirm);
+          if (confirmModalCancel) confirmModalCancel.addEventListener('click', closeConfirmModal);
           
-          // 复选框状态变化时更新卡片选中状态
-          checkbox.addEventListener('change', () => {
-            card.classList.toggle('selected', checkbox.checked);
-          });
+          // 点击弹窗外部关闭弹窗
+          window.addEventListener('click', handleWindowClick);
+          
+          // 初始化文件点击事件
+          initializeFileCards();
         });
-  
+        
+        // 初始化文件卡片点击事件
+        function initializeFileCards() {
+          const fileGrid = document.getElementById('fileGrid');
+          if (!fileGrid) return;
+          
+          const fileCards = Array.from(fileGrid.children);
+          fileCards.forEach(card => {
+            const checkbox = card.querySelector('.file-checkbox');
+            if (!checkbox) return;
+            
+            // 点击卡片区域选中/取消选中文件
+            card.addEventListener('click', (e) => {
+              // 如果点击在按钮上不触发选择
+              if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A' || 
+                  e.target.closest('.btn') || e.target.closest('.file-actions')) {
+                return;
+              }
+              
+              // 切换复选框状态
+              checkbox.checked = !checkbox.checked;
+              // 更新卡片选中状态
+              card.classList.toggle('selected', checkbox.checked);
+              e.preventDefault(); // 防止其他点击事件
+            });
+            
+            // 复选框状态变化时更新卡片选中状态
+            checkbox.addEventListener('change', () => {
+              card.classList.toggle('selected', checkbox.checked);
+            });
+          });
+        }
+        
+        // 过滤文件
         function filterFiles() {
+          const searchInput = document.getElementById('searchInput');
+          const categoryFilter = document.getElementById('categoryFilter');
+          const fileGrid = document.getElementById('fileGrid');
+          if (!searchInput || !categoryFilter || !fileGrid) return;
+          
           const searchTerm = searchInput.value.toLowerCase();
           const selectedCategory = categoryFilter.value;
+          const fileCards = Array.from(fileGrid.children);
   
           fileCards.forEach(card => {
-            const fileName = card.querySelector('.file-info div:first-child').textContent.toLowerCase();
+            const fileInfo = card.querySelector('.file-info');
+            if (!fileInfo) return;
+            
+            const fileName = fileInfo.querySelector('div:first-child')?.textContent.toLowerCase() || '';
             const categoryId = card.getAttribute('data-category-id') || '';
   
             const matchesSearch = fileName.includes(searchTerm);
@@ -3860,21 +3895,27 @@ async function initDatabase(config) {
             card.style.display = matchesSearch && matchesCategory ? '' : 'none';
           });
         }
-  
-        // 全选/取消全选功能
-        selectAllBtn.addEventListener('click', () => {
+        
+        // 全选/取消全选
+        function toggleSelectAll() {
+          const fileGrid = document.getElementById('fileGrid');
+          if (!fileGrid) return;
+          
+          const fileCards = Array.from(fileGrid.children);
           const visibleCards = fileCards.filter(card => card.style.display !== 'none');
-          const allSelected = visibleCards.every(card => card.querySelector('.file-checkbox').checked);
+          const allSelected = visibleCards.every(card => card.querySelector('.file-checkbox')?.checked);
           
           visibleCards.forEach(card => {
             const checkbox = card.querySelector('.file-checkbox');
-            checkbox.checked = !allSelected;
-            card.classList.toggle('selected', !allSelected);
+            if (checkbox) {
+              checkbox.checked = !allSelected;
+              card.classList.toggle('selected', !allSelected);
+            }
           });
-        });
-  
-        // 删除选中的文件
-        deleteFilesBtn.addEventListener('click', () => {
+        }
+        
+        // 确认删除选中文件
+        function confirmDeleteSelected() {
           const selectedCheckboxes = document.querySelectorAll('.file-checkbox:checked');
           if (selectedCheckboxes.length === 0) {
             showConfirmModal('请先选择要删除的文件！', null, true);
@@ -3885,11 +3926,13 @@ async function initDatabase(config) {
             \`确定要删除选中的 \${selectedCheckboxes.length} 个文件吗？\`, 
             deleteSelectedFiles
           );
-        });
-  
-        // 删除分类
-        deleteCategoryBtn.addEventListener('click', () => {
+        }
+        
+        // 确认删除分类
+        function confirmDeleteCategory() {
           const select = document.getElementById('categoryDeleteSelect');
+          if (!select) return;
+          
           const categoryId = select.value;
           if (!categoryId) {
             showConfirmModal('请选择要删除的分类', null, true);
@@ -3901,110 +3944,59 @@ async function initDatabase(config) {
             \`确定要删除分类 "\${categoryName}" 吗？这将清空所有关联文件的分类！\`, 
             deleteCategory
           );
-        });
-  
-        // 分享文件
+        }
+        
+        // 分享文件 - 简化版，直接使用prompt
         function shareFile(url, fileName) {
-          console.log('调用分享函数，URL:', url, '文件名:', fileName);
           try {
-            currentShareUrl = url;
-            
-            // 设置文件名
-            const qrFileName = document.getElementById('qrFileName');
-            if (qrFileName) {
-              qrFileName.textContent = fileName || getFileName(url);
-              console.log('设置文件名成功:', qrFileName.textContent);
-            } else {
-              console.error('找不到qrFileName元素');
-            }
-            
-            // 生成二维码
-            const qrcodeDiv = document.getElementById('qrcode');
-            if (!qrcodeDiv) {
-              console.error('找不到qrcode元素');
-              return;
-            }
-            qrcodeDiv.innerHTML = '';
-            
-            // 检查QRCode是否已加载
-            if (typeof QRCode === 'undefined') {
-              console.error('QRCode库未加载');
-              // 使用备用方案显示URL
-              qrcodeDiv.innerHTML = '<div style="padding: 20px; word-break: break-all;">' + url + '</div>';
-              alert('二维码生成失败，但您仍可以复制链接使用');
-            } else {
-              console.log('QRCode库已加载，开始生成二维码');
-              // 使用QRCode库生成二维码
-              new QRCode(qrcodeDiv, {
-                text: url,
-                width: 200,
-                height: 200,
-                colorDark: "#000000",
-                colorLight: "#ffffff",
-                correctLevel: QRCode.CorrectLevel.H
+            // 尝试复制到剪贴板
+            navigator.clipboard.writeText(url)
+              .then(() => {
+                alert('链接已复制到剪贴板: ' + url);
+              })
+              .catch(() => {
+                // 复制失败时使用prompt
+                prompt('请复制以下链接:', url);
               });
-              console.log('二维码生成完成');
-            }
-            
-            // 设置下载链接
-            const downloadBtn = document.getElementById('qrDownloadBtn');
-            if (downloadBtn) {
-              downloadBtn.href = url;
-              downloadBtn.setAttribute('download', fileName || getFileName(url));
-              console.log('下载链接设置成功');
-            } else {
-              console.error('找不到qrDownloadBtn元素');
-            }
-            
-            // 显示弹窗 - 直接操作style属性
-            const qrModal = document.getElementById('qrModal');
-            if (qrModal) {
-              // 直接设置内联样式显示弹窗
-              qrModal.style.display = 'flex';
-              console.log('二维码弹窗显示成功');
-            } else {
-              console.error('找不到qrModal元素');
-              // 弹窗不存在，使用alert作为备用
-              alert('分享链接：' + url);
-            }
           } catch (error) {
-            console.error('分享文件出错:', error);
-            // 出错时使用alert作为备用
-            alert('分享链接：' + url);
+            // 出错时使用prompt
+            prompt('请复制以下链接:', url);
           }
         }
-  
-        // 初始化关闭按钮
-        document.addEventListener('DOMContentLoaded', function() {
-          const qrCloseBtn = document.getElementById('qrCloseBtn');
-          if (qrCloseBtn) {
-            qrCloseBtn.addEventListener('click', function() {
-              const qrModal = document.getElementById('qrModal');
-              if (qrModal) qrModal.style.display = 'none';
-            });
-          }
+        
+        // 关闭二维码弹窗
+        function closeQrModal() {
+          if (qrModal) qrModal.style.display = 'none';
+        }
+        
+        // 复制当前分享URL
+        function copyCurrentShareUrl() {
+          if (!currentShareUrl) return;
           
-          // 点击弹窗外部关闭弹窗
-          window.addEventListener('click', function(event) {
-            const qrModal = document.getElementById('qrModal');
-            if (event.target === qrModal) {
-              qrModal.style.display = 'none';
-            }
-          });
-        });
-  
-        // 复制URL
-        qrCopyBtn.addEventListener('click', () => {
-          copyToClipboard(currentShareUrl);
-          qrCopyBtn.textContent = '✓ 已复制';
-          setTimeout(() => {
-            qrCopyBtn.textContent = '复制链接';
-          }, 2000);
-        });
-  
+          navigator.clipboard.writeText(currentShareUrl)
+            .then(() => {
+              if (qrCopyBtn) {
+                qrCopyBtn.textContent = '✓ 已复制';
+                setTimeout(() => {
+                  qrCopyBtn.textContent = '复制链接';
+                }, 2000);
+              }
+            })
+            .catch(() => {
+              prompt('请手动复制链接:', currentShareUrl);
+            });
+        }
+        
         // 显示确认弹窗
         function showConfirmModal(message, callback, alertOnly = false) {
-          // 如果已有弹窗显示，先关闭它
+          if (!confirmModal || !confirmModalMessage || !confirmModalConfirm || !confirmModalCancel) {
+            // 如果元素不存在，退化为使用alert
+            alert(message);
+            if (callback && !alertOnly) callback();
+            return;
+          }
+          
+          // 关闭已有弹窗
           closeConfirmModal();
           
           confirmModalMessage.textContent = message;
@@ -4020,39 +4012,57 @@ async function initDatabase(config) {
           
           confirmModal.classList.add('show');
         }
-  
+        
         // 关闭确认弹窗
         function closeConfirmModal() {
-          confirmModal.classList.remove('show');
+          if (confirmModal) confirmModal.classList.remove('show');
         }
-  
-        // 确认按钮事件
-        confirmModalConfirm.addEventListener('click', () => {
+        
+        // 确认按钮事件处理
+        function handleConfirmModalConfirm() {
           if (currentConfirmCallback) {
             currentConfirmCallback();
           }
           closeConfirmModal();
-        });
-  
-        // 取消按钮事件
-        confirmModalCancel.addEventListener('click', closeConfirmModal);
-  
-        // 点击弹窗外部关闭弹窗
-        window.addEventListener('click', (event) => {
-          if (event.target === confirmModal) {
+        }
+        
+        // 窗口点击事件处理
+        function handleWindowClick(event) {
+          if (confirmModal && event.target === confirmModal) {
             closeConfirmModal();
           }
-          
-          const qrModal = document.getElementById('qrModal');
-          if (event.target === qrModal) {
-            qrModal.style.display = 'none';
+          if (qrModal && event.target === qrModal) {
+            closeQrModal();
           }
-          
-          if (event.target === editSuffixModal) {
+          if (editSuffixModal && event.target === editSuffixModal) {
             editSuffixModal.classList.remove('show');
           }
-        });
-  
+        }
+        
+        // 修改后缀
+        function showEditSuffixModal(url) {
+          if (!editSuffixModal) {
+            alert('修改后缀功能不可用');
+            return;
+          }
+          
+          currentEditUrl = url;
+          
+          // 获取当前后缀
+          const urlObj = new URL(url);
+          const pathParts = urlObj.pathname.split('/');
+          const fileName = pathParts[pathParts.length - 1];
+          const fileNameParts = fileName.split('.');
+          const extension = fileNameParts.pop(); // 获取扩展名
+          const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
+          
+          const editSuffixInput = document.getElementById('editSuffixInput');
+          if (editSuffixInput) {
+            editSuffixInput.value = currentSuffix;
+            editSuffixModal.classList.add('show');
+          }
+        }
+        
         // 删除单个文件
         async function deleteFile(url, card) {
           try {
@@ -4083,7 +4093,7 @@ async function initDatabase(config) {
             showConfirmModal('文件删除失败: ' + error.message, null, true);
           }
         }
-  
+        
         // 删除选中的文件
         async function deleteSelectedFiles() {
           const checkboxes = document.querySelectorAll('.file-checkbox:checked');
@@ -4110,10 +4120,12 @@ async function initDatabase(config) {
             showConfirmModal('批量删除失败: ' + error.message, null, true);
           }
         }
-  
+        
         // 删除分类
         async function deleteCategory() {
           const select = document.getElementById('categoryDeleteSelect');
+          if (!select) return;
+          
           const categoryId = select.value;
   
           try {
@@ -4136,130 +4148,106 @@ async function initDatabase(config) {
             showConfirmModal('删除分类失败: ' + error.message, null, true);
           }
         }
-  
-        // 修改后缀
-        let currentEditUrl = '';
-  
-        function showEditSuffixModal(url) {
-          currentEditUrl = url;
+        
+        // 初始化修改后缀对话框
+        document.addEventListener('DOMContentLoaded', function() {
+          const editSuffixConfirm = document.getElementById('editSuffixConfirm');
+          const editSuffixCancel = document.getElementById('editSuffixCancel');
           
-          // 获取当前后缀
-          const urlObj = new URL(url);
-          const pathParts = urlObj.pathname.split('/');
-          const fileName = pathParts[pathParts.length - 1];
-          const fileNameParts = fileName.split('.');
-          const extension = fileNameParts.pop(); // 获取扩展名
-          const currentSuffix = fileNameParts.join('.'); // 获取当前后缀
-          
-          if (editSuffixInput) {
-            editSuffixInput.value = currentSuffix;
-            editSuffixModal.classList.add('show');
-          }
-        }
-  
-        if (editSuffixCancel) {
-          editSuffixCancel.addEventListener('click', () => {
-            editSuffixModal.classList.remove('show');
-          });
-        }
-  
-        if (editSuffixConfirm) {
-          editSuffixConfirm.addEventListener('click', async () => {
-            const newSuffix = editSuffixInput.value;
-            
-            try {
-              const response = await fetch('/update-suffix', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                  url: currentEditUrl,
-                  suffix: newSuffix
-                })
-              });
-              
-              const data = await response.json();
-              
-              if (data.status === 1) {
-                // 更新成功，隐藏弹窗
-                editSuffixModal.classList.remove('show');
-                
-                // 更新页面上的URL
-                const card = document.querySelector('.file-card[data-url="' + currentEditUrl + '"]');
-                if (card) {
-                  // 更新卡片的URL值
-                  card.setAttribute('data-url', data.newUrl);
-                  
-                  // 更新卡片中的按钮URL
-                  const shareBtn = card.querySelector('.btn-share');
-                  const deleteBtn = card.querySelector('.btn-delete');
-                  const editBtn = card.querySelector('.btn-edit');
-                  
-                  if (shareBtn) {
-                    const fileName = getFileName(data.newUrl);
-                    shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
-                  }
-                  if (deleteBtn) {
-                    const newOnclick = deleteBtn.getAttribute('onclick').replace(currentEditUrl, data.newUrl);
-                    deleteBtn.setAttribute('onclick', newOnclick);
-                  }
-                  if (editBtn) {
-                    editBtn.setAttribute('onclick', 'showEditSuffixModal("' + data.newUrl + '")');
-                  }
-                  
-                  // 更新描述中的文件名
-                  const fileNameElement = card.querySelector('.file-info div:first-child');
-                  if (fileNameElement) {
-                    const urlObj = new URL(data.newUrl);
-                    const fileName = urlObj.pathname.split('/').pop();
-                    fileNameElement.textContent = fileName;
-                  }
-                  
-                  // 更新复选框值
-                  const checkbox = card.querySelector('.file-checkbox');
-                  if (checkbox) {
-                    checkbox.value = data.newUrl;
-                  }
-                }
-                
-                // 更新当前编辑的URL
-                currentEditUrl = data.newUrl;
-                
-                showConfirmModal(data.msg, null, true);
-              } else {
-                showConfirmModal(data.msg || '修改后缀失败', null, true);
-              }
-            } catch (error) {
-              showConfirmModal('修改后缀时出错：' + error.message, null, true);
-            }
-          });
-        }
-  
-        // 复制到剪贴板
-        function copyToClipboard(text) {
-          navigator.clipboard.writeText(text)
-            .then(() => {
-              showConfirmModal('已复制到剪贴板', null, true);
-            })
-            .catch(() => {
-              showConfirmModal('复制失败，请手动复制', null, true);
+          if (editSuffixCancel) {
+            editSuffixCancel.addEventListener('click', () => {
+              if (editSuffixModal) editSuffixModal.classList.remove('show');
             });
-        }
-  
-        // 点击弹窗外部关闭弹窗
-        window.addEventListener('click', (event) => {
-          if (event.target === confirmModal) {
-            closeConfirmModal();
           }
           
-          const qrModal = document.getElementById('qrModal');
-          if (event.target === qrModal) {
-            qrModal.style.display = 'none';
-          }
-          
-          if (event.target === editSuffixModal) {
-            editSuffixModal.classList.remove('show');
+          if (editSuffixConfirm) {
+            editSuffixConfirm.addEventListener('click', updateFileSuffix);
           }
         });
+        
+        // 更新文件后缀
+        async function updateFileSuffix() {
+          const editSuffixInput = document.getElementById('editSuffixInput');
+          if (!editSuffixInput) return;
+          
+          const newSuffix = editSuffixInput.value;
+          
+          try {
+            const response = await fetch('/update-suffix', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                url: currentEditUrl,
+                suffix: newSuffix
+              })
+            });
+            
+            const data = await response.json();
+            
+            if (data.status === 1) {
+              // 更新成功，隐藏弹窗
+              if (editSuffixModal) editSuffixModal.classList.remove('show');
+              
+              // 更新页面上的URL
+              const card = document.querySelector('.file-card[data-url="' + currentEditUrl + '"]');
+              if (card) {
+                // 更新卡片的URL值
+                card.setAttribute('data-url', data.newUrl);
+                
+                // 更新卡片中的按钮URL
+                const shareBtn = card.querySelector('.btn-share');
+                const deleteBtn = card.querySelector('.btn-delete');
+                const editBtn = card.querySelector('.btn-edit');
+                
+                if (shareBtn) {
+                  const fileName = getFileName(data.newUrl);
+                  shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
+                }
+                if (deleteBtn) {
+                  const newOnclick = deleteBtn.getAttribute('onclick').replace(currentEditUrl, data.newUrl);
+                  deleteBtn.setAttribute('onclick', newOnclick);
+                }
+                if (editBtn) {
+                  editBtn.setAttribute('onclick', 'showEditSuffixModal("' + data.newUrl + '")');
+                }
+                
+                // 更新描述中的文件名
+                const fileNameElement = card.querySelector('.file-info div:first-child');
+                if (fileNameElement) {
+                  const urlObj = new URL(data.newUrl);
+                  const fileName = urlObj.pathname.split('/').pop();
+                  fileNameElement.textContent = fileName;
+                }
+                
+                // 更新复选框值
+                const checkbox = card.querySelector('.file-checkbox');
+                if (checkbox) {
+                  checkbox.value = data.newUrl;
+                }
+              }
+              
+              // 更新当前编辑的URL
+              currentEditUrl = data.newUrl;
+              
+              showConfirmModal(data.msg, null, true);
+            } else {
+              showConfirmModal(data.msg || '修改后缀失败', null, true);
+            }
+          } catch (error) {
+            showConfirmModal('修改后缀时出错：' + error.message, null, true);
+          }
+        }
+        
+        // 获取文件名
+        function getFileName(url) {
+          try {
+            const urlObj = new URL(url);
+            const pathParts = urlObj.pathname.split('/');
+            return pathParts[pathParts.length - 1];
+          } catch (e) {
+            return url.split('/').pop() || url;
+          }
+        }
       </script>
     </body>
     </html>`;
