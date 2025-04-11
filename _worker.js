@@ -1927,9 +1927,11 @@ async function handleAdminRequest(request, config) {
             <div>分类: ${file.category_name || '无分类'}</div>
           </div>
           <div class="file-actions">
-            <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
-            <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-            <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
+            <div class="button-row">
+              <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">鍒嗕韩</button>
+              <button class="btn btn-delete" onclick="showConfirmModal('纭畾瑕佸垹闄よ繖涓枃浠跺悧锛?', () => deleteFile('${url}'))">鍒犻櫎</button>
+              <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">淇敼鍚庣紑</button>
+            </div>
           </div>
         </div>
       `;
@@ -3429,12 +3431,17 @@ function generateAdminPage(fileCards, categoryOptions) {
         color: #2c3e50;
       }
       .file-actions {
-        padding: 1rem;
-        border-top: 1px solid #eee;
         display: flex;
         justify-content: space-between;
-        gap: 0.5rem;
+        margin-top: 8px;
       }
+      
+      .button-row {
+        display: flex;
+        gap: 10px;
+        width: 100%;
+      }
+      
       .btn {
         padding: 0.5rem 1rem;
         border: none;
@@ -3740,8 +3747,9 @@ function generateAdminPage(fileCards, categoryOptions) {
           <div class="qr-file-name" id="qrFileName"></div>
           <div id="qrcode"></div>
           <div class="qr-buttons">
-            <a class="qr-download" id="qrDownloadBtn" download>涓嬭浇鏂囦欢</a>
-            <button class="qr-close" id="qrCloseBtn">鍏抽棴</button>
+            <button class="qr-copy" id="qrCopyBtn">澶嶅埗閾炬帴</button>
+            <a class="qr-download" id="qrDownloadBtn" download>娑撳娴囬弬鍥︽</a>
+            <button class="qr-close" id="qrCloseBtn">閸忔娊妫?/button>
           </div>
         </div>
       </div>
@@ -3945,6 +3953,20 @@ function generateAdminPage(fileCards, categoryOptions) {
       // 关闭二维码弹窗
       qrCloseBtn.addEventListener('click', () => {
         qrModal.classList.remove('show');
+      });
+
+      // 添加复制链接按钮的事件监听器
+      qrCloseBtn.addEventListener('click', () => {
+        qrModal.classList.remove('show');
+      });
+      
+      // 复制链接按钮点击事件
+      qrCopyBtn.addEventListener('click', () => {
+        copyToClipboard(currentShareUrl);
+        qrCopyBtn.textContent = '✓ 已复制';
+        setTimeout(() => {
+          qrCopyBtn.textContent = '复制链接';
+        }, 2000);
       });
 
       // 显示确认弹窗
