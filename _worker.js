@@ -1929,7 +1929,7 @@ async function initDatabase(config) {
                 <div>分类: ${file.category_name || '无分类'}</div>
               </div>
               <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
-                <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
+                <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="copyShareUrl('${url}', '${getFileName(url)}')">复制链接</button>
                 <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
                 <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
               </div>
@@ -3753,15 +3753,15 @@ async function initDatabase(config) {
         </div>
         
         <!-- 二维码弹窗 -->
-        <div id="qrModal" class="modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000;">
-          <div class="qr-content" style="background:white; padding:2rem; border-radius:15px; box-shadow:0 15px 40px rgba(0,0,0,0.3); text-align:center; width:90%; max-width:350px; margin:50px auto;">
-            <h3 class="qr-title" style="color:#2c3e50; font-size:1.3rem; margin-top:0; margin-bottom:0.5rem;">分享文件</h3>
-            <div class="qr-file-name" id="qrFileName" style="color:#7f8c8d; font-size:0.9rem; margin-bottom:1rem; word-break:break-all;"></div>
+        <div id="qrModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000; justify-content:center; align-items:center;">
+          <div style="background:white; padding:2rem; border-radius:15px; box-shadow:0 15px 40px rgba(0,0,0,0.3); text-align:center; width:90%; max-width:350px;">
+            <h3 style="color:#2c3e50; font-size:1.3rem; margin-top:0; margin-bottom:0.5rem;">分享文件</h3>
+            <div id="qrFileName" style="color:#7f8c8d; font-size:0.9rem; margin-bottom:1rem; word-break:break-all;"></div>
             <div id="qrcode" style="margin:1.5rem auto;"></div>
-            <div class="qr-buttons" style="display:flex; gap:0.5rem; justify-content:center; margin-top:1.5rem;">
-              <button class="qr-copy" id="qrCopyBtn" style="background:#3498db; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">复制链接</button>
-              <a class="qr-download" id="qrDownloadBtn" download style="background:#2ecc71; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center;">下载文件</a>
-              <button class="qr-close" id="qrCloseBtn" style="background:#95a5a6; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">关闭</button>
+            <div style="display:flex; gap:0.5rem; justify-content:center; margin-top:1.5rem;">
+              <button id="qrCopyBtn" style="background:#3498db; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">复制链接</button>
+              <a id="qrDownloadBtn" download style="background:#2ecc71; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center;">下载文件</a>
+              <button id="qrCloseBtn" style="background:#95a5a6; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">关闭</button>
             </div>
           </div>
         </div>
@@ -3903,22 +3903,6 @@ async function initDatabase(config) {
           );
         });
   
-        // 显示二维码分享
-        function showQRCode(url) {
-          currentShareUrl = url;
-          const qrcodeDiv = document.getElementById('qrcode');
-          qrcodeDiv.innerHTML = '';
-          new QRCode(qrcodeDiv, {
-            text: url,
-            width: 200,
-            height: 200,
-            colorDark: "#000000",
-            colorLight: "#ffffff",
-            correctLevel: QRCode.CorrectLevel.H
-          });
-          qrModal.classList.add('show');
-        }
-  
         // 分享文件
         function shareFile(url, fileName) {
           console.log('调用分享函数，URL:', url, '文件名:', fileName);
@@ -3947,7 +3931,7 @@ async function initDatabase(config) {
               console.error('QRCode库未加载');
               // 使用备用方案显示URL
               qrcodeDiv.innerHTML = '<div style="padding: 20px; word-break: break-all;">' + url + '</div>';
-              showConfirmModal('二维码生成失败，但您仍可以复制链接使用', null, true);
+              alert('二维码生成失败，但您仍可以复制链接使用');
             } else {
               console.log('QRCode库已加载，开始生成二维码');
               // 使用QRCode库生成二维码
@@ -3972,27 +3956,41 @@ async function initDatabase(config) {
               console.error('找不到qrDownloadBtn元素');
             }
             
-            // 显示弹窗 - 直接修改样式而不是使用classList
+            // 显示弹窗 - 直接操作style属性
             const qrModal = document.getElementById('qrModal');
             if (qrModal) {
+              // 直接设置内联样式显示弹窗
               qrModal.style.display = 'flex';
               console.log('二维码弹窗显示成功');
             } else {
               console.error('找不到qrModal元素');
+              // 弹窗不存在，使用alert作为备用
+              alert('分享链接：' + url);
             }
           } catch (error) {
             console.error('分享文件出错:', error);
-            copyToClipboard(url);
-            showConfirmModal('二维码生成失败，链接已复制到剪贴板', null, true);
+            // 出错时使用alert作为备用
+            alert('分享链接：' + url);
           }
         }
   
-        // 关闭二维码弹窗
-        qrCloseBtn.addEventListener('click', () => {
-          const qrModal = document.getElementById('qrModal');
-          if (qrModal) {
-            qrModal.style.display = 'none';
+        // 初始化关闭按钮
+        document.addEventListener('DOMContentLoaded', function() {
+          const qrCloseBtn = document.getElementById('qrCloseBtn');
+          if (qrCloseBtn) {
+            qrCloseBtn.addEventListener('click', function() {
+              const qrModal = document.getElementById('qrModal');
+              if (qrModal) qrModal.style.display = 'none';
+            });
           }
+          
+          // 点击弹窗外部关闭弹窗
+          window.addEventListener('click', function(event) {
+            const qrModal = document.getElementById('qrModal');
+            if (event.target === qrModal) {
+              qrModal.style.display = 'none';
+            }
+          });
         });
   
         // 复制URL
@@ -4139,10 +4137,9 @@ async function initDatabase(config) {
           }
         }
   
-        // 淇敼鍚庣紑
+        // 修改后缀
         let currentEditUrl = '';
   
-        // 修改后缀
         function showEditSuffixModal(url) {
           currentEditUrl = url;
           
@@ -4608,6 +4605,24 @@ async function initDatabase(config) {
     } catch (error) {
       // 静默失败，返回null而不打印错误日志
       return null;
+    }
+  }
+  
+  // 复制分享链接到剪贴板 (替代QR码分享)
+  function copyShareUrl(url, fileName) {
+    console.log('复制分享链接:', url);
+    try {
+      navigator.clipboard.writeText(url)
+        .then(() => {
+          alert('链接已复制到剪贴板: ' + url);
+        })
+        .catch((err) => {
+          console.error('复制失败:', err);
+          prompt('请手动复制以下链接:', url);
+        });
+    } catch (error) {
+      console.error('复制出错:', error);
+      prompt('请手动复制以下链接:', url);
     }
   }
     
