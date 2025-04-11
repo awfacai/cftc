@@ -433,83 +433,101 @@ async function initDatabase(config) {
           return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { status: 500 });
       }
       
-      // favicon.ico处理
-      if (request.url.includes('favicon.ico')) {
-        return new Response(null, { status: 204 });
-      }
-      
       const url = new URL(request.url);
       const { pathname } = url;
       
+      console.log(`[Auth] Request Path: ${pathname}, Method: ${request.method}`);
+      
+      // favicon.ico处理 (移到认证之前)
+      if (pathname === '/favicon.ico') {
+        console.log('[Auth] Handling favicon.ico request.');
+        return new Response(null, { status: 204 });
+      }
+      
       // --- 核心认证逻辑 --- 
       const isAuthEnabled = config.enableAuth;
-      const isAuthenticated = isAuthEnabled ? authenticate(request, config) : true; // 如果未启用认证，则视为已认证
+      const isAuthenticated = authenticate(request, config); // 直接调用，authenticate内部处理enableAuth
       const isLoginPage = pathname === '/login';
-      const isPublicApi = pathname === '/webhook' || pathname === '/config'; // 公开API路径
+      const isPublicApi = pathname === '/webhook' || pathname === '/config' || pathname === '/bing'; // 公开API路径
+      
+      console.log(`[Auth] isAuthEnabled: ${isAuthEnabled}, isAuthenticated: ${isAuthenticated}, isLoginPage: ${isLoginPage}, isPublicApi: ${isPublicApi}`);
       
       // 需要认证的路径
       const protectedPaths = ['/', '/upload', '/admin', '/create-category', '/delete-category', '/update-suffix', '/delete', '/delete-multiple', '/search'];
       const requiresAuth = isAuthEnabled && protectedPaths.includes(pathname);
       
+      console.log(`[Auth] Path requires authentication: ${requiresAuth}`);
+      
       // 如果需要认证但未认证，且不是登录页面
       if (requiresAuth && !isAuthenticated && !isLoginPage) {
-          console.log(`认证失败: 访问受保护路径 ${pathname}，重定向到登录`);
+          console.log(`[Auth] FAILED: Accessing protected path ${pathname} without authentication. Redirecting to login.`);
           // 对于API或POST请求，返回JSON错误
           if (request.method === 'POST' || request.headers.get('Accept')?.includes('application/json')) {
               return new Response(JSON.stringify({ status: 0, error: "未授权访问", redirect: `${url.origin}/login` }), {
                   status: 401,
-                  headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+                  headers: { 
+                      'Content-Type': 'application/json;charset=UTF-8',
+                      'Cache-Control': 'no-store' // API 错误也不缓存
+                   }
               });
           }
           // 否则重定向到登录页，并附带原始请求路径
-          return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(pathname)}`, 302);
+          const redirectUrl = `${url.origin}/login?redirect=${encodeURIComponent(pathname + url.search)}`;
+          return Response.redirect(redirectUrl, 302);
       }
       
-      // 如果访问登录页但已认证，重定向到上传页
+      // 如果访问登录页但已认证，重定向到上传页 (或redirect参数指定的页面)
       if (isAuthEnabled && isAuthenticated && isLoginPage) {
-          console.log(`已认证用户访问登录页，重定向到 /upload`);
-          return Response.redirect(`${url.origin}/upload`, 302);
+          const redirectTarget = url.searchParams.get('redirect') || '/upload';
+          console.log(`[Auth] SUCCESS: Authenticated user accessing login page. Redirecting to ${redirectTarget}.`);
+          return Response.redirect(`${url.origin}${redirectTarget}`, 302);
       }
+      
+      console.log(`[Auth] Check PASSED for path: ${pathname}`);
       
       // --- 数据库初始化 (移到认证之后) ---
       try {
-        // 对于不需要数据库的公共 API 或已认证的文件请求，可以考虑延迟初始化
-        if (!isPublicApi && pathname !== '/login') { 
+        // 公开API和登录页不需要立即初始化数据库
+        if (!isPublicApi && !isLoginPage) { 
             await initDatabase(config);
+            console.log('[DB] Database initialized successfully.');
+        } else {
+            console.log('[DB] Skipping database initialization for public API or login page.');
         }
       } catch (error) {
-        console.error(`数据库初始化失败: ${error.message}`);
+        console.error(`[DB] Database initialization FAILED: ${error.message}`);
         return new Response(`数据库初始化失败: ${error.message}`, { 
           status: 500,
-          headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
+          headers: { 
+              'Content-Type': 'text/plain;charset=UTF-8',
+              'Cache-Control': 'no-store'
+          }
         });
       }
       
-      // --- Webhook 设置 (仅当配置了Bot Token) ---
-      if (config.tgBotToken) {
-        try {
-          const webhookUrl = `https://${config.domain}/webhook`;
-          // 考虑不在每次请求时都设置webhook，或添加检查逻辑
-          // const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
-          // if (!webhookSet) { console.error('Webhook设置失败'); }
-        } catch (error) {
-          console.error(`设置webhook时出错: ${error.message}`);
-        }
-      }
+      // --- Webhook 设置 (优化，例如只在启动时或特定条件下设置) ---
+      // Consider optimizing webhook setup logic if necessary
       
       // --- 路由处理 ---
       const routes = {
-        // 根路径处理: 未认证导向登录，已认证导向上传
         '/': async () => {
-            if (!isAuthEnabled || isAuthenticated) {
-                return handleUploadRequest(request, config);
-            } else {
-                return handleLoginRequest(request, config);
-            }
+            // 根路径逻辑现在由顶层认证检查处理
+            // 如果到这里，说明要么认证关闭，要么已认证
+            console.log('[Route] Handling / request.');
+            return handleUploadRequest(request, config);
         },
-        '/login': () => handleLoginRequest(request, config),
-        '/upload': () => handleUploadRequest(request, config),
-        '/admin': () => handleAdminRequest(request, config),
+        '/login': async () => {
+            console.log('[Route] Handling /login request.');
+            return handleLoginRequest(request, config);
+        },
+        '/upload': async () => {
+            console.log('[Route] Handling /upload request.');
+            return handleUploadRequest(request, config);
+        },
+        '/admin': async () => {
+            console.log('[Route] Handling /admin request.');
+            return handleAdminRequest(request, config);
+        },
         '/delete': () => handleDeleteRequest(request, config),
         '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
         '/search': () => handleSearchRequest(request, config),
@@ -517,27 +535,46 @@ async function initDatabase(config) {
         '/delete-category': () => handleDeleteCategoryRequest(request, config),
         '/update-suffix': () => handleUpdateSuffixRequest(request, config),
         '/config': () => {
+            console.log('[Route] Handling /config request.');
             const safeConfig = { maxSizeMB: config.maxSizeMB };
             return new Response(JSON.stringify(safeConfig), {
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'public, max-age=3600' // 配置可以缓存一段时间
+                 }
             });
         },
-        '/webhook': () => handleTelegramWebhook(request, config),
-        '/bing': handleBingImagesRequest
+        '/webhook': () => { 
+            console.log('[Route] Handling /webhook request.');
+            return handleTelegramWebhook(request, config); 
+        },
+        '/bing': () => { 
+            console.log('[Route] Handling /bing request.');
+            return handleBingImagesRequest(request, config); // bing请求有自己的缓存逻辑
+        }
       };
       
       const handler = routes[pathname];
       
       if (handler) {
         try {
-            return await handler();
+            console.log(`[Route] Executing handler for ${pathname}`);
+            const response = await handler();
+            // 为受保护的 HTML 页面添加缓存控制头
+            if (isAuthEnabled && requiresAuth && response.headers.get('Content-Type')?.includes('text/html')) {
+                response.headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+                response.headers.set('Pragma', 'no-cache'); // For HTTP/1.0 compatibility
+                response.headers.set('Expires', '0'); // Proxies
+            }
+            return response;
         } catch (error) {
-            console.error(`处理路由 ${pathname} 出错:`, error);
-            return new Response("服务器内部错误", { status: 500 });
+            console.error(`[Route] Error handling route ${pathname}:`, error);
+            return new Response("服务器内部错误", { status: 500, headers: { 'Cache-Control': 'no-store' } });
         }
       }
       
       // 文件请求处理 (默认情况)
+      console.log(`[File] Handling file request for ${pathname}`);
       return await handleFileRequest(request, config);
     }
   };
@@ -1458,12 +1495,13 @@ async function initDatabase(config) {
   function authenticate(request, config) {
     // 如果没有启用认证，直接返回通过
     if (!config.enableAuth) {
+      console.log('[Auth] Authentication disabled.');
       return true;
     }
     
     // 如果缺少用户名或密码配置，认证失败
     if (!config.username || !config.password) {
-      console.error("认证配置错误: 缺少用户名或密码");
+      console.error("[Auth] FAILED: Missing USERNAME or PASSWORD configuration while auth is enabled.");
       return false;
     }
     
@@ -1472,6 +1510,7 @@ async function initDatabase(config) {
     const authToken = cookies.match(/auth_token=([^;]+)/);
     
     if (!authToken) {
+      console.log('[Auth] FAILED: No auth_token cookie found.');
       return false;
     }
     
@@ -1482,20 +1521,21 @@ async function initDatabase(config) {
       // 检查过期时间
       const now = Date.now();
       if (now > tokenData.expiration) {
-        console.log("登录令牌已过期");
+        console.log("[Auth] FAILED: Token expired.");
         return false;
       }
       
       // 验证用户名匹配
       if (tokenData.username !== config.username) {
-        console.log("令牌用户名不匹配");
+        console.log("[Auth] FAILED: Token username mismatch.");
         return false;
       }
       
       // 认证通过
+      console.log('[Auth] SUCCESS: Valid token found.');
       return true;
     } catch (error) {
-      console.error("令牌验证失败", error);
+      console.error("[Auth] FAILED: Error validating token:", error);
       return false;
     }
   }
@@ -2224,7 +2264,7 @@ async function initDatabase(config) {
     const lowerExt = ext.toLowerCase();
     return types[lowerExt] || 'application/octet-stream';
   }
-  async function handleBingImagesRequest() {
+  async function handleBingImagesRequest(request, config) {
     const cache = caches.default;
     const cacheKey = new Request('https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=5');
     const cachedResponse = await cache.match(cacheKey);
@@ -4342,3 +4382,4 @@ async function initDatabase(config) {
   } catch (error) {
     console.error('添加DOMContentLoaded事件监听器失败:', error);
   }
+    
