@@ -1912,6 +1912,8 @@ async function initDatabase(config) {
       `).all();
   
       const fileList = files.results || [];
+      console.log(`文件总数: ${fileList.length}`);
+      
       const fileCards = fileList.map(file => {
           const url = file.url;
           return `
@@ -1926,10 +1928,10 @@ async function initDatabase(config) {
                 <div>上传时间: ${formatDate(file.created_at)}</div>
                 <div>分类: ${file.category_name || '无分类'}</div>
               </div>
-              <div class="file-actions">
-                <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
-                <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-                <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
+              <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
+                <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
+                <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
+                <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
               </div>
             </div>
           `;
@@ -3073,6 +3075,15 @@ async function initDatabase(config) {
           if (event.target === confirmModal) {
             closeConfirmModal();
           }
+          
+          const qrModal = document.getElementById('qrModal');
+          if (event.target === qrModal) {
+            qrModal.style.display = 'none';
+          }
+          
+          if (event.target === editSuffixModal) {
+            editSuffixModal.classList.remove('show');
+          }
         });
   
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -3742,15 +3753,15 @@ async function initDatabase(config) {
         </div>
         
         <!-- 二维码弹窗 -->
-        <div id="qrModal" class="modal">
-          <div class="qr-content">
-            <h3 class="qr-title">分享文件</h3>
-            <div class="qr-file-name" id="qrFileName"></div>
-            <div id="qrcode"></div>
-            <div class="qr-buttons">
-              <button class="qr-copy" id="qrCopyBtn">复制链接</button>
-              <a class="qr-download" id="qrDownloadBtn" download>下载文件</a>
-              <button class="qr-close" id="qrCloseBtn">关闭</button>
+        <div id="qrModal" class="modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000;">
+          <div class="qr-content" style="background:white; padding:2rem; border-radius:15px; box-shadow:0 15px 40px rgba(0,0,0,0.3); text-align:center; width:90%; max-width:350px; margin:50px auto;">
+            <h3 class="qr-title" style="color:#2c3e50; font-size:1.3rem; margin-top:0; margin-bottom:0.5rem;">分享文件</h3>
+            <div class="qr-file-name" id="qrFileName" style="color:#7f8c8d; font-size:0.9rem; margin-bottom:1rem; word-break:break-all;"></div>
+            <div id="qrcode" style="margin:1.5rem auto;"></div>
+            <div class="qr-buttons" style="display:flex; gap:0.5rem; justify-content:center; margin-top:1.5rem;">
+              <button class="qr-copy" id="qrCopyBtn" style="background:#3498db; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">复制链接</button>
+              <a class="qr-download" id="qrDownloadBtn" download style="background:#2ecc71; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center;">下载文件</a>
+              <button class="qr-close" id="qrCloseBtn" style="background:#95a5a6; color:white; padding:0.8rem 1rem; border:none; border-radius:8px; cursor:pointer;">关闭</button>
             </div>
           </div>
         </div>
@@ -3910,6 +3921,7 @@ async function initDatabase(config) {
   
         // 分享文件
         function shareFile(url, fileName) {
+          console.log('调用分享函数，URL:', url, '文件名:', fileName);
           try {
             currentShareUrl = url;
             
@@ -3917,10 +3929,17 @@ async function initDatabase(config) {
             const qrFileName = document.getElementById('qrFileName');
             if (qrFileName) {
               qrFileName.textContent = fileName || getFileName(url);
+              console.log('设置文件名成功:', qrFileName.textContent);
+            } else {
+              console.error('找不到qrFileName元素');
             }
             
             // 生成二维码
             const qrcodeDiv = document.getElementById('qrcode');
+            if (!qrcodeDiv) {
+              console.error('找不到qrcode元素');
+              return;
+            }
             qrcodeDiv.innerHTML = '';
             
             // 检查QRCode是否已加载
@@ -3930,6 +3949,7 @@ async function initDatabase(config) {
               qrcodeDiv.innerHTML = '<div style="padding: 20px; word-break: break-all;">' + url + '</div>';
               showConfirmModal('二维码生成失败，但您仍可以复制链接使用', null, true);
             } else {
+              console.log('QRCode库已加载，开始生成二维码');
               // 使用QRCode库生成二维码
               new QRCode(qrcodeDiv, {
                 text: url,
@@ -3939,6 +3959,7 @@ async function initDatabase(config) {
                 colorLight: "#ffffff",
                 correctLevel: QRCode.CorrectLevel.H
               });
+              console.log('二维码生成完成');
             }
             
             // 设置下载链接
@@ -3946,12 +3967,18 @@ async function initDatabase(config) {
             if (downloadBtn) {
               downloadBtn.href = url;
               downloadBtn.setAttribute('download', fileName || getFileName(url));
+              console.log('下载链接设置成功');
+            } else {
+              console.error('找不到qrDownloadBtn元素');
             }
             
-            // 显示弹窗
+            // 显示弹窗 - 直接修改样式而不是使用classList
             const qrModal = document.getElementById('qrModal');
             if (qrModal) {
-              qrModal.classList.add('show');
+              qrModal.style.display = 'flex';
+              console.log('二维码弹窗显示成功');
+            } else {
+              console.error('找不到qrModal元素');
             }
           } catch (error) {
             console.error('分享文件出错:', error);
@@ -3960,6 +3987,14 @@ async function initDatabase(config) {
           }
         }
   
+        // 关闭二维码弹窗
+        qrCloseBtn.addEventListener('click', () => {
+          const qrModal = document.getElementById('qrModal');
+          if (qrModal) {
+            qrModal.style.display = 'none';
+          }
+        });
+  
         // 复制URL
         qrCopyBtn.addEventListener('click', () => {
           copyToClipboard(currentShareUrl);
@@ -3967,11 +4002,6 @@ async function initDatabase(config) {
           setTimeout(() => {
             qrCopyBtn.textContent = '复制链接';
           }, 2000);
-        });
-  
-        // 关闭二维码弹窗
-        qrCloseBtn.addEventListener('click', () => {
-          qrModal.classList.remove('show');
         });
   
         // 显示确认弹窗
@@ -4014,9 +4044,12 @@ async function initDatabase(config) {
           if (event.target === confirmModal) {
             closeConfirmModal();
           }
+          
+          const qrModal = document.getElementById('qrModal');
           if (event.target === qrModal) {
-            qrModal.classList.remove('show');
+            qrModal.style.display = 'none';
           }
+          
           if (event.target === editSuffixModal) {
             editSuffixModal.classList.remove('show');
           }
@@ -4220,9 +4253,12 @@ async function initDatabase(config) {
           if (event.target === confirmModal) {
             closeConfirmModal();
           }
+          
+          const qrModal = document.getElementById('qrModal');
           if (event.target === qrModal) {
-            qrModal.classList.remove('show');
+            qrModal.style.display = 'none';
           }
+          
           if (event.target === editSuffixModal) {
             editSuffixModal.classList.remove('show');
           }
@@ -4393,6 +4429,7 @@ async function initDatabase(config) {
         showConfirmModal('复制失败，请手动复制', null, true);
       });
   }
+  
   
   // 从MIME类型获取文件扩展名
   function getExtensionFromMime(mimeType) {
