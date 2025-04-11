@@ -5,10 +5,10 @@ async function initDatabase(config) {
       throw new Error("数据库配置无效，请检查D1数据库是否正确绑定");
     }
     
-    // 初始化缓存
-    if (!global.fileCache) {
-      global.fileCache = new Map();
-      global.fileCacheTTL = 3600000; // 1小时缓存过期时间
+    // 初始化缓存 - 使用非全局方式，避免Worker环境问题
+    if (!config.fileCache) {
+      config.fileCache = new Map();
+      config.fileCacheTTL = 3600000; // 1小时缓存过期时间
     }
     
     const maxRetries = 3;
@@ -350,52 +350,77 @@ async function initDatabase(config) {
     }
   }
   async function setWebhook(webhookUrl, botToken) {
+    // 如果没有配置Telegram机器人令牌，跳过设置webhook
+    if (!botToken) {
+      console.log('未配置Telegram机器人令牌，跳过webhook设置');
+      return true;
+    }
+    
     const maxRetries = 3;
     let retryCount = 0;
     while (retryCount < maxRetries) {
       try {
+        console.log(`尝试设置webhook: ${webhookUrl}`);
         const response = await fetch(
           `https://api.telegram.org/bot${botToken}/setWebhook?url=${webhookUrl}`
         );
+        
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`Telegram API错误: HTTP ${response.status} - ${errorText}`);
+          retryCount++;
+          continue;
+        }
+        
         const result = await response.json();
         if (!result.ok) {
           if (result.error_code === 429) {
             const retryAfter = result.parameters?.retry_after || 1;
-            console.log(`Rate limited, waiting ${retryAfter} seconds before retry...`);
+            console.log(`请求频率限制，等待 ${retryAfter} 秒后重试...`);
             await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
             retryCount++;
             continue;
           }
-          console.error(`Failed to set webhook: ${JSON.stringify(result)}`);
+          console.error(`设置webhook失败: ${JSON.stringify(result)}`);
           return false;
         }
-        console.log(`Webhook set successfully: ${webhookUrl}`);
+        console.log(`Webhook设置成功: ${webhookUrl}`);
       return true;
     } catch (error) {
-        console.error(`Error setting webhook: ${error.message}`);
+        console.error(`设置webhook时出错: ${error.message}`);
         retryCount++;
         if (retryCount < maxRetries) {
-          await new Promise(resolve => setTimeout(resolve, 1000)); 
+          const delay = 1000 * Math.pow(2, retryCount);
+          console.log(`等待 ${delay}ms 后重试...`);
+          await new Promise(resolve => setTimeout(resolve, delay)); 
         }
       }
     }
-    console.error('Failed to set webhook after maximum retries');
-      return false;
-    }
+    console.error('多次尝试后仍未能设置webhook');
+    return false;
+  }
   export default {
     async fetch(request, env) {
+      // 检查并设置必要的环境变量
+      if (!env.DATABASE) {
+        console.error("缺少DATABASE配置");
+        return new Response('缺少必要配置: DATABASE 环境变量未设置', { status: 500 });
+      }
+      
       const config = {
-        domain: env.DOMAIN,
+        domain: env.DOMAIN || request.headers.get("host") || '',
         database: env.DATABASE,
         username: env.USERNAME || '',
         password: env.PASSWORD || '',
         enableAuth: env.ENABLE_AUTH === 'true' || false,
-        tgBotToken: env.TG_BOT_TOKEN,
+        tgBotToken: env.TG_BOT_TOKEN || '',
         tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [],
-        tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID,
+        tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
         cookie: Number(env.COOKIE) || 7,
         maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
-        bucket: env.BUCKET
+        bucket: env.BUCKET,
+        fileCache: new Map(),
+        fileCacheTTL: 3600000 // 1小时缓存
       };
       
       // 确保认证配置有效
@@ -407,16 +432,34 @@ async function initDatabase(config) {
       }
       
       try {
+        if (request.url.includes('favicon.ico')) {
+          // 对于favicon请求直接返回204，避免数据库初始化
+          return new Response(null, { status: 204 });
+        }
+        
         await initDatabase(config);
       } catch (error) {
-        console.error(`Database initialization failed: ${error.message}`);
-        return new Response('Database initialization failed', { status: 500 });
+        console.error(`数据库初始化失败: ${error.message}`);
+        return new Response(`数据库初始化失败: ${error.message}`, { 
+          status: 500,
+          headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
+        });
       }
-      const webhookUrl = `https://${config.domain}/webhook`;
-      const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
-      if (!webhookSet) {
-        console.error('Webhook setup failed');
+      
+      // 仅当配置了Telegram机器人令牌时才设置webhook
+      if (config.tgBotToken) {
+        try {
+          const webhookUrl = `https://${config.domain}/webhook`;
+          const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
+          if (!webhookSet) {
+            console.error('Webhook设置失败');
+          }
+        } catch (error) {
+          console.error(`设置webhook时出错: ${error.message}`);
+          // 继续处理请求，不中断操作
+        }
       }
+      
       const { pathname } = new URL(request.url);
       if (pathname === '/config') {
         const safeConfig = { maxSizeMB: config.maxSizeMB };
@@ -1610,21 +1653,21 @@ async function initDatabase(config) {
       
       // 检查缓存
       const cacheKey = `file:${path}`;
-      if (global.fileCache && global.fileCache.has(cacheKey)) {
-        const cachedData = global.fileCache.get(cacheKey);
-        if (Date.now() - cachedData.timestamp < global.fileCacheTTL) {
+      if (config.fileCache && config.fileCache.has(cacheKey)) {
+        const cachedData = config.fileCache.get(cacheKey);
+        if (Date.now() - cachedData.timestamp < config.fileCacheTTL) {
           console.log(`从缓存提供文件: ${path}`);
           return cachedData.response.clone();
         } else {
           // 缓存过期，删除
-          global.fileCache.delete(cacheKey);
+          config.fileCache.delete(cacheKey);
         }
       }
       
       // 辅助函数：缓存并返回响应
       const cacheAndReturnResponse = (response) => {
-        if (global.fileCache) {
-          global.fileCache.set(cacheKey, {
+        if (config.fileCache) {
+          config.fileCache.set(cacheKey, {
             response: response.clone(),
             timestamp: Date.now()
           });
