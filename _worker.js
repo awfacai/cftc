@@ -1927,7 +1927,6 @@ async function handleAdminRequest(request, config) {
             <div>分类: ${file.category_name || '无分类'}</div>
           </div>
           <div class="file-actions">
-            <button class="btn btn-copy" onclick="copyToClipboard('${url}')">复制链接</button>
             <button class="btn btn-share" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
             <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
             <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">修改后缀</button>
@@ -3445,7 +3444,7 @@ function generateAdminPage(fileCards, categoryOptions) {
         box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         font-size: 0.9rem;
       }
-      .btn-copy {
+      .btn-share {
         background: #3498db;
         color: white;
       }
@@ -3466,7 +3465,7 @@ function generateAdminPage(fileCards, categoryOptions) {
         transform: translateY(-2px);
         box-shadow: 0 4px 8px rgba(0,0,0,0.15);
       }
-      .btn-copy:hover {
+      .btn-share:hover {
         background: #2980b9;
       }
       .btn-down:hover {
@@ -3741,9 +3740,8 @@ function generateAdminPage(fileCards, categoryOptions) {
           <div class="qr-file-name" id="qrFileName"></div>
           <div id="qrcode"></div>
           <div class="qr-buttons">
-            <button class="qr-copy" id="qrCopyBtn">复制链接</button>
-            <a class="qr-download" id="qrDownloadBtn" download>下载文件</a>
-            <button class="qr-close" id="qrCloseBtn">关闭</button>
+            <a class="qr-download" id="qrDownloadBtn" download>涓嬭浇鏂囦欢</a>
+            <button class="qr-close" id="qrCloseBtn">鍏抽棴</button>
           </div>
         </div>
       </div>
@@ -3792,7 +3790,6 @@ function generateAdminPage(fileCards, categoryOptions) {
       const confirmModalConfirm = document.getElementById('confirmModalConfirm');
       const confirmModalCancel = document.getElementById('confirmModalCancel');
       const qrModal = document.getElementById('qrModal');
-      const qrCopyBtn = document.getElementById('qrCopyBtn');
       const qrCloseBtn = document.getElementById('qrCloseBtn');
       const editSuffixModal = document.getElementById('editSuffixModal');
       const editSuffixInput = document.getElementById('editSuffixInput');
@@ -3938,17 +3935,11 @@ function generateAdminPage(fileCards, categoryOptions) {
 
       // 复制URL
       qrCopyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(currentShareUrl)
-          .then(() => {
-            qrCopyBtn.textContent = '✓ 已复制';
-            setTimeout(() => {
-              qrCopyBtn.textContent = '复制链接';
-            }, 2000);
-          })
-          .catch(err => {
-            console.error('复制失败:', err);
-            showConfirmModal('复制失败，请手动复制', null, true);
-          });
+        copyToClipboard(currentSharedUrl);
+        qrCopyBtn.textContent = '??????';
+        setTimeout(() => {
+          qrCopyBtn.textContent = '澶嶅埗閾炬帴';
+        }, 2000);
       });
 
       // 关闭二维码弹窗
@@ -4147,14 +4138,10 @@ function generateAdminPage(fileCards, categoryOptions) {
                 card.setAttribute('data-url', data.newUrl);
                 
                 // 更新卡片中的按钮URL
-                const copyBtn = card.querySelector('.btn-copy');
                 const shareBtn = card.querySelector('.btn-share');
                 const deleteBtn = card.querySelector('.btn-delete');
                 const editBtn = card.querySelector('.btn-edit');
                 
-                if (copyBtn) {
-                  copyBtn.setAttribute('onclick', 'copyToClipboard("' + data.newUrl + '")');
-                }
                 if (shareBtn) {
                   const fileName = getFileName(data.newUrl);
                   shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
