@@ -1913,7 +1913,7 @@ async function initDatabase(config) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744302340226.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2078,7 +2078,7 @@ async function initDatabase(config) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744302340226.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2688,7 +2688,7 @@ async function initDatabase(config) {
     return `<!DOCTYPE html>
     <html lang="zh-CN">
     <head>
-      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744301785698.ico" type="image/x-icon">
+      <link rel="shortcut icon" href="https://tc-212.pages.dev/1744302340226.ico" type="image/x-icon">
       <meta name="description" content="Telegram文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3863,7 +3863,7 @@ async function initDatabase(config) {
   }
   async function fetchNotification() {
     try {
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+      const response = await fetch('https://raw.githubusercontent.com/iawooo/cftc/refs/heads/main/cftc/panel.md');
       if (!response.ok) {
         return null;
       }
