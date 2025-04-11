@@ -349,24 +349,24 @@ async function initDatabase(config) {
     while (retryCount < maxRetries) {
       try {
         const response = await fetch(
-          `https:
+          `https://api.telegram.org/bot${botToken}/setWebhook?url=${webhookUrl}`
         );
         const result = await response.json();
         if (!result.ok) {
           if (result.error_code === 429) {
             const retryAfter = result.parameters?.retry_after || 1;
-            console.log(`Rate limited, waiting ${retryAfter} seconds before retry...`);
+            console.log("Rate limited, waiting " + retryAfter + " seconds before retry...");
             await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
             retryCount++;
             continue;
           }
-          console.error(`Failed to set webhook: ${JSON.stringify(result)}`);
+          console.error("Failed to set webhook: " + JSON.stringify(result));
           return false;
         }
-        console.log(`Webhook set successfully: ${webhookUrl}`);
+        console.log("Webhook set successfully: " + webhookUrl);
       return true;
     } catch (error) {
-        console.error(`Error setting webhook: ${error.message}`);
+        console.error("Error setting webhook: " + error.message);
         retryCount++;
         if (retryCount < maxRetries) {
           await new Promise(resolve => setTimeout(resolve, 1000));
@@ -394,10 +394,10 @@ async function initDatabase(config) {
       try {
         await initDatabase(config);
       } catch (error) {
-        console.error(`Database initialization failed: ${error.message}`);
+        console.error("Database initialization failed: " + error.message);
         return new Response('Database initialization failed', { status: 500 });
       }
-      const webhookUrl = `https:
+      const webhookUrl = "https://" + config.domain + "/webhook";
       const webhookSet = await setWebhook(webhookUrl, config.tgBotToken);
       if (!webhookSet) {
         console.error('Webhook setup failed');
@@ -480,8 +480,8 @@ async function initDatabase(config) {
             } else {
               const originalFileName = getFileName(file.url);
               const fileExt = originalFileName.split('.').pop();
-              const newFileName = `${newSuffix}.${fileExt}`;
-              const fileUrl = `https:
+              const newFileName = newSuffix + "." + fileExt;
+              const fileUrl = "https://" + config.domain + "/" + newFileName;
               let success = false;
               if (file.storage_type === 'telegram') {
                 await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
@@ -669,11 +669,11 @@ async function initDatabase(config) {
           { text: "📋 最近文件", callback_data: "recent_files" }
         ],
         [
-          { text: "🔗 GitHub项目", url: "https:
+          { text: "🔗 GitHub项目", url: "https://github.com/awfacai/cftc" }
         ]
       ]
     };
-    await fetch(`https:
+    await fetch("https://api.telegram.org/bot" + config.tgBotToken + "/sendMessage", {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -688,7 +688,7 @@ async function initDatabase(config) {
   async function handleCallbackQuery(update, config, userSetting) {
     const cbData = update.callback_query.data;
     const chatId = update.callback_query.from.id.toString();
-    const answerPromise = fetch(`https:
+    const answerPromise = fetch("https://api.telegram.org/bot" + config.tgBotToken + "/answerCallbackQuery", {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3185,7 +3185,6 @@ async function initDatabase(config) {
         let currentShareUrl = '';
         let currentConfirmCallback = null;
         let currentEditUrl = '';
-        let confirmModal, confirmModalMessage, confirmModalConfirm, confirmModalCancel, editSuffixModal;
         async function setBingBackground() {
           try {
             const response = await fetch('/bing', { cache: 'no-store' });
