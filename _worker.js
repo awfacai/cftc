@@ -412,7 +412,7 @@ async function initDatabase(config) {
         database: env.DATABASE,
         username: env.USERNAME || '',
         password: env.PASSWORD || '',
-        enableAuth: env.ENABLE_AUTH === 'true' || true, // 默认启用认证
+        enableAuth: env.ENABLE_AUTH === 'true' || false,
         tgBotToken: env.TG_BOT_TOKEN || '',
         tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [],
         tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
@@ -428,6 +428,14 @@ async function initDatabase(config) {
         menuCacheTTL: 300000 // 菜单缓存5分钟过期
       };
       
+      // 确保认证配置有效
+      if (config.enableAuth) {
+        if (!config.username || !config.password) {
+          console.error("启用了认证但未配置用户名或密码");
+          return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { status: 500 });
+        }
+      }
+      
       // favicon.ico处理
       if (request.url.includes('favicon.ico')) {
         return new Response(null, { status: 204 });
@@ -436,43 +444,23 @@ async function initDatabase(config) {
       const url = new URL(request.url);
       const { pathname } = url;
       
-      // 这些路径不需要认证
-      const publicPaths = [
-        '/login',
-        '/webhook',
-        '/config'
-      ];
+      // 公开资源白名单
+      const publicPaths = ['/login', '/webhook', '/config', '/favicon.ico'];
+      // 受保护的页面列表
+      const protectedPaths = ['/', '/admin', '/upload', '/search', '/delete', '/delete-multiple'];
       
-      // 检查Webhook请求，这是特殊处理
-      if (pathname === '/webhook' && request.method === 'POST') {
-        return handleTelegramWebhook(request, config);
-      }
+      // 所有POST请求都需要登录验证
+      const needsAuth = 
+        // 是受保护的路径
+        (protectedPaths.includes(pathname) || 
+        // 或者不在公开白名单中
+        !publicPaths.includes(pathname)) && 
+        // 且启用了认证
+        config.enableAuth;
       
-      // 检查配置请求
-      if (pathname === '/config') {
-        const safeConfig = { maxSizeMB: config.maxSizeMB };
-        return new Response(JSON.stringify(safeConfig), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      // 如果是登录请求
-      if (pathname === '/login') {
-        return handleLoginRequest(request, config);
-      }
-      
-      // 确保认证配置有效
-      if (!config.username || !config.password) {
-        console.error("登录认证需要配置用户名和密码");
-        return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { 
-          status: 500,
-          headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
-        });
-      }
-      
-      // 对所有其他路径进行认证检查
-      if (!publicPaths.includes(pathname) && !authenticate(request, config)) {
-        console.log(`用户尝试未授权访问: ${pathname}`);
+      // 登录权限检查
+      if (needsAuth && !authenticate(request, config)) {
+        console.log(`未授权访问: ${pathname}`);
         
         // 如果是API请求，返回JSON格式的授权错误
         if (pathname.startsWith('/api/') || 
@@ -516,26 +504,38 @@ async function initDatabase(config) {
         }
       }
       
-      // 处理其他路由
+      if (pathname === '/config') {
+        const safeConfig = { maxSizeMB: config.maxSizeMB };
+        return new Response(JSON.stringify(safeConfig), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      if (pathname === '/webhook' && request.method === 'POST') {
+        return handleTelegramWebhook(request, config);
+      }
+      if (pathname === '/create-category' && request.method === 'POST') {
+        return handleCreateCategoryRequest(request, config);
+      }
+      if (pathname === '/delete-category' && request.method === 'POST') {
+        return handleDeleteCategoryRequest(request, config);
+      }
+      if (pathname === '/update-suffix' && request.method === 'POST') {
+        return handleUpdateSuffixRequest(request, config);
+      }
       const routes = {
         '/': () => handleAuthRequest(request, config),
+        '/login': () => handleLoginRequest(request, config),
         '/upload': () => handleUploadRequest(request, config),
         '/admin': () => handleAdminRequest(request, config),
         '/delete': () => handleDeleteRequest(request, config),
         '/delete-multiple': () => handleDeleteMultipleRequest(request, config),
         '/search': () => handleSearchRequest(request, config),
-        '/bing': handleBingImagesRequest,
-        '/create-category': () => handleCreateCategoryRequest(request, config),
-        '/delete-category': () => handleDeleteCategoryRequest(request, config),
-        '/update-suffix': () => handleUpdateSuffixRequest(request, config)
+        '/bing': handleBingImagesRequest
       };
-      
       const handler = routes[pathname];
       if (handler) {
         return await handler();
       }
-      
-      // 处理文件请求
       return await handleFileRequest(request, config);
     }
   };
@@ -1498,62 +1498,39 @@ async function initDatabase(config) {
     }
   }
   async function handleAuthRequest(request, config) {
-    const url = new URL(request.url);
-    
-    // 检查是否已经认证
-    if (!authenticate(request, config)) {
-      // 未登录，重定向到登录页面
-      return Response.redirect(`${url.origin}/login?redirect=/`, 302);
-    }
-    
-    // 已登录，重定向到上传页面
-    return Response.redirect(`${url.origin}/upload`, 302);
-  }
-  async function handleLoginRequest(request, config) {
-    // 处理POST请求（登录请求）
-    if (request.method === 'POST') {
-      try {
-        const { username, password } = await request.json();
-        
-        // 验证用户名和密码
-        if (username === config.username && password === config.password) {
-          const expirationDate = new Date();
-          // 使用配置的cookie值（天数）
-          const cookieDays = config.cookie || 7; // 默认7天
-          expirationDate.setDate(expirationDate.getDate() + cookieDays);
-          const expirationTimestamp = expirationDate.getTime();
-          const tokenData = JSON.stringify({
-            username: config.username,
-            expiration: expirationTimestamp
-          });
-          const token = btoa(tokenData);
-          const cookie = `auth_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Expires=${expirationDate.toUTCString()}`;
-          
-          // 登录成功
-          return new Response("登录成功", {
-            status: 200,
-            headers: {
-              "Set-Cookie": cookie,
-              "Content-Type": "text/plain"
-            }
-          });
-        }
-        
-        // 登录失败
-        return new Response("用户名或密码错误", { 
-          status: 401,
-          headers: { "Content-Type": "text/plain;charset=UTF-8" }
-        });
-      } catch (error) {
-        console.error("登录处理出错:", error);
-        return new Response("登录请求格式错误", { 
-          status: 400,
-          headers: { "Content-Type": "text/plain;charset=UTF-8" }
-        });
+    if (config.enableAuth) {
+      const isAuthenticated = authenticate(request, config);
+      if (!isAuthenticated) {
+        return handleLoginRequest(request, config);
       }
     }
-    
-    // 处理GET请求（显示登录页面）
+    return handleUploadRequest(request, config);
+  }
+  async function handleLoginRequest(request, config) {
+    if (request.method === 'POST') {
+      const { username, password } = await request.json();
+      if (username === config.username && password === config.password) {
+        const expirationDate = new Date();
+        // 使用配置的cookie值（天数）
+        const cookieDays = config.cookie || 7; // 默认7天
+        expirationDate.setDate(expirationDate.getDate() + cookieDays);
+        const expirationTimestamp = expirationDate.getTime();
+        const tokenData = JSON.stringify({
+          username: config.username,
+          expiration: expirationTimestamp
+        });
+        const token = btoa(tokenData);
+        const cookie = `auth_token=${token}; Path=/; HttpOnly; Secure; Expires=${expirationDate.toUTCString()}`;
+        return new Response("登录成功", {
+          status: 200,
+          headers: {
+            "Set-Cookie": cookie,
+            "Content-Type": "text/plain"
+          }
+        });
+      }
+      return new Response("认证失败", { status: 401 });
+    }
     const html = generateLoginPage();
     return new Response(html, {
       headers: { 'Content-Type': 'text/html;charset=UTF-8' }
@@ -1662,11 +1639,9 @@ async function initDatabase(config) {
     }
   }
   async function handleUploadRequest(request, config) {
-    // 安全检查 - 确保已经登录
-    if (!authenticate(request, config)) {
-      const url = new URL(request.url);
-      return Response.redirect(`${url.origin}/login?redirect=/upload`, 302);
-    }
+    // 检查认证状态
+    const authResponse = ensureAuthenticated(request, config);
+    if (authResponse) return authResponse;
     
     if (request.method === 'GET') {
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
@@ -1686,8 +1661,6 @@ async function initDatabase(config) {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
       });
     }
-    
-    // 处理文件上传
     try {
       const formData = await request.formData();
       const file = formData.get('file');
@@ -1797,95 +1770,9 @@ async function initDatabase(config) {
     }
   }
   async function handleDeleteMultipleRequest(request, config) {
-    if (config.enableAuth && !authenticate(request, config)) {
-      return Response.redirect(`${new URL(request.url).origin}/`, 302);
-    }
-    try {
-      const { urls } = await request.json();
-      if (!Array.isArray(urls) || urls.length === 0) {
-        return new Response(JSON.stringify({ 
-          status: 0, 
-          error: '无效的URL列表' 
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      const results = {
-        success: [],
-        failed: []
-      };
-      for (const url of urls) {
-        try {
-          const fileName = url.split('/').pop();
-          let file = await config.database.prepare(
-            'SELECT id, fileId, message_id, storage_type FROM files WHERE url = ?'
-          ).bind(url).first();
-          if (!file && fileName) {
-            file = await config.database.prepare(
-              'SELECT id, fileId, message_id, storage_type FROM files WHERE fileId = ?'
-            ).bind(fileName).first();
-          }
-          if (file) {
-            console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
-            if (file.storage_type === 'telegram' && file.message_id) {
-              try {
-                await fetch(
-                  `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
-                );
-                console.log(`已从Telegram删除消息: ${file.message_id}`);
-              } catch (error) {
-                console.error(`从Telegram删除消息失败: ${error.message}`);
-              }
-            } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
-              try {
-                await config.bucket.delete(file.fileId);
-                console.log(`已从R2删除文件: ${file.fileId}`);
-              } catch (error) {
-                console.error(`从R2删除文件失败: ${error.message}`);
-              }
-            }
-            await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
-            console.log(`已从数据库删除记录: ID=${file.id}`);
-            results.success.push(url);
-          } else {
-            console.log(`未找到文件记录: ${url}`);
-            results.failed.push({url, reason: '未找到文件记录'});
-          }
-        } catch (error) {
-          console.error(`删除文件失败 ${url}: ${error.message}`);
-          results.failed.push({url, reason: error.message});
-        }
-      }
-      return new Response(
-        JSON.stringify({ 
-          status: 1, 
-          message: '批量删除处理完成',
-          results: {
-            success: results.success.length,
-            failed: results.failed.length,
-            details: results
-          }
-        }),
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-    } catch (error) {
-      console.error(`[Delete Multiple Error] ${error.message}`);
-      return new Response(
-        JSON.stringify({ 
-          status: 0, 
-          error: error.message 
-        }),
-        { status: 500, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-  }
-  async function handleAdminRequest(request, config) {
-    // 安全检查 - 确保已经登录
-    if (!authenticate(request, config)) {
-      const url = new URL(request.url);
-      return Response.redirect(`${url.origin}/login?redirect=/admin`, 302);
-    }
+    // 检查认证状态
+    const authResponse = ensureAuthenticated(request, config);
+    if (authResponse) return authResponse;
     
     try {
       const categories = await config.database.prepare('SELECT id, name FROM categories').all();
@@ -1901,26 +1788,26 @@ async function initDatabase(config) {
       const fileList = files.results || [];
       console.log(`文件总数: ${fileList.length}`);
       const fileCards = fileList.map(file => {
-        const url = file.url;
-        return `
-          <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}">
-            <input type="checkbox" class="file-checkbox" value="${url}">
-            <div class="file-preview">
-              ${getPreviewHtml(url)}
+          const url = file.url;
+          return `
+            <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}">
+              <input type="checkbox" class="file-checkbox" value="${url}">
+              <div class="file-preview">
+                ${getPreviewHtml(url)}
+              </div>
+              <div class="file-info">
+                <div>${getFileName(url)}</div>
+                <div>大小: ${formatSize(file.file_size || 0)}</div>
+                <div>上传时间: ${formatDate(file.created_at)}</div>
+                <div>分类: ${file.category_name || '无分类'}</div>
+              </div>
+              <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
+                <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
+                <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
+                <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
+              </div>
             </div>
-            <div class="file-info">
-              <div>${getFileName(url)}</div>
-              <div>大小: ${formatSize(file.file_size || 0)}</div>
-              <div>上传时间: ${formatDate(file.created_at)}</div>
-              <div>分类: ${file.category_name || '无分类'}</div>
-            </div>
-            <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
-              <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
-              <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-              <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
-            </div>
-          </div>
-        `;
+          `;
       }).join('');
       const html = generateAdminPage(fileCards, categoryOptions);
       return new Response(html, {
@@ -1931,10 +1818,215 @@ async function initDatabase(config) {
       return new Response(`加载文件列表失败，请检查数据库配置：${error.message}`, { status: 500 });
     }
   }
+  
+  async function handleSearchRequest(request, config) {
+    if (config.enableAuth && !authenticate(request, config)) {
+      const url = new URL(request.url);
+      if (request.method === 'POST') {
+        return new Response(JSON.stringify({ 
+          status: 0, 
+          error: "未授权访问",
+          redirect: `${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`
+        }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`, 302);
+    }
+    
+    try {
+      const { query } = await request.json();
+      const searchPattern = `%${query}%`;
+      const files = await config.database.prepare(`
+        SELECT url, fileId, message_id, created_at, file_name, file_size, mime_type
+         FROM files 
+         WHERE file_name LIKE ? ESCAPE '!'
+         COLLATE NOCASE
+         ORDER BY created_at DESC
+      `).bind(searchPattern).all();
+      return new Response(
+        JSON.stringify({ files: files.results || [] }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    } catch (error) {
+      console.error(`[Search Error] ${error.message}`);
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+  }
+  function getPreviewHtml(url) {
+    const ext = (url.split('.').pop() || '').toLowerCase();
+    const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'icon'].includes(ext);
+    const isVideo = ['mp4', 'webm'].includes(ext);
+    const isAudio = ['mp3', 'wav', 'ogg'].includes(ext);
+    if (isImage) {
+      return `<img src="${url}" alt="预览">`;
+    } else if (isVideo) {
+      return `<video src="${url}" controls></video>`;
+    } else if (isAudio) {
+      return `<audio src="${url}" controls></audio>`;
+    } else {
+      return `<div style="font-size: 48px">📄</div>`;
+    }
+  }
+  async function handleFileRequest(request, config) {
+    try {
+      const url = new URL(request.url);
+      const path = decodeURIComponent(url.pathname.slice(1));
+      if (!path) {
+        return new Response('Not Found', { status: 404 });
+      }
+      
+      // 检查缓存
+      const cacheKey = `file:${path}`;
+      if (config.fileCache && config.fileCache.has(cacheKey)) {
+        const cachedData = config.fileCache.get(cacheKey);
+        if (Date.now() - cachedData.timestamp < config.fileCacheTTL) {
+          console.log(`从缓存提供文件: ${path}`);
+          return cachedData.response.clone();
+        } else {
+          // 缓存过期，删除
+          config.fileCache.delete(cacheKey);
+        }
+      }
+      
+      // 辅助函数：缓存并返回响应
+      const cacheAndReturnResponse = (response) => {
+        if (config.fileCache) {
+          config.fileCache.set(cacheKey, {
+            response: response.clone(),
+            timestamp: Date.now()
+          });
+        }
+        return response;
+      };
+      
+      const getCommonHeaders = (contentType) => {
+        const headers = new Headers();
+        headers.set('Content-Type', contentType);
+        headers.set('Access-Control-Allow-Origin', '*');
+        if (contentType.startsWith('image/') || 
+            contentType.startsWith('video/') || 
+            contentType.startsWith('audio/')) {
+          headers.set('Content-Disposition', 'inline');
+        }
+        headers.set('Cache-Control', 'public, max-age=31536000');
+        return headers;
+      };
+      
+      // 尝试从R2存储桶直接获取文件
+      if (config.bucket) {
+        try {
+          const object = await config.bucket.get(path);
+          if (object) {
+            const contentType = object.httpMetadata.contentType || getContentType(path.split('.').pop());
+            const headers = getCommonHeaders(contentType);
+            object.writeHttpMetadata(headers);
+            headers.set('etag', object.httpEtag);
+            return cacheAndReturnResponse(new Response(object.body, { headers }));
+          }
+        } catch (error) {
+          if (error.name !== 'NoSuchKey') {
+            console.error('R2获取文件错误:', error.name);
+          }
+        }
+      }
+      
+      // 从数据库查找文件
+      let file;
+      const urlPattern = `https://${config.domain}/${path}`;
+      file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
+      
+      if (!file) {
+        file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
+      }
+      
+      if (!file) {
+        const fileName = path.split('/').pop();
+        file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
+      }
+      
+      if (!file) {
+        return new Response('File not found', { status: 404 });
+      }
+      
+      // 处理Telegram存储的文件
+      if (file.storage_type === 'telegram') {
+        try {
+          const telegramFileId = file.fileId;
+          if (!telegramFileId) {
+            console.error('文件记录缺少Telegram fileId');
+            return new Response('Missing Telegram file ID', { status: 500 });
+          }
+          
+          const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${telegramFileId}`);
+          const data = await response.json();
+          
+          if (!data.ok) {
+            console.error('Telegram getFile 失败:', data.description);
+            return new Response('Failed to get file from Telegram', { status: 500 });
+          }
+          
+          const telegramUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
+          const fileResponse = await fetch(telegramUrl);
+          
+          if (!fileResponse.ok) {
+            console.error(`从Telegram获取文件失败: ${fileResponse.status}`);
+            return new Response('Failed to fetch file from Telegram', { status: fileResponse.status });
+          }
+          
+          const contentType = file.mime_type || getContentType(path.split('.').pop());
+          const headers = getCommonHeaders(contentType);
+          return cacheAndReturnResponse(new Response(fileResponse.body, { headers }));
+          
+        } catch (error) {
+          console.error('处理Telegram文件出错:', error.message);
+          return new Response('Error processing Telegram file', { status: 500 });
+        }
+      } 
+      // 处理R2存储的文件
+      else if (file.storage_type === 'r2' && config.bucket) {
+        try {
+          const object = await config.bucket.get(file.fileId);
+          if (object) {
+            const contentType = object.httpMetadata.contentType || file.mime_type || getContentType(path.split('.').pop());
+            const headers = getCommonHeaders(contentType);
+            object.writeHttpMetadata(headers);
+            headers.set('etag', object.httpEtag);
+            return cacheAndReturnResponse(new Response(object.body, { headers }));
+          }
+        } catch (error) {
+          console.error('通过fileId从R2获取文件出错:', error.message);
+        }
+      }
+      
+      // 如果文件URL与请求的不同，重定向到正确的URL
+      if (file.url && file.url !== urlPattern) {
+        return Response.redirect(file.url, 302);
+      }
+      
+      return new Response('File not available', { status: 404 });
+    } catch (error) {
+      console.error('处理文件请求出错:', error.message);
+      return new Response('Internal Server Error', { status: 500 });
+    }
+  }
   async function handleDeleteRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config)) {
-      return Response.redirect(`${new URL(request.url).origin}/`, 302);
+      const url = new URL(request.url);
+      return new Response(JSON.stringify({ 
+        status: 0, 
+        error: "未授权访问",
+        redirect: `${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
+    
     try {
       const { id, fileId } = await request.json();
       if (!id && !fileId) {
@@ -1990,9 +2082,7 @@ async function initDatabase(config) {
     }
   }
   function getContentType(ext) {
-    ext = (ext || '').toLowerCase();
-    const mimeMap = {
-      // 图片
+    const types = {
       jpg: 'image/jpeg',
       jpeg: 'image/jpeg',
       png: 'image/png',
@@ -2003,24 +2093,26 @@ async function initDatabase(config) {
       ico: 'image/x-icon',
       icon: 'image/x-icon',
       bmp: 'image/bmp',
-      
-      // 视频
+      tiff: 'image/tiff',
+      tif: 'image/tiff',
       mp4: 'video/mp4',
+      webm: 'video/webm',
+      ogg: 'video/ogg',
+      ogv: 'video/ogg',
       avi: 'video/x-msvideo',
       mov: 'video/quicktime',
       wmv: 'video/x-ms-wmv',
       flv: 'video/x-flv',
-      webm: 'video/webm',
       mkv: 'video/x-matroska',
-      
-      // 音频
+      m4v: 'video/x-m4v',
+      ts: 'video/mp2t',
       mp3: 'audio/mpeg',
       wav: 'audio/wav',
       ogg: 'audio/ogg',
+      m4a: 'audio/mp4',
       aac: 'audio/aac',
       flac: 'audio/flac',
-      
-      // 文档
+      wma: 'audio/x-ms-wma',
       pdf: 'application/pdf',
       doc: 'application/msword',
       docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -2028,24 +2120,46 @@ async function initDatabase(config) {
       xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       ppt: 'application/vnd.ms-powerpoint',
       pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-      
-      // 压缩文件
+      rtf: 'application/rtf',
+      txt: 'text/plain',
+      md: 'text/markdown',
+      csv: 'text/csv',
+      html: 'text/html',
+      htm: 'text/html',
+      css: 'text/css',
+      js: 'application/javascript',
+      xml: 'application/xml',
+      json: 'application/json',
       zip: 'application/zip',
       rar: 'application/x-rar-compressed',
       '7z': 'application/x-7z-compressed',
       tar: 'application/x-tar',
       gz: 'application/gzip',
-      
-      // 文本
-      txt: 'text/plain',
-      csv: 'text/csv',
-      html: 'text/html',
-      css: 'text/css',
-      js: 'text/javascript',
-      xml: 'application/xml',
-      json: 'application/json'
+      swf: 'application/x-shockwave-flash',
+      ttf: 'font/ttf',
+      otf: 'font/otf',
+      woff: 'font/woff',
+      woff2: 'font/woff2',
+      eot: 'application/vnd.ms-fontobject',
+      ini: 'text/plain',
+      yml: 'application/yaml',
+      yaml: 'application/yaml',
+      toml: 'text/plain',
+      py: 'text/x-python',
+      java: 'text/x-java',
+      c: 'text/x-c',
+      cpp: 'text/x-c++',
+      cs: 'text/x-csharp',
+      php: 'application/x-php',
+      rb: 'text/x-ruby',
+      go: 'text/x-go',
+      rs: 'text/x-rust',
+      sh: 'application/x-sh',
+      bat: 'application/x-bat',
+      sql: 'application/sql'
     };
-    return mimeMap[ext] || 'application/octet-stream';
+    const lowerExt = ext.toLowerCase();
+    return types[lowerExt] || 'application/octet-stream';
   }
   async function handleBingImagesRequest() {
     const cache = caches.default;
@@ -2154,7 +2268,7 @@ async function initDatabase(config) {
       <meta name="description" content="文件存储与分享平台">
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>登录 - 文件存储系统</title>
+      <title>登录</title>
       <style>
         body {
           font-family: 'Segoe UI', Arial, sans-serif;
@@ -3383,17 +3497,6 @@ async function initDatabase(config) {
           border-radius: 8px;
           font-size: 1rem;
         }
-        .qr-code {
-          text-align: center;
-          margin: 20px 0;
-        }
-        .qr-container {
-          display: inline-block;
-          background: white;
-          padding: 15px;
-          border-radius: 8px;
-          box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        }
       </style>
     </head>
     <body>
@@ -3880,13 +3983,27 @@ async function initDatabase(config) {
     </html>`;
   }
   async function handleUpdateSuffixRequest(request, config) {
+    if (config.enableAuth && !authenticate(request, config)) {
+      const reqUrl = new URL(request.url);
+      return new Response(JSON.stringify({ 
+        status: 0, 
+        error: "未授权访问",
+        redirect: `${reqUrl.origin}/login?redirect=${encodeURIComponent(reqUrl.pathname)}`
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
     try {
       const { url, suffix } = await request.json();
       if (!url || !suffix) {
         return new Response(JSON.stringify({
           status: 0,
-          msg: '文件链接和后缀不能为空'
-        }), { headers: { 'Content-Type': 'application/json' } });
+          message: '缺少文件URL或新后缀'
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
       const originalFileName = getFileName(url);
       let fileRecord = await config.database.prepare('SELECT * FROM files WHERE url = ?')
@@ -4177,60 +4294,40 @@ async function initDatabase(config) {
     console.error('添加DOMContentLoaded事件监听器失败:', error);
   }
     
-  async function handleSearchRequest(request, config) {
-    // 安全检查 - 确保已经登录
-    if (!authenticate(request, config)) {
-      if (request.headers.get('Accept')?.includes('application/json')) {
-        return new Response(JSON.stringify({ 
-          status: 0, 
-          error: "未授权访问",
-          redirect: `/login?redirect=/search`
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      const url = new URL(request.url);
-      return Response.redirect(`${url.origin}/login?redirect=/search`, 302);
+  // 确保用户已登录，返回适当的响应
+  function ensureAuthenticated(request, config) {
+    if (!config.enableAuth) {
+      return null; // 认证未启用，直接通过
     }
     
-    try {
-      const { query } = await request.json();
-      const searchPattern = `%${query}%`;
-      const files = await config.database.prepare(`
-        SELECT url, fileId, message_id, created_at, file_name, file_size, mime_type
-        FROM files 
-        WHERE file_name LIKE ? ESCAPE '!'
-        COLLATE NOCASE
-        ORDER BY created_at DESC
-      `).bind(searchPattern).all();
-      return new Response(
-        JSON.stringify({ files: files.results || [] }),
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-    } catch (error) {
-      console.error(`[Search Error] ${error.message}`);
-      return new Response(
-        JSON.stringify({ error: error.message }),
-        { status: 500, headers: { 'Content-Type': 'application/json' } }
-      );
+    if (authenticate(request, config)) {
+      return null; // 已登录，直接通过
     }
+    
+    // 未登录，返回适当的响应
+    const url = new URL(request.url);
+    
+    // API请求返回JSON
+    if (url.pathname.startsWith('/api/') || 
+        request.headers.get('Accept')?.includes('application/json') ||
+        request.method === 'POST') {
+      return new Response(JSON.stringify({ 
+        status: 0, 
+        error: "未授权访问",
+        redirect: `${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // 普通页面请求重定向到登录
+    return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(url.pathname)}`, 302);
   }
   
-  function getPreviewHtml(url) {
-    const ext = (url.split('.').pop() || '').toLowerCase();
-    const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'icon'].includes(ext);
-    const isVideo = ['mp4', 'webm'].includes(ext);
-    const isAudio = ['mp3', 'wav', 'ogg'].includes(ext);
-    if (isImage) {
-      return `<img src="${url}" alt="预览">`;
-    } else if (isVideo) {
-      return `<video src="${url}" controls></video>`;
-    } else if (isAudio) {
-      return `<audio src="${url}" controls></audio>`;
-    } else {
-      return `<div style="font-size: 48px">📄</div>`;
-    }
+  // 确保用户已认证的方法 - 简化版，用于辅助函数
+  function checkAuthentication(request, config) {
+    // 如果未启用认证，或者已经通过认证，则返回true
+    return !config.enableAuth || authenticate(request, config);
   }
     
