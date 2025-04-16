@@ -405,7 +405,7 @@ export default {
       password: env.PASSWORD || '',
       enableAuth: env.ENABLE_AUTH === 'true' || false,
       tgBotToken: env.TG_BOT_TOKEN || '',
-      tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [],
+      tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [], 
       tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
       cookie: Number(env.COOKIE) || 7,
       maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
@@ -561,6 +561,12 @@ async function handleTelegramWebhook(request, config) {
       chatId = update.message.chat.id.toString();
       userId = update.message.from.id.toString();
       console.log(`[Webhook] Received message from chat ID: ${chatId}, User ID: ${userId}`);
+      // --- Ignore group/supergroup messages --- 
+      if (update.message.chat.type === 'group' || update.message.chat.type === 'supergroup') {
+        console.log(`[Webhook] Ignoring message from group/supergroup chat ID: ${chatId}`);
+        return new Response('OK');
+      }
+      // --------------------------------------
     } else if (update.callback_query) {
       chatId = update.callback_query.from.id.toString();
       userId = update.callback_query.from.id.toString();
@@ -569,6 +575,7 @@ async function handleTelegramWebhook(request, config) {
       console.log('[Webhook] Received update without message or callback_query:', JSON.stringify(update));
       return new Response('OK');
     }
+    // Check if the chatId is included in the allowed list
     if (config.tgChatId && config.tgChatId.length > 0 && !config.tgChatId.includes(chatId)) {
       console.log(`[Auth Check] FAILED: Chat ID ${chatId} (User ID: ${userId}) is not in the allowed list [${config.tgChatId.join(', ')}]. Ignoring update.`);
       if (config.tgBotToken) {
@@ -859,7 +866,7 @@ async function handleTelegramWebhook(request, config) {
             userSetting.editing_file_id = fileToEdit.id;
             await sendMessage(
               chatId,
-              `📝 找到文件: ${fileName}\n当前后缀: ${currentSuffix}\n\n请输入文件的新后缀（不含扩展名）`,
+              `📝 找到文件: ${fileName}\n当前后缀: ${currentSuffix}\n\n请回复此消息，输入文件的新后缀（不含扩展名）`,
               config.tgBotToken
             );
             return new Response('OK');
@@ -1035,7 +1042,7 @@ async function generateMainMenu(chatId, userSetting, config) {
   const defaultNotification = 
     "➡️ 现在您可以直接发送图片或文件，上传完成后会自动生成图床直链\n" +
     "➡️ 所有上传的文件都可以在网页后台管理，支持删除、查看、分类等操作";
-  const messageBody = `🌩️<b>图床助手v1</b>
+  const messageBody = `☁️ <b>图床助手v1</b>
   📂 当前存储：${storageText}
   📁 当前分类：${categoryName}
   📊 已上传：${stats && stats.total_files ? stats.total_files : 0} 个文件
@@ -1063,7 +1070,7 @@ function getKeyboardLayout(userSetting) {
         { text: "🗑️ 删除文件", callback_data: "delete_file_input" }
       ],
       [
-        { text: "📦 GitHub项目", url: "https://github.com/iawooo/cftc" }
+        { text: "📦 本项目GitHub地址", url: "https://github.com/iawooo/cftc" }
       ]
     ]
   };
@@ -1173,12 +1180,12 @@ async function handleCallbackQuery(update, config, userSetting) {
       if (config.buttonCache) {
         config.buttonCache.set(cacheKey, {
           timestamp: Date.now(),
-          responseText: "📝 请输入新分类名称"
+          responseText: "📝 请回复此消息，输入新分类名称"
         });
       }
       await Promise.all([
         answerPromise,
-        sendMessage(chatId, "📝 请输入新分类名称", config.tgBotToken),
+        sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken),
         config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
           .bind('new_category', chatId).run()
       ]);
@@ -1318,14 +1325,14 @@ async function handleCallbackQuery(update, config, userSetting) {
       await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
         .bind('edit_suffix_input_file', chatId).run();
       userSetting.waiting_for = 'edit_suffix_input_file';
-      await sendMessage(chatId, "✏️ 请输入要修改后缀的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
+      await sendMessage(chatId, "✏️ 请回复此消息，输入要修改后缀的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
     }
     else if (cbData === 'delete_file_input') {
       await answerPromise;
       await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
         .bind('delete_file_input', chatId).run();
       userSetting.waiting_for = 'delete_file_input';
-      await sendMessage(chatId, "🗑️ 请输入要删除的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
+      await sendMessage(chatId, "🗑️ 请回复此消息，输入要删除的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
     }
     else if (cbData.startsWith('delete_file_confirm_')) {
     }
